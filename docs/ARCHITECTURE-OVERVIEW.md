@@ -121,4 +121,6 @@ ACK 仅表示输入已保存。切会话、卡或真实分支使旧结果失效�
 
 [TESTING](../TESTING.md)以 manifest 的实际脚本为准，区分离线、浏览器、原 fixture、真实模型和发行门禁。`verify` 已含后端 typecheck，但不重编 SDK fork、不验证全部插件或实际三平台包。
 
-候选构建先放临时目录，服务空闲且完成源码、旧 dist 和私有资料备份后才部署；部署后独立核对 health、hello、bundle 与 SW。不 reset 继承 dirty、不自动 commit/push/Release、不放宽私有权限、不偷偷启用旧渠道。同步与部署分别授权，见[发布流程](BRANCH-RELEASE-WORKFLOW.md)。
+按用户授权，维护/部署默认不新建手工本地备份或归档；先核验 GitHub 恢复仓库、精确 commit 与匹配产物来源、校验和及可获取性。GitHub 仅覆盖已推送、核验且获准公开的内容，不覆盖 dirty、未推送提交或私有资料；受影响内容不能安全保留/恢复时停止并请求专项方案。已有备份、原子 `.bak` 和更新器内部回退保留，旧更新脚本仍归档，不视为已符合新流程。
+
+候选构建先放临时目录，完成离线/浏览器验证，确认服务空闲与恢复来源有效后才部署；部署后独立核对 health、hello、bundle 与 SW。不 reset 继承 dirty、不自动 commit/push/Release/部署、不放宽私有权限、不偷偷启用旧渠道，不回滚故事或数据库来回退代码。同步与部署分别授权，见[发布流程](BRANCH-RELEASE-WORKFLOW.md)。

@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiGet, apiPut, type ModelRef, type ModelsResponse, type RpConfigView, type SideModelStep, type StepModelOverrides } from "../api.ts";
 import type { GenerationMode } from "../generation-mode.ts";
 import { getTheme, setTheme, type ThemeMode } from "../theme.ts";
+import { setReadingPosition, useReadingPosition, type ReadingPosition } from "../reading-preference.ts";
 import { PanelStatus, SliderField, Toggle, useAction, usePanelData } from "./kit.tsx";
 import { GenerationModeControl } from "./GenerationModeControl.tsx";
 import { ModelPlugSelector } from "./ModelPlugSelector.tsx";
@@ -692,6 +693,7 @@ export function SettingsPanel({
 	const failedRevisionRef = useRef<number | null>(null);
 	const stepModelsDirtyRef = useRef(false);
 	const [dark, setDark] = useState(() => getTheme() === "dark");
+	const readingPosition = useReadingPosition();
 	const formDisabled = saving;
 
 	useEffect(() => {
@@ -783,6 +785,20 @@ export function SettingsPanel({
 				<div className="field-hint">白昼 / 黑夜立刻切换，偏好记在本机浏览器，与会话配置无关。</div>
 			</section>
 			<AccessSection toast={toast} />
+			<section className="sp-section">
+				<h4>阅读</h4>
+				<label className="field-label">
+					打开游玩记录的位置
+					<select className="field-input" value={readingPosition} onChange={event => {
+						try { setReadingPosition(event.target.value as ReadingPosition); }
+						catch { toast("warning", "浏览器无法保存阅读偏好，请检查本机存储权限。"); }
+					}}>
+						<option value="latest">最新楼层（默认）</option>
+						<option value="start">记录开头</option>
+					</select>
+				</label>
+				<div className="field-hint">仅保存在本机浏览器，下次进入记录时生效；阅读旧楼层时不会强制跟随新内容。</div>
+			</section>
 			<DatabasePluginPanel toast={toast} onOpenManager={onOpenDatabase} />
 			<MemorySection toast={toast} />
 			{data && (

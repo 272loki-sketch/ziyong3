@@ -18,6 +18,7 @@ import { isFullInterface } from "../htmlEmbed.ts";
 import { splitRichContentParts, stripProjectedFormats, type SkinMacros } from "../richContentParts.ts";
 import { needsDossierSnapshot, delegatedDossierShell } from "../cardDossierView.ts";
 import { DossierMessageFrame, DelegatedDossierFrame } from "./DossierMessageFrame.tsx";
+import { DossierHeader } from "./TurnDossier.tsx";
 import { splitMarkdownParts, splitRpInline } from "../markdown.ts";
 import type { WireActivity, WireBeatWorkflow, WireTurnPerformance, WireChoice, WireMsg } from "../wire.ts";
 import type { LiteraryWorldState } from "../../../src/stage/literary-world.ts";
@@ -1201,9 +1202,9 @@ function GenerationWorkflowCard({ workflow }: { workflow: GenerationWorkflow }) 
 	</details>;
 }
 
-function ModularWorldCard({ world, audit }: { world: ModularWorldWireView; audit?: WorldAuditWireView }) {
-	return <details className="world-state-card">
-		<summary><span className="world-state-title">世界模块</span><span className="world-state-round">第 {world.round} 轮</span><span className="world-state-digest">{world.digest}</span></summary>
+export function ModularWorldCard({ world, audit }: { world: ModularWorldWireView; audit?: WorldAuditWireView }) {
+	return <details className="turn-dossier">
+		<DossierHeader title="世界模块" domain="世界卷宗 · 当前快照" meta={`第 ${world.round} 轮 · ${world.modules.length} 个模块`} digest={world.digest} />
 		<div className="world-state-body">
 			<p className="world-state-summary">{world.digest}</p>
 			{audit && <WorldRows label="审计" rows={[`${audit.status === "committed" ? "已提交" : "未提交"}｜${audit.summary}`, ...audit.warnings.map((item) => `提醒｜${item}`)]} />}
@@ -1254,19 +1255,18 @@ function NativeCalendarCard({ calendar }: { calendar: CalendarView }) {
 	</details>;
 }
 
-function EcologyStateCard({ ecology }: { ecology: EcologyWireView }) {
-	const [revealed, setRevealed] = useState(false);
-	useEffect(() => { setRevealed(false); }, [ecology.round, ecology.digest]);
+export function EcologyStateCard({ ecology }: { ecology: EcologyWireView }) {
+	const snapshot = JSON.stringify(ecology);
+	const [disclosure, setDisclosure] = useState({ snapshot, revealed: false });
+	const revealed = disclosure.snapshot === snapshot && disclosure.revealed;
+	// Reset consent during render: a new snapshot must never commit with stale disclosure.
+	if (disclosure.snapshot !== snapshot) setDisclosure({ snapshot, revealed: false });
 	const cognition = ecology.spoilers.cognition ?? [];
 	const advances = ecology.spoilers.actorAdvances ?? [];
 	const propagation = ecology.propagation ?? [];
 	const spoilerCount = ecology.spoilers.actors.length + ecology.spoilers.events.length + ecology.spoilers.secrets.length + cognition.length + advances.length;
-	return <details className="world-state-card ecology-state-card">
-		<summary>
-			<span className="world-state-title">鲜活世界</span>
-			<span className="world-state-round">第 {ecology.round} 轮</span>
-			<span className="world-state-digest">{ecology.digest}</span>
-		</summary>
+	return <details className="turn-dossier">
+		<DossierHeader title="鲜活世界" domain="生态卷宗 · 当前快照" meta={`第 ${ecology.round} 轮`} digest={ecology.digest} />
 		<div className="world-state-body">
 			<p className="world-state-summary">{ecology.digest}</p>
 			{ecology.public.locations.length > 0 && <WorldRows label="公开场所动态" rows={ecology.public.locations} />}
@@ -1278,14 +1278,14 @@ function EcologyStateCard({ ecology }: { ecology: EcologyWireView }) {
 				{ecology.discovered.actors.length > 0 && <WorldRows label="场外人物" rows={ecology.discovered.actors} />}
 			</details>}
 			{spoilerCount > 0 && <div className="ecology-spoiler">
-				{!revealed ? <button type="button" className="drawer-btn ecology-reveal" onClick={() => setRevealed(true)}>查看幕后剧透（{spoilerCount} 条）</button> : <>
+				{!revealed ? <button type="button" className="drawer-btn ecology-reveal" onClick={() => setDisclosure({ snapshot, revealed: true })}>查看幕后剧透（{spoilerCount} 条）</button> : <>
 					<div className="world-secret-note">以下是系统掌握但用户角色未必知道的幕后真相。</div>
 					{ecology.spoilers.actors.length > 0 && <WorldRows label="人物真实目标" rows={ecology.spoilers.actors} />}
 					{ecology.spoilers.events.length > 0 && <WorldRows label="秘密事件" rows={ecology.spoilers.events} />}
 					{ecology.spoilers.secrets.length > 0 && <WorldRows label="幕后真相" rows={ecology.spoilers.secrets} />}
 					{cognition.length > 0 && <WorldRows label="人物认知边界" rows={cognition} />}
 					{advances.length > 0 && <WorldRows label="后台人物推进" rows={advances} />}
-					<button type="button" className="drawer-btn" onClick={() => setRevealed(false)}>收起剧透</button>
+					<button type="button" className="drawer-btn" onClick={() => setDisclosure({ snapshot, revealed: false })}>收起剧透</button>
 				</>}
 			</div>}
 		</div>
@@ -1293,16 +1293,27 @@ function EcologyStateCard({ ecology }: { ecology: EcologyWireView }) {
 }
 
 /** Text-only derived views, explicitly revealed by the reader; never fed back as author text. */
-function NpcParallelViews({receipt}:{receipt:NpcParallelReceipt}) {
+export function NpcParallelViews({receipt}:{receipt:NpcParallelReceipt}) {
  const labels={accepted:"鲜活世界已采纳",rejected:"冲突批次未采纳",empty:"本轮无侧写",failed:"接入未完成"};
- return <details className="world-state-card npc-parallel-views"><summary><span className="world-state-title">众生侧写 · 幕后视角</span><span>{labels[receipt.status]}</span></summary><div className="world-state-body">
-  <p>读者可见不代表用户角色知情。侧写独立保存，不改作者原稿；只有已采纳状态进入鲜活世界。</p>
+  return <details className="turn-dossier npc-parallel-views"><DossierHeader title="众生侧写 · 幕后视角" domain="人物卷宗 · 来源绑定收据" meta={labels[receipt.status]} /><div className="world-state-body">
+   <p className="turn-dossier-note">读者可见不代表用户角色知情。侧写独立保存，不改作者原稿；只有已采纳状态进入鲜活世界。</p>
   {receipt.reason && <p role={receipt.status==="failed"?"alert":undefined}>{receipt.reason}</p>}
   {receipt.entries.map(entry=><details key={entry.id}><summary>{entry.name} · {entry.status==="accepted"?"已采纳":"候选，未入账"}</summary><p style={{whiteSpace:"pre-wrap"}}>{entry.text}</p>{entry.info&&<p style={{whiteSpace:"pre-wrap"}}>{entry.info}</p>}{entry.reason&&<p>{entry.reason}</p>}</details>)}
-  <small>上游 {receipt.upstreamVersion} · {receipt.upstreamCommit.slice(0,7)} · 正文来源 {receipt.sourceEntryId}</small>
+   <small className="turn-dossier-source">上游 {receipt.upstreamVersion} · {receipt.upstreamCommit.slice(0,7)} · 正文来源 {receipt.sourceEntryId}</small>
  </div></details>;
 }
 
-function VeridisRewriteView({receipt,original}:{receipt:VeridisRewriteReceipt;original:string}) {
- return <details className="world-state-card"><summary>Veridis Rewrite · {receipt.status==="complete"?(receipt.changed?"净化显示稿":"未发生措辞变化"):receipt.status==="skipped"?(receipt.reason?.includes("未命中")?"未命中规则，正常跳过":"已跳过（查看原因）"):"净化失败，原稿保留"}</summary><div className="world-state-body"><p>净化只作用于来源绑定的显示投影，不改原作者交付、故事事实或变量。模型语义保真不等于程序已证明。</p>{receipt.error&&<p role="alert">{receipt.error}</p>}{receipt.reason&&<p>{receipt.reason}</p>}<details><summary>查看原作者完整交付</summary><p style={{whiteSpace:"pre-wrap"}}>{original}</p></details>{receipt.status==="complete"&&receipt.changed&&<details><summary>查看净化后的显示稿</summary><p style={{whiteSpace:"pre-wrap"}}>{receipt.text}</p></details>}</div></details>;
+export function VeridisRewriteView({receipt,original}:{receipt:VeridisRewriteReceipt;original:string}) {
+	const status = receipt.status === "complete" ? (receipt.changed ? "净化显示稿" : "未发生措辞变化") : receipt.status === "skipped" ? (receipt.reason?.includes("未命中") ? "未命中规则，正常跳过" : "已跳过（查看原因）") : "净化失败，原稿保留";
+	return <details className="turn-dossier">
+		<DossierHeader title="Veridis Rewrite" domain="文字对照 · 显示投影收据" meta={status} />
+		<div className="world-state-body">
+			<p className="turn-dossier-note">净化只作用于来源绑定的显示投影，不改原作者交付、故事事实或变量。模型语义保真不等于程序已证明。</p>
+			{receipt.error && <p role="alert">{receipt.error}</p>}{receipt.reason && <p>{receipt.reason}</p>}
+			<div className="turn-dossier-compare">
+				<details open><summary>查看原作者完整交付</summary><p>{original}</p></details>
+				{receipt.status === "complete" && receipt.changed && <details open><summary>查看净化后的显示稿</summary><p>{receipt.text}</p></details>}
+			</div>
+		</div>
+	</details>;
 }

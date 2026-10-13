@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import "../npc-parallel.css";
+import { PluginLeaveError, usePluginLeave } from "../plugins/usePluginLeave.tsx";
 
 type Toast = (level: "info" | "warning" | "error", text: string) => void;
 type Receipt = { status: string; sourceEntryId: string; accepted: number; rejected: number; total: number };
@@ -106,11 +107,13 @@ function Switch({ checked, disabled, label, onChange }: {
 
 export function NpcParallelOriginalSettings({ theme, contextTick, onBack, embedded = false }: { theme: "light" | "dark"; contextTick: number; onBack: () => void; embedded?: boolean }) {
 	const frameRef = useRef<HTMLIFrameElement>(null);
+	const managerRef = useRef<HTMLDivElement>(null);
+	const { leave, pending: leaving, error: leaveError, discard } = usePluginLeave(managerRef, contextTick);
 	const [attempt, setAttempt] = useState(0);
 	const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
 	const [problem, setProblem] = useState("");
 	const onBackRef = useRef(onBack);
-	onBackRef.current = onBack;
+	onBackRef.current = () => leave(onBack);
 
 	useEffect(() => {
 		let active = true;
@@ -219,19 +222,23 @@ export function NpcParallelOriginalSettings({ theme, contextTick, onBack, embedd
 	}, [attempt, contextTick, theme]);
 
 	const retry = () => {
+		leave(() => {
 		setPhase("loading");
 		setProblem("");
 		setAttempt(value => value + 1);
+		});
 	};
 	const src = `/npc-parallel-host.html?view=manager&theme=${theme}`;
-	return <div className={`npc-parallel-manager${embedded ? " is-embedded" : ""}`} role="region" aria-label="众生侧写原版设置">
+	return <div ref={managerRef} className={`npc-parallel-manager${embedded ? " is-embedded" : ""}`} role="region" aria-label="众生侧写原版设置">
 		<header className="npc-parallel-manager-header">
 			<div><span className="npc-parallel-eyebrow">原版管理页</span><h3>众生侧写设置</h3><p>梨园宿主适配页 · 不改写主线原稿</p></div>
 			<div className="npc-parallel-manager-actions">
-				<button type="button" className="npc-parallel-button" onClick={onBack}>返回梨园管理</button>
+				<button type="button" className="npc-parallel-button" disabled={leaving} onClick={() => leave(onBack)}>返回梨园管理</button>
 				<button type="button" className="npc-parallel-button npc-parallel-icon-button" aria-label="重新载入原版设置" title="重新载入原版设置" onClick={retry}>↻</button>
 			</div>
 		</header>
+		{leaving && <p role="status">正在等待原设置保存确认…</p>}
+		<PluginLeaveError error={leaveError} discard={discard} />
 		<div className={`npc-parallel-frame-wrap${phase !== "ready" ? " is-not-ready" : ""}`}>
 			<iframe ref={frameRef} key={attempt} title="众生侧写原版设置" src={`${src}&attempt=${attempt}&contextTick=${encodeURIComponent(String(contextTick))}`}
 				sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups" aria-hidden={phase !== "ready"} />
@@ -404,7 +411,7 @@ export function NpcParallelPanel({ contextTick, storyBusy = false, toast, onOpen
 
 			<div className="npc-parallel-info-grid">
 				<div className="npc-parallel-info"><span>鲜活世界依赖</span><strong className={status.ecologyEnabled ? "is-ok" : "is-muted"}>{status.ecologyEnabled ? "已开启" : "未开启"}</strong></div>
-				<div className="npc-parallel-info"><span>独立模型岗位</span><strong>3.8 Flash</strong><small>与正文作者分开调用</small></div>
+				<div className="npc-parallel-info"><span>独立模型岗位</span><strong>{status.model?.id ?? "未提供"}</strong><small>与正文作者分开调用</small></div>
 				{status.model && <div className="npc-parallel-info npc-parallel-info-wide"><span>服务端报告模型</span><strong>{status.model.provider}/{status.model.id}</strong></div>}
 			</div>
 

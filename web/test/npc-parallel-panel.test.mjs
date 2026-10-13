@@ -64,7 +64,7 @@ test("众生侧写管理卡：安装/开关/候选/状态失败/原页就绪与�
 				managerRequests.push({ view: url.searchParams.get("view"), theme: url.searchParams.get("theme") });
 				res.writeHead(200, { "content-type": "text/html" });
 				const delay = frameReadyDelay;
-				return res.end(`<!doctype html><html><body><main>合成众生侧写原设置 fixture</main><button id="escape">iframe内按Escape返回</button><script>setTimeout(()=>parent.postMessage({type:'liyuan:npc-parallel-ready'},location.origin),${delay});</script></body></html>`);
+				return res.end(`<!doctype html><html><body><main>合成众生侧写原设置 fixture</main><button id="escape">iframe内按Escape返回</button><script>window.LiyuanNpcParallel={flush:async()=>{}};setTimeout(()=>parent.postMessage({type:'liyuan:npc-parallel-ready'},location.origin),${delay});</script></body></html>`);
 			}
 			if (url.pathname === "/fixture.js") { res.writeHead(200, { "content-type": "text/javascript" }); return res.end(await (await import("node:fs/promises")).readFile(join(cwd, "fixture.js"))); }
 			if (url.pathname === "/fixture.css") { res.writeHead(200, { "content-type": "text/css" }); return res.end(await (await import("node:fs/promises")).readFile(join(cwd, "fixture.css"))); }
@@ -87,7 +87,7 @@ test("众生侧写管理卡：安装/开关/候选/状态失败/原页就绪与�
 		await card.getByText(/最近鲜活世界回执：整批拒绝（业务审阅）/).waitFor();
 		await card.getByText(/正常业务拒绝：本批候选未入账，原生态状态保持不变/).waitFor();
 		assert.equal(await card.getByRole("alert").count(), 0, "业务拒绝回执不是技术错误告警");
-		await card.getByText("3.8 Flash", { exact: true }).waitFor();
+		await card.getByText("gemini-3.8-flash", { exact: true }).waitFor();
 		await card.getByText("new/gemini-3.8-flash", { exact: true }).waitFor();
 		assert.equal(await card.getByRole("button", { name: "显式安装原版" }).isDisabled(), false);
 		assert.equal(await card.getByRole("switch", { name: "众生侧写原版插件启用开关" }).isDisabled(), true, "未安装时不可直接启用");

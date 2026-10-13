@@ -70,6 +70,10 @@ git push https://github.com/OWNER/REPO.git HEAD:main
 
 ## 部署边界
 
-分支同步不重启服务、不改模型连接或用户资料。部署先候选构建与离线/浏览器验证，再确认空闲、备份当前 dirty 源码、旧 dist 和实际私有路径，最后切换并核对 health/hello/bundle/SW。保留可回退产物和来源，回退产品代码不等于回滚私人故事或数据库。
+分支同步不重启服务、不改模型连接或用户资料。按用户授权，维护和部署默认不再新建手工本地备份/归档。先核验 GitHub 恢复仓库 URL、分支或标签所指向的精确 commit，以及与该提交匹配的源码、manifest/锁文件、SDK 和前端产物；记录产物来源与校验和，确认可获取且足以恢复本次授权目标，不能仅凭分支名或版本号认定可恢复。
+
+GitHub 仅覆盖已推送、通过核验且获准公开的内容，不覆盖本地未推送提交、dirty 改动或私有资料。恢复覆盖不足、产物不匹配或操作会危及未覆盖内容时停止，请求专项保留/恢复方案；不为补齐恢复源自动提交、推送、Release 或备份，不覆盖继承 dirty。已有备份不删除，原子 `.bak` 与更新器内部回退保留；旧更新脚本仍有归档副作用，限制见 [LOCAL-UPSTREAM-UPDATES](LOCAL-UPSTREAM-UPDATES.md#现有脚本限制)。
+
+部署先候选构建与离线/浏览器验证，再确认空闲与上述恢复来源有效，最后切换并核对 health/hello/bundle/SW。私有资料留在原处并保持权限；回退只针对本次授权产品目标，不回滚私人故事或数据库。
 
 部署不能偷偷启用插件、autoUpdate、旧渠道或重生成故事。具体运维与数据保护见 [VPS-OPERATIONS](../deploy/VPS-OPERATIONS.md)，上游审阅见 [LOCAL-UPSTREAM-UPDATES](LOCAL-UPSTREAM-UPDATES.md)。

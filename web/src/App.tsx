@@ -108,6 +108,8 @@ import { PresetPanel } from "./components/PresetPanel.tsx";
 import { RosterPanel } from "./components/RosterPanel.tsx";
 import { SessionsPanel } from "./components/SessionsPanel.tsx";
 import { SettingsPanel } from "./components/SettingsPanel.tsx";
+import { useReadingNavigation } from "./use-reading-position.ts";
+import { useReadingHistory } from "./use-reading-history.ts";
 import { DatabasePluginManager } from "./components/DatabasePluginManager.tsx";
 import { RegexManager } from "./components/RegexManager.tsx";
 import { TavernPluginsManager } from "./components/TavernPluginsManager.tsx";
@@ -263,7 +265,7 @@ export default function App() {
 	const [turnTokenEstimate, setTurnTokenEstimate] = useState(0);
 	const [toolNote, setToolNote] = useState<string | null>(null);
 	/** 本轮过程步骤（实时清单渲染用；与 turnActsRef 同内容） */
-	const [liveActs, setLiveActs] = useState<WireActivity[]>([]);
+	const [, setLiveActs] = useState<WireActivity[]>([]);
 	const [toasts, setToasts] = useState<Toast[]>([]);
 	// 在线更新：WS update 帧驱动；modal 开关与 ready 气泡的本次会话收起标记
 	const [updateInfo, setUpdateInfo] = useState<UpdateWire | null>(null);
@@ -357,6 +359,8 @@ export default function App() {
 	 * 久未访问启动显示；点品牌强制打开；开会话/发消息后收起。
 	 */
 	const [welcome, setWelcome] = useState(() => shouldShowHomeOnBoot());
+	const [readingNavigation, setReadingNavigation] = useState(0);
+	const [readingSessionId, setReadingSessionId] = useState("");
 	const [planningOpen, setPlanningOpen] = useState(false);
 	const [databaseOpen, setDatabaseOpen] = useState(false);
 	const [tavernPluginsOpen, setTavernPluginsOpen] = useState(false);
@@ -367,6 +371,7 @@ export default function App() {
 	const openTavernPlugins = useCallback(() => { setCenterMenu(null); setRegexOpen(false); setDatabaseOpen(false); setTavernPluginsOpen(true); }, []);
 
 	const dismissWelcome = useCallback(() => {
+		setReadingNavigation(value => value + 1);
 		setWelcome(false);
 		setAtHome(false); // 进入对话：刷新可续聊
 		touchVisit();
@@ -444,6 +449,10 @@ export default function App() {
 	const [settlementRetrying, setSettlementRetrying] = useState(false);
 	const uploadInputRef = useRef<HTMLInputElement>(null);
 	const atBottomRef = useRef(true);
+	const { onScroll, jumpToBottom } = useReadingNavigation({
+		listRef, atBottomRef, setAtBottom, welcome,
+		sessionId: readingSessionId, navigation: readingNavigation,
+	});
 
 	useEffect(() => {
 		const field = inputRef.current;
@@ -486,15 +495,6 @@ export default function App() {
 
 	useEffect(() => {
 		welcomeRef.current = welcome;
-		if (!welcome) return;
-		// 回主页：滚到欢迎区最顶（两帧后布局已换，避免停在对话流原滚动位）
-		const id1 = requestAnimationFrame(() => {
-			requestAnimationFrame(() => {
-				const el = listRef.current;
-				if (el) el.scrollTop = 0;
-			});
-		});
-		return () => cancelAnimationFrame(id1);
 	}, [welcome]);
 
 	const pushToast = useCallback((level: Toast["level"], text: string) => {
@@ -780,6 +780,7 @@ export default function App() {
 					// 切到别的会话：清空会话内数据（同会话的命令后重放则保留）
 					if (sessionIdRef.current !== frame.sessionId) {
 						sessionIdRef.current = frame.sessionId;
+						setReadingSessionId(frame.sessionId);
 						setWarnings([]);
 						setActiveChoice(null);
 						turnActsRef.current = [];
@@ -1189,6 +1190,10 @@ export default function App() {
 		});
 		return out;
 	}, [numbered]);
+	const { start: historyStart, loadEarlier } = useReadingHistory({
+		count: blocks.length, sessionId: readingSessionId, welcome, navigation: readingNavigation,
+		listRef, atBottomRef, setAtBottom,
+	});
 
 	const lastNarrativeIdx = useMemo(() => {
 		for (let i = messages.length - 1; i >= 0; i--) if (messages[i].channel === "narrative") return i;
@@ -1261,28 +1266,6 @@ export default function App() {
 		const timer = window.setInterval(tick, 250);
 		return () => window.clearInterval(timer);
 	}, [busy, turnStartedAt]);
-
-	// 跟随滚动：仅当用户本就在底部
-	useEffect(() => {
-		const el = listRef.current;
-		if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
-	}, [messages, streamText, streamThinking, thinkingLive, toolNote, liveActs, liveSegs]);
-
-	const onScroll = () => {
-		const el = listRef.current;
-		if (!el) return;
-		const near = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
-		atBottomRef.current = near;
-		setAtBottom(near);
-	};
-
-	const jumpToBottom = () => {
-		const el = listRef.current;
-		if (!el) return;
-		atBottomRef.current = true;
-		setAtBottom(true);
-		el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-	};
 
 	/**
 	 * 场外标记粗判（仅 UX 用：发出后顺手展开助手面板）。
@@ -2015,8 +1998,8 @@ export default function App() {
 				<button type="button" className="database-entry" aria-label="数据库" onClick={openDatabase}>
 					<IconCodex size={16} /> 数据库
 				</button>
-				<button type="button" className="tavern-plugin-entry" aria-label="酒馆插件：酒馆助手与提示词模板" onClick={openTavernPlugins}>
-					<IconPuzzle size={16} /> <span>酒馆插件</span>
+				<button type="button" className="tavern-plugin-entry" aria-label="插件中心：酒馆助手、提示词模板、MVU、众生侧写与 Veridis Rewrite" onClick={openTavernPlugins}>
+					<IconPuzzle size={16} /> <span>插件中心</span>
 				</button>
 			</nav>
 
@@ -2154,13 +2137,15 @@ export default function App() {
 											<div className="empty-hint">{conn === "open" ? "新的会话，开始对话吧。" : "连接后台中…"}</div>
 										</div>
 									)}
-									{blocks.map((b, bi) =>
+									{historyStart > 0 && <button type="button" className="drawer-btn" onClick={loadEarlier}>加载更早记录（还有 {historyStart} 块）</button>}
+									{blocks.slice(historyStart).map((b, visibleIndex) => <div key={`${readingSessionId}:${b.kind}:${b.idx}`} data-reading-block={b.idx} style={{ display: "flow-root" }}>
+										{
 										b.kind === "backstage" ? (
 											<BackstageGroup
 												key={`bs-${b.idx}`}
 												msgs={b.msgs}
 												fallbackName={charName}
-												open={bi === blocks.length - 1}
+												open={historyStart + visibleIndex === blocks.length - 1}
 												avatarUrl={charAvatarUrl}
 											/>
 										) : (
@@ -2291,7 +2276,8 @@ export default function App() {
 														: undefined
 												}
 											/>
-										),
+										)}
+									</div>,
 									)}
 								</>
 							)}
@@ -2331,7 +2317,7 @@ export default function App() {
 						</div>
 					</div>
 
-					{!atBottom && (
+					{!welcome && !atBottom && (
 						<button className="jump-bottom" onClick={jumpToBottom} title="回到最新" aria-label="回到最新">
 							<IconChevronDown size={17} />
 						</button>

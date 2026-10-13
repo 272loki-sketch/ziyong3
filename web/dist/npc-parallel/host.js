@@ -160,6 +160,7 @@ try {
   let saveQueue = Promise.resolve();
   let saveTimer = null;
   let savePending = false;
+  let saveFailure = null;
   const nativeFetch = window.fetch.bind(window);
   const sameOriginPath = input => {
     const raw = input instanceof Request ? input.url : String(input);
@@ -223,12 +224,30 @@ try {
       saveTimer = null;
       if (!savePending) return;
       savePending = false;
-      saveQueue = saveQueue.then(saveStateNow).catch(error => {
+      saveQueue = saveQueue.then(saveStateNow).then(() => { saveFailure = null; }).catch(error => {
+        saveFailure = error;
         setStatus(error?.message ?? String(error), true);
         try { window.toastr.error(error?.message ?? String(error), '梨园 · 众生侧写'); } catch { /* UI status above remains authoritative. */ }
       });
     }, 250);
     return Promise.resolve();
+  }
+
+  async function flushSettings() {
+    if (mode !== 'manager') return;
+    if (saveTimer !== null) { clearTimeout(saveTimer); saveTimer = null; }
+    await saveQueue;
+    // Retry a failed snapshot only on an explicit flush, keeping the original CAS binding.
+    while (savePending || saveFailure) {
+      savePending = false;
+      saveQueue = saveQueue.then(saveStateNow).then(() => { saveFailure = null; }).catch(error => {
+        saveFailure = error;
+        setStatus(error?.message ?? String(error), true);
+      });
+      await saveQueue;
+      if (saveFailure) throw saveFailure;
+      if (saveTimer !== null) { clearTimeout(saveTimer); saveTimer = null; }
+    }
   }
 
   window.LiyuanNpcParallelHost = {
@@ -342,7 +361,7 @@ try {
   window.EventSource = class DisabledNpcParallelEventSource { constructor() { throw new DOMException('NPC Parallel 宿主禁用EventSource', 'NotSupportedError'); } };
 
   if (mode === 'manager') installManagerGuards();
-  window.LiyuanNpcParallel = { ready: () => !!window.LiyuanNpcParallelHost?.ready };
+  window.LiyuanNpcParallel = { ready: () => !!window.LiyuanNpcParallelHost?.ready, flush: flushSettings };
   setStatus(mode === 'runtime' ? '正在加载隔离的原版运行器…' : '正在加载原版设置…');
 
   if (!isRecord(bootstrap.manifest)) throw new Error('管理/运行上下文缺少经来源校验的原版manifest');

@@ -1,4 +1,6 @@
 /* Drawer-style hierarchy inspired by the native Luker/MVU panel; porcelain/cinnabar tokens stay local. */
+.plugin-center-detail .mvu-panel{margin:0}
+@media(max-width:460px){.plugin-center-detail .mvu-panel-header{flex-wrap:wrap}.plugin-center-detail .mvu-panel-heading{flex-basis:calc(100% - 50px)}}
 .mvu-panel{margin:0 32px 28px;border:1px solid var(--hairline-strong,#d9d2c8);border-radius:16px;background:var(--surface,#fffcfa);color:var(--text,#3d3833);overflow:hidden;min-width:0}
 .mvu-panel-header{display:flex;align-items:center;gap:12px;padding:20px 24px;border-bottom:1px solid var(--hairline,#ebe6df)}
 .mvu-panel-mark{display:grid;place-items:center;flex-shrink:0;width:44px;height:44px;border-radius:12px;background:var(--accent-wash,#faeee7);color:var(--accent,#bc4123);font-size:12px;font-weight:750;letter-spacing:.03em}

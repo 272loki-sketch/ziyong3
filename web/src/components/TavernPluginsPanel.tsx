@@ -4,6 +4,7 @@ import { IconBack, IconClose, IconRefresh, IconPuzzle, IconCheck } from "./icons
 import { Toggle } from "./kit.tsx";
 import type { MvuSettingsTarget } from "./MvuPanel.tsx";
 import "./TavernPluginsPanel.css";
+import { PluginLeaveError, usePluginLeave } from "../plugins/usePluginLeave.tsx";
 
 type Toast = (level: "info" | "warning" | "error", text: string) => void;
 const messageOf = (error: unknown) => error instanceof Error ? error.message : "酒馆插件操作失败";
@@ -13,6 +14,10 @@ type OriginalSettingsProps = { plugin: TavernPluginInfo; contextTick?: number; o
 
 /** Loads the unmodified upstream settings page and waits for its real host-ready state. */
 export function OriginalTavernPluginManager({ plugin, contextTick = 0, onClose, presentation = "modal", mvu }: OriginalSettingsProps) {
+	const rootRef = useRef<HTMLElement>(null);
+	const { leave, pending: leaving, error: leaveError, discard } = usePluginLeave(rootRef, contextTick);
+	const close = useRef(() => {});
+	close.current = () => leave(onClose);
 	const name=mvu?"MVU 变量框架":plugin.name,version=mvu?.version??plugin.version,commit=mvu?.commit??plugin.commit;
 	const [attempt, setAttempt] = useState(0);
 	const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
@@ -25,7 +30,7 @@ export function OriginalTavernPluginManager({ plugin, contextTick = 0, onClose, 
 		if (inline) { closeRef.current?.focus(); return; }
 		const previous = document.activeElement;
 		const onKey = (event: KeyboardEvent) => {
-			if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); onClose(); }
+			if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); close.current(); }
 		};
 		window.addEventListener("keydown", onKey);
 		document.body.classList.add("tavern-plugins-manager-open");
@@ -48,7 +53,7 @@ export function OriginalTavernPluginManager({ plugin, contextTick = 0, onClose, 
 		let observedFrameDocument: Document | null = null;
 		const frame = frameRef.current;
 		const onEmbeddedKeyDown = (event: KeyboardEvent) => {
-			if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); onClose(); }
+			if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); close.current(); }
 		};
 		const stop = () => {
 			terminal = true;
@@ -116,10 +121,10 @@ export function OriginalTavernPluginManager({ plugin, contextTick = 0, onClose, 
 		};
 	}, [attempt, contextTick, plugin.id, plugin.commit, mvu?.commit]);
 
-	const retry = () => { setPhase("loading"); setFrameError(""); setAttempt(value => value + 1); };
+	const retry = () => leave(() => { setPhase("loading"); setFrameError(""); setAttempt(value => value + 1); });
 	const closeButton = inline
-		? <button ref={closeRef} type="button" className="drawer-btn" onClick={onClose}><IconBack size={15} /> 返回酒馆插件</button>
-		: <button ref={closeRef} type="button" className="icon-btn" aria-label="关闭上游管理台" onClick={onClose}><IconClose size={18} /></button>;
+		? <button ref={closeRef} type="button" className="drawer-btn" onClick={() => close.current()}><IconBack size={15} /> 返回酒馆插件</button>
+		: <button ref={closeRef} type="button" className="icon-btn" aria-label="关闭上游管理台" onClick={() => close.current()}><IconClose size={18} /></button>;
 	const frame = <div className={`tavern-plugin-frame-wrap ${phase !== "ready" ? "is-not-ready" : ""}`}>
 		<iframe
 			ref={frameRef}
@@ -139,29 +144,32 @@ export function OriginalTavernPluginManager({ plugin, contextTick = 0, onClose, 
 		</div>}
 	</div>;
 
-	if (inline) return <section className="tavern-plugin-original-inline" aria-label={`${name}原版设置`}>
+	const leaveFeedback = <>{leaving && <p role="status">正在等待原设置保存确认…</p>}<PluginLeaveError error={leaveError} discard={discard} /></>;
+	if (inline) return <section ref={rootRef} className="tavern-plugin-original-inline" aria-label={`${name}原版设置`}>
 		<header><div><h3>{name} · 原上游设置</h3><small>已核验 {version ?? "未知版本"} · {commit?.slice(0, 12) ?? "未知 commit"}</small></div>
 			<div className="tavern-plugins-manager-actions">{closeButton}<button type="button" className="icon-btn" aria-label="重新载入上游管理台" onClick={retry}><IconRefresh size={17} /></button></div>
 		</header>
 		<p className="field-hint tavern-plugins-manager-note">原版插件运行文件保持不变；中文、主题与交互由梨园宿主适配。</p>
-		{frame}
+		{leaveFeedback}{frame}
 	</section>;
 
-	return <div className="tavern-plugins-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-		<section className="tavern-plugins-manager" role="dialog" aria-modal="true" aria-label={`${name}原上游管理台`}>
+	return <div className="tavern-plugins-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close.current(); }}>
+		<section ref={rootRef} className="tavern-plugins-manager" role="dialog" aria-modal="true" aria-label={`${name}原上游管理台`}>
 			<header><div><h3>{name} · 原上游管理台</h3><small>已核验 {version ?? "未知版本"} · {commit?.slice(0, 12) ?? "未知 commit"}</small></div>
 				<div className="tavern-plugins-manager-actions">{closeButton}<button type="button" className="icon-btn" aria-label="重新载入上游管理台" onClick={retry}><IconRefresh size={17} /></button></div>
 			</header>
 			<p className="field-hint tavern-plugins-manager-note">原版插件运行文件保持不变；中文、主题与交互由梨园宿主适配。</p>
-			{frame}
+			{leaveFeedback}{frame}
 		</section>
 	</div>;
 }
 
-export function TavernPluginsPanel({ toast, contextTick = 0, managerMode = false, onOpenOriginal }: {
+export function TavernPluginsPanel({ toast, contextTick = 0, managerMode = false, onOpenOriginal, pluginId, storyBusy = false }: {
 	toast: Toast;
 	contextTick?: number;
 	managerMode?: boolean;
+	pluginId?: TavernPluginId;
+	storyBusy?: boolean;
 	onOpenOriginal?: (plugin: TavernPluginInfo) => void;
 }) {
 	const [status, setStatus] = useState<TavernPluginsStatus | null>(null);
@@ -225,13 +233,14 @@ export function TavernPluginsPanel({ toast, contextTick = 0, managerMode = false
 		finally { actionRunning.current = false; if (mounted.current) setBusy(false); }
 	};
 	const managerPlugin = status?.plugins.find((plugin) => plugin.id === managerId);
-	const disabled = busy || !!status?.checking;
+	const disabled = busy || loading || !!error || storyBusy || !!status?.checking;
 	return <section className={`sp-section tavern-plugins-panel ${managerMode ? "is-manager" : ""}`} aria-busy={loading || busy}>
 		{!managerMode && <h4>酒馆助手与提示词模板 · 原版接入</h4>}
 		<p className="tavern-plugins-intro">管理角色卡的渲染、脚本与模板功能。安装和开启分开进行，原数据始终保留。</p>
+		{storyBusy && <p role="status" className="plugin-center-footnote">故事正在生成或后台整理，完成后可修改插件设置。</p>}
 		{error && status && <div className="panel-error tavern-plugin-status-error" role="alert">状态刷新失败：{error}<button type="button" className="drawer-btn" disabled={busy} onClick={() => void refresh(true).catch(() => {})}>重试读取状态</button></div>}
 		{!status ? loading ? <div className="tavern-plugins-loading" role="status">正在读取原插件安装与完整性状态…</div> : <div className="tavern-plugin-empty-state"><p role="alert">无法读取酒馆插件状态{error ? `：${error}` : ""}</p><button type="button" className="drawer-btn" disabled={busy || loading} onClick={() => void refresh(true).catch(() => {})}>重新读取插件状态</button></div> : <>
-			<div className="tavern-plugin-grid">{status.plugins.map((plugin) => <article className={`tavern-plugin-card ${managerMode ? "tavern-plugin-card-manager" : ""}`} key={plugin.id} aria-label={`${plugin.name}来源与更新`}>
+			<div className="tavern-plugin-grid">{status.plugins.filter(plugin => !pluginId || plugin.id === pluginId).map((plugin) => <article className={`tavern-plugin-card ${managerMode ? "tavern-plugin-card-manager" : ""}`} key={plugin.id} aria-label={`${plugin.name}来源与更新`}>
 				<div className="tavern-plugin-heading">
 					<span className="tavern-plugin-symbol" aria-hidden="true"><IconPuzzle size={23} /></span>
 					<div className="tavern-plugin-title"><strong>{plugin.name}</strong><p>{plugin.id === "helper" ? "HTML 渲染 · 脚本 · 变量管理" : "EJS 求值 · 提示词注入 · 消息模板"}</p></div>
