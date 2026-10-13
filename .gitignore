@@ -1,0 +1,232 @@
+# deps
+node_modules/
+web/node_modules/
+packages/**/node_modules/
+
+# runtime / user data (never ship)
+# Only this exact product extension is public; sibling files remain private.
+.liyuan/*
+!.liyuan/extensions/
+.liyuan/extensions/*
+!.liyuan/extensions/roleplay.ts
+# Future runtime namespaces, including files and atomic staging bytes.
+.liyuan-*
+.rp-*
+.local/
+.pi/
+.liyuan-artifacts/
+.liyuan-assistant/
+.liyuan-cache/
+.liyuan-codex/
+.liyuan-lore/
+.liyuan-media/
+.liyuan-research/
+.liyuan-skills/
+.liyuan-stage-skills/
+.liyuan-state/
+.liyuan-uploads/
+.liyuan-audio/
+.liyuan-personas.json
+.rp-media/
+.rp-uploads/
+.playwright-mcp/
+
+# local secrets & personal config
+liyuan.agent.json
+liyuan.agent.meta.json
+liyuan.config.json
+liyuan-preset.json
+.liyuan-mcp.json
+.liyuan-memory/
+rp.config*.json
+rp-preset.json
+rp.agent.json
+rp.agent.meta.json
+liyuan-profiles/
+# docker compose 的宿主数据目录（含 API Key 的 liyuan.agent.json）
+data/
+*.bak
+.env
+.env.*
+*.tmp
+
+# logs / build noise
+*.log
+_web-*.log
+_test-*.txt
+_test-*.json
+web/tsconfig.tsbuildinfo
+**/*.tsbuildinfo
+
+# local generative / scratch assets
+assets/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Exact approved tracked assets, not a name-prefix declassification rule.
+assets/*
+!assets/brand/
+assets/brand/*
+!assets/brand/logo.png
+!assets/cards/
+assets/cards/*
+!assets/cards/default_Qingwu.json
+!assets/lorebooks/
+assets/lorebooks/*
+!assets/lorebooks/Mistvale.json
+assets/presets/
+assets/ab-test/
+assets/import-test/
+assets/personas/
+
+# local debug screenshots (not for testers)
+web/shot-*.png
+web/bug-*.png
+web/fix-*.png
+web/latest-ui.png
+scripts/tmp-test-image.png
+white-screen-check.png
+.playwright/
+playwright-report/
+test-results/
+blob-report/
+screenshots/
+
+# local VPS / gateway debug scripts (personal ops, not product)
+scripts/_*
+
+# root-level local diagnostics and imported display regex samples
+check-statusbar.cjs
+drive-turn.mjs
+dump-narrative.cjs
+dump-session.cjs
+inspect-wire-real.mts
+probe.mjs
+test-status-detect.mts
+vps-rounds.mjs
+/regex-*.json
+
+# 根级排查脚手架（下划线约定）+ 旧实验目录 + 调试截图
+# 与 pack-release.ps1 的 $dropGlobs 同口径（那里已有 "_*"，注释写着 root-level
+# dev scratch）——两处用同一套约定，别再各自点名。锚定根级 `/_*` 而非 `_*`，
+# 否则会波及已入库的 scripts/_privacy_scan.py。
+/_*
+/scratch/
+/summaries/
+/output/
+/persist/
+/liyuan-*.png
+# 同 $dropGlobs：内部调试脚本不随包、也不入库（已入库的同名前缀文件不受影响）
+scripts/build-fanren-*.mjs
+scripts/check-*.mjs
+scripts/debug-*.mjs
+scripts/find-*.mjs
+scripts/live-*.mjs
+scripts/probe-*.mjs
+!scripts/probe-backstage.mjs
+scripts/verify-*.mjs
+scripts/write-*.mjs
+
+# optional: keep web/dist for easier clone-and-run; uncomment to force rebuild
+# web/dist/
+
+# 预设→skill 装载期生成物（用户数据，不入库）
+skills/预设-*/
+/.backup/
+/.tmp-liyuan-e2e-test.mjs
+
+# Protected local pre-deploy static bundles, never source/release artifacts
+web/.dist-*/
+
+# 原子卡保存的未提交临时字节可能含私人内嵌书；即使异常中断也不得入库
+**/.liyuan-card-*.tmp
+
+# External database plugin private state, vectors, settings and upstream cache
+.liyuan-database-plugin/
+
+# Atomic config staging may contain private data if interrupted; never commit
+**/.liyuan-json-*.tmp
+
+# Original Tavern plugins, derived private state and pinned browser dependency cache
+.liyuan-tavern-plugins/
+
+web/.liyuan-tavern-*/
+
+# Public synthetic main/card/plugin canary
+!scripts/check-tavern-canary.mjs
+# Public policy tools must remain visible despite diagnostic name conventions.
+!scripts/check-public-data.mjs
+!scripts/check-repository-privacy.mjs
+!scripts/check-publication-range.mjs
+!scripts/check-docs.mjs
+!scripts/check-director-chat.mjs
+!scripts/_privacy_scan.py
+
+# Unmodified NPC upstream cache, credentials/settings and branch-scoped derived state
+.liyuan-npc-parallel/
+
+# Locally downloaded original Veridis assets and derived settings/output; never redistributed
+.liyuan-veridis-rewrite/
+
+# Host-specific audit/deployment runners: retained locally, not product source.
+/scripts/activate-plugin-integration.mjs
+/scripts/deploy-npc-settings-ui.mjs
+/scripts/deploy-plugin-integration.mjs
+/scripts/deploy-round-plugin-repair.mjs
+/scripts/postcheck-plugin-integration.mjs
+/scripts/restart-plugin-network.mjs
+/scripts/test-flash-sdk-transport.mjs
+/scripts/analyze-session.mjs
+/scripts/drive-*.mjs
+
+# Upstream binary with uncleared redistribution; retain the local source object.
+/packages/coding-agent/examples/extensions/doom-overlay/doom/build/doom.wasm
+
+# Exact reviewed license texts and component notices only.
+/licenses/*
+!/licenses/Luker-AGPL-3.0.txt
+!/licenses/README.md
+
+# Public docs are current guides only; records remain on disk, not in new commits.
+# Mirror scripts/public-repository-policy.mjs. Tracked records still require the gate.
+/PUBLICATION.md
+/docs/*
+!/docs/AGENTIC-RESEARCH.md
+!/docs/ARCHITECTURE-NOVEL-PLAY.md
+!/docs/ARCHITECTURE-OVERVIEW.md
+!/docs/BRANCH-RELEASE-WORKFLOW.md
+!/docs/DATABASE-PLUGIN.md
+!/docs/DIRECTOR-ROOM.md
+!/docs/DOCUMENTATION-INDEX.md
+!/docs/FORMAT-DELIVERY.md
+!/docs/GENERATION-MODES.md
+!/docs/IMAGE-GENERATION-RETIREMENT.md
+!/docs/LOCAL-UPSTREAM-UPDATES.md
+!/docs/LOREBOOKS.md
+!/docs/MODEL-CONNECTIONS.md
+!/docs/MVU.md
+!/docs/NOVEL-PLAY.md
+!/docs/NOVEL-PLAY-MAINTENANCE.md
+!/docs/NPC-PARALLEL.md
+!/docs/PLAN-LIVING-ECOLOGY.md
+!/docs/PLAN-NOVEL-DIGEST.md
+!/docs/PLAN-OUTLINE-SYSTEM.md
+!/docs/PLAN-ROUND-FLOW.md
+!/docs/PLAN-RP-MEMORY.md
+!/docs/PLAN-RP-TOOLING.md
+!/docs/PLAN-WORLD-ENGINE.md
+!/docs/PRESET-SPLIT-TAXONOMY.md
+!/docs/STANDALONE-INTEGRATION-BASELINE.md
+!/docs/PRIVACY-AND-PUBLISHING.md
+!/docs/PROJECT-STRUCTURE.md
+!/docs/PROMPT-BUDGETS.md
+!/docs/PROMPT-SOURCES.md
+!/docs/READING-THINKING.md
+!/docs/RECOVERY-AND-DIAGNOSTICS.md
+!/docs/REQUEST-INSPECTOR.md
+!/docs/TAVERN-PLUGINS.md
+!/docs/THIRD-PARTY-INSPIRATION.md
+!/docs/VERIDIS-REWRITE.md
+!/docs/WRITER-API-COMPATIBILITY.md

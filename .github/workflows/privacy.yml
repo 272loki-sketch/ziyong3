@@ -1,0 +1,31 @@
+name: privacy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  privacy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+      - name: Public candidate privacy policy
+        run: npm run privacy:check
+      - name: Introduced commit privacy policy
+        if: ${{ !cancelled() }}
+        run: node scripts/check-publication-range.mjs "$GITHUB_EVENT_NAME"
+      - name: Public documentation and synthetic fixture policy
+        if: ${{ !cancelled() }}
+        run: node scripts/check-public-data.mjs

@@ -1,0 +1,2 @@
+import { RequestJournal,requestSummary,type RequestScope } from "../src/stage/request-journal.ts";
+export function inspectRequests(cwd:string,scope:RequestScope,visible:Set<string>,id?:string){const journal=new RequestJournal(cwd),rows=journal.list(scope,visible,false);if(id){const row=journal.detail(scope,visible,id);if(!row)throw Object.assign(new Error("请求不存在、已过期或不属于当前角色卡/故事分支"),{status:404});return row;}return {requests:rows.map(requestSummary),retention:"最近100次或64MiB/当前会话与卡",scope};}

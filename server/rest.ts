@@ -1,0 +1,4076 @@
+import { inspectBoundRegex, type BoundRegexSource, type RegexInspectorSnapshot } from "../src/regex-inspector.ts";
+import { writeJsonAtomicWithBackup } from "../src/atomic-json.ts";
+import { listRealTests, readRealTest } from "./real-tests.ts";
+/**
+ * REST 层（PLAN-PHASE3 §4）：面板 CRUD 走 /api/*，请求-响应形态；流内容继续走 WS wire。
+ *
+ * D3 纪律：本模块零 pi import——凡需要触碰 pi 的操作（模型/凭据/会话重载/换卡/命令），
+ * 通过 main.ts 注入的 RestHost 接口（纯平面类型）完成；本模块自己只做
+ * HTTP 路由 + liyuan.config.json / liyuan-preset.json / 世界书 / 角色卡的领域层文件操作。
+ *
+ * 写入纪律（PLAN-PHASE3 §4）：写 liyuan.config.json / 预设前先备份 .bak；
+ * 触发会话重载的写操作在流式中一律拒绝（409）。
+ */
+
+import { createHash } from "node:crypto";
+import { copyFileSync, createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, lstatSync, unlinkSync, writeFileSync } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { basename, dirname, isAbsolute, join } from "node:path";
+
+import { handleNovelPlayApiRequest, isNovelPlayStartLocked } from "./novel-play-api.ts";
+import { streamOutlineDiscussion } from "./outline-chat-stream.ts";
+
+import {
+	EMPTY_AGENT_CONFIG,
+	deleteProfile,
+	enableProfile,
+	listProfiles,
+	loadAgentConfig,
+	loadProfile,
+	materializeEnvKeysInConfig,
+	mergeModelsById,
+	migrateActiveConfigIntoProfiles,
+	normalizeAgentConfig,
+	normalizeModels,
+	publicProvider,
+	repairDefaultProvider,
+	saveAgentConfig,
+	saveProfile,
+	seedProviderFromRuntime,
+	syncAgentConfigToRuntime,
+	type AgentModelEntry,
+	type AgentProvider,
+	type LiyuanAgentConfig,
+} from "../src/agent-config.ts";
+import {
+	addCardGreeting,
+	deleteCardGreeting,
+	exportCardFile,
+	editCardLorebook,
+	writeCardBytesAtomic,
+	loadCardFile,
+	moveCardGreeting,
+	readCardRawJson,
+	remapGreetingIndexAfterMove,
+	setCardGreetings,
+	updateCardFields,
+	updateCardGreeting,
+	type CardExportLoreMode,
+	type CardFieldPatch,
+} from "../src/card.ts";
+import {
+	buildCardFrontSnapshot,
+	extractRegexScripts,
+	setSkinEnabled,
+	type CardFrontSnapshot,
+	type RegexScriptSource,
+} from "../src/cardfront.ts";
+import {
+	appendCodexEntry,
+	createCodex,
+	deleteCodexEntry,
+	findCodex,
+	keysFromTitle,
+	listCodexes,
+	loadCodexEntries,
+	userEntryToCodexInput,
+} from "../src/codex.ts";
+import { RP_COMMANDS } from "../src/commands.ts";
+import {
+	getMemoryStatus,
+	memoryClearStore,
+	memoryDeleteChunk,
+	memoryImportText,
+	memoryListChunks,
+	memoryListEventDigests,
+	memoryListDiff,
+	memoryManualAdd,
+	retryNarrativeMemory,
+	memoryReembedScope,
+	memoryRemoveStore,
+	memorySearch,
+	probeCloudEmbed,
+	updateMemoryConfig,
+	updateStoreConfig,
+} from "../src/memory/index.ts";
+import { findHistoricalImage } from "../src/historical-images.ts";
+import { normalizeStepModels, type SideModelStep } from "../src/model-routing.ts";
+import { resolveConfigPath } from "../src/paths.ts";
+import { loadStageMaterials } from "../src/stage/materials.ts";
+import { acknowledgeStageSkillBuiltin, deleteStageSkill, saveStageSkill, scanSkillFiles, type WorkflowSkillStage } from "../src/stage/skill-store.ts";
+import {
+	buildWorldProfilePrompt,
+	defaultCardWorldProfile,
+	loadCardWorldProfile,
+	manifestFromProfile,
+	normalizeCardWorldProfile,
+	saveCardWorldProfile,
+	worldProfileFingerprint,
+} from "../src/stage/literary-world-profile.ts";
+import type { WorldlineView } from "../src/worldline.ts";
+import {
+	appendLorebookFileEntry,
+	applyDisabledLore,
+	applyLoreSourceState,
+	loreSourceKey,
+	patchLorebookRawEntry,
+	deleteLorebookRawEntry,
+	exportStLorebook,
+	loadLorebookFile,
+	loadLorebookRegexScripts,
+	loreFingerprint,
+	mergeEntries,
+	mountedLorebookPaths,
+	normalizeEntries,
+	normalizeEntriesWithKeys,
+	overlayPathFor,
+	searchEntries,
+	setLorebookEntriesEnabledByUid,
+	setMountedLorebooks,
+	type LoreEntryPatch,
+} from "../src/lorebook.ts";
+import {
+	clearPersonaAvatar,
+	createPersona,
+	deletePersona,
+	findPersona,
+	loadPersonas,
+	personaForCard,
+	savePersonaAvatar,
+	savePersonas,
+	updatePersona,
+	type Persona,
+} from "../src/personas.ts";
+import {
+	loadPresetDoc,
+	patchPresetRaw,
+	presetDocBlock,
+	presetDocView,
+	type PresetBlockPatch,
+	type PresetDoc,
+} from "../src/preset-doc.ts";
+import {
+	allocateServerId,
+	discoverMcpCatalog,
+	getMcpHub,
+	loadMcpConfig,
+	probeMcpServer,
+	saveMcpConfig,
+	sanitizeServerId,
+	setDefaultEnabled,
+	validateServerConfig,
+	type McpServerConfig,
+} from "../src/mcp.ts";
+import { listSkills, saveSkill } from "../src/skills.ts";
+import { DEFAULT_CONFIG, type LorebookEntry, type RpConfig } from "../src/types.ts";
+import { readJsonFile } from "../src/jsonio.ts";
+import { formatBytes, listMedia, listUploads, saveUpload } from "../src/uploads.ts";
+
+// ---------- 宿主接口（由 main.ts 实现；纯平面类型，pi 止步于 main） ----------
+
+export interface CurrentModelInfo {
+	provider: string;
+	id: string;
+	name: string;
+	thinkingLevel: string;
+	availableLevels: string[];
+	/** 当前模型上下文窗口（来自 models.json / 连接配置；默认 128000） */
+	contextWindow: number;
+	/** 单次最大输出（来自 models.json / 连接配置；缺省时 registry 用 16384） */
+	maxTokens?: number;
+}
+
+export interface ModelInfo {
+	provider: string;
+	providerName: string;
+	id: string;
+	name: string;
+	reasoning: boolean;
+	/** 支持图片输入（上传图片可被该模型看见） */
+	vision: boolean;
+	contextWindow: number;
+	maxTokens?: number;
+}
+
+export interface AuthProviderInfo {
+	provider: string;
+	displayName: string;
+	/** 已写入 auth.json（可「移除已存 key」） */
+	configured: boolean;
+	/**
+	 * 当前是否真正可用（stored / 环境变量已设 / runtime key 等）。
+	 * 注意：pi 的 getAuthStatus().configured 对「仅环境变量」恒为 false，
+	 * 列表展示必须以 ready 为准，否则 DeepSeek 等会沉进「未配置」。
+	 */
+	ready: boolean;
+	/** 凭据来源（stored/environment/models_json_key…） */
+	source?: string;
+	/** 环境变量名等提示（如 DEEPSEEK_API_KEY） */
+	label?: string;
+	modelCount: number;
+}
+
+/** 运行时渠道快照（用于空配置时收编当前正在用的渠道） */
+export interface ProviderRuntimeSnapshot {
+	provider: string;
+	baseUrl?: string;
+	api?: string;
+	/** 环境变量名（无 $），如 DEEPSEEK_API_KEY */
+	envKey?: string;
+	models: Array<{
+		id: string;
+		name?: string;
+		reasoning?: boolean;
+		contextWindow?: number;
+		maxTokens?: number;
+	}>;
+}
+
+export interface TavernGreetingContext {
+	sessionId: string;
+	card: string;
+	leafId: string | null;
+	messageCount: number;
+	greetingIndex: number;
+	greetings: string[];
+}
+export interface TavernGreetingExpected {
+	sessionId: string;
+	card: string;
+	leafId: string | null;
+	greetingIndex: number;
+}
+export interface TavernGreetingSnapshot {
+	context: TavernGreetingContext;
+	hasStarted: boolean;
+	greetingOnly: boolean;
+	busy?: boolean;
+}
+
+export interface RestHost {
+	cwd: string;
+	/** Synchronous canonical story/greeting scope snapshot; optional for synthetic/legacy hosts. */
+	readTavernGreetingSnapshot?(): TavernGreetingSnapshot;
+	/** Guarded host/tree switch. Must verify the selected greeting before returning true. */
+	selectTavernGreeting?(index: number, expected: TavernGreetingExpected): Promise<boolean>;
+
+	isStreaming(): boolean;
+	retrySettlement?(): Promise<unknown>;
+	retryVeridisRewrite?(expectedSessionId: string, expectedSourceEntryId: string): Promise<{ aborted: boolean; error?: string }>;
+	listModels(): { current: CurrentModelInfo | null; models: ModelInfo[] };
+	selectModel(provider: string, id: string): Promise<CurrentModelInfo>;
+	setThinkingLevel(level: string): CurrentModelInfo;
+	authProviders(): AuthProviderInfo[];
+	setAuthKey(provider: string, key: string): void;
+	removeAuth(provider: string): void;
+	/** runtime agent 目录（同步用，不对用户暴露） */
+	agentDir(): string;
+	/** 取某 provider 的运行时模型/端点快照 */
+	providerSnapshot(provider: string): ProviderRuntimeSnapshot | null;
+	refreshModels(): void;
+	/** 会话重载（session_start 重放，素材重装）+ 服务端显示名刷新 + 全端对齐 */
+	reloadSession(): Promise<void>;
+	/**
+	 * 热更新：扩展内重读 config/卡/世界书/预设并重建 system prompt，不 session.reload。
+	 * 用于切身份、改 user 设定、挂载世界书等——ST 式即时生效。
+	 */
+	softRefreshConfig(): Promise<void>;
+	/** config.card 已写盘后调用：切到该卡最近会话，无则新建 */
+	switchToCard(): Promise<"switched" | "created">;
+	/** 经会话通道执行斜杠命令（/import 等，扩展的 notify 会以 wire notify 推送） */
+	promptCommand(text: string): Promise<void>;
+	/** 排队执行斜杠命令（不等待完成；流式中自动排到本轮结束）。返回是否进入了排队 */
+	queueCommand(text: string): boolean;
+	/** 面板导入（柱 2 liyuan-panels 格式）：写盘并 await panelsync 收编扩展内存 */
+	importPanels(list: Array<{ name?: unknown; kind?: unknown; content?: unknown }>): Promise<{
+		imported: number;
+		names: string[];
+		errors: string[];
+	}>;
+	/** 用户收起/删除面板（同 panel_close：归档出活跃列表，盘上保留，同名重写可重开） */
+	closePanel(name: string): Promise<void>;
+	/**
+	 * 用户手改面板 content（A：通用源码编辑）。
+	 * 须已有活跃面板；kind 可改（默认保留原 kind）。写盘 + 收编扩展内存 + 树快照。
+	 */
+	savePanel(input: {
+		name: string;
+		content: string;
+		kind?: string;
+	}): Promise<{ name: string; kind: string; updatedAt: number }>;
+	/** 当前剧情分支上挂载的知识库名（会话树 rp-codex 快照，随 rewind/fork 走） */
+	mountedCodexes(): string[];
+	// ---- 会话管理（PLAN-PANELS §2.1，main.ts 实现） ----
+	sessions(): Promise<SessionInfoLite[]>;
+	renameSession(path: string, name: string): Promise<void>;
+	deleteSession(path: string): Promise<void>;
+	/** 删除绑定某张卡的全部会话文件（删卡「相关数据」用；当前打开的会话不动） */
+	deleteCardSessions(cardRel: string): Promise<number>;
+	readSessionFile(path: string): Promise<string>;
+	searchSessions(q: string): Promise<SessionSearchHit[]>;
+	/** 世界状态用户主权编辑（applyPatch 语义，落盘+ await statesync） */
+	applyStatePatch(patch: Record<string, unknown>): Promise<{ applied: string[]; warnings: string[] }>;
+	notify(level: "info" | "warning" | "error", text: string): void;
+	/** 世界线时间线视图（会话树 rp-save + 旁路 meta） */
+	worldlineView(): import("../src/worldline.ts").WorldlineView;
+	/** 软删除存档节点 */
+	deleteWorldlineSave(saveId: string): void;
+	/** 重命名世界线（自动名可改） */
+	renameWorldline(worldlineId: string, name: string): void;
+	/** 文生音并写入会话（气泡「配音」/ REST） */
+	ttsSpeak(text: string, caption?: string): Promise<{ src: string; bytes: number }>;
+	/** 向量记忆作用域：当前角色卡 + 当前对话（换卡/新对话 = 独立库） */
+	memoryScope(): { sessionId: string; card?: string };
+	/** 当前分支最后一条角色正文（自动向量入库失败后重试）。 */
+	latestNarrativeText(): string;
+	// ---- 在线更新（主页 chip → 弹窗 → toast；状态经 WS update 帧推送） ----
+	/** 手动检查（启动已静默查过一次；这里给弹窗里的重试） */
+	updateCheckNow(): Promise<void>;
+	/** 开始下载暂存（mirror=镜像前缀，空=直连）；进度经 WS 推送 */
+	updateDownload(mirror?: string): Promise<void>;
+	/** 丢弃已暂存的更新 */
+	updateDiscard(): void;
+	/** 重启进程应用更新（启动脚本包裹下：退出后由脚本循环重拉） */
+	updateRestart(): void;
+	/**
+	 * 调当前会话模型做一次性旁路判断（预设分拣等装载期声明用）。
+	 * 返回模型文本或 { error }。默认关思考、4k tokens。
+	 */
+	runSideText(
+		step: SideModelStep,
+		systemPrompt: string,
+		userText: string,
+		opts?: { maxTokens?: number; reasoning?: string; signal?: AbortSignal; forceNonStreaming?: boolean; onDelta?: (event: { kind: "text"; delta: string } | { kind: "error"; text: string }) => void },
+	): Promise<string | { error: string }>;
+	/** 将当前角色卡画像钉到当前会话分支。 */
+	appendWorldManifest(data: unknown): void;
+	/** 长旁路分析提交前用于拒绝分支或角色卡漂移。 */
+	worldProfileContext(): { leafId: string | null; card: string };
+	worldStateView(): unknown;
+	/** 当前分支最近回合的只读演出诊断投影，不写入任何权威状态。 */
+	requestRecords(id?:string):unknown;
+ recoverMvu?(expectedSource?:string,expectedScope?:string):Promise<unknown>;
+ turnDiagnostics(limit?: number): ReturnType<typeof import("../src/stage/diagnostics.ts").diagnosticsFromBranch>;
+	clearWorldModule(moduleId: string): void;
+	outline: {
+		getView(): unknown;
+		history(): unknown;
+		chat(message: string, options?: { research?: boolean; discussionId?: string; focus?: "open" | "next-beat" | "dialogue" | "character" | "diagnose" | "daily"; contextKey?: string; signal?: AbortSignal; onDelta?: (event: { kind: "text"; delta: string } | { kind: "error"; text: string }) => void }): Promise<unknown>;
+		clearChats(contextKey?: string,discussionId?:string): void;
+		deleteChat(id: string, contextKey?: string,discussionId?:string): void;
+  createDiscussion(title:string,contextKey?:string):unknown;
+  selectDiscussion(id:string,contextKey?:string):unknown;
+  renameDiscussion(id:string,title:string,contextKey?:string):unknown;
+  discussionPage(id:string,before?:string,contextKey?:string):unknown;
+		bootstrap(experienceWish?: string): Promise<unknown>;
+		reconcile(leafId?: string): Promise<unknown>;
+		confirm(id: string, proposalHash: string): Promise<unknown>;
+		reject(id: string, reason?: string): void;
+		researchView(): unknown;
+		research(topic?: string): Promise<unknown>;
+		researchSearch(topic?: string): Promise<unknown>;
+		researchSearchLogs(): unknown;
+		researchRetrySearchExtraction(logId: string): Promise<unknown>;
+		researchSearchScheduleStatus(): unknown;
+		researchSearchScheduleRunNow(): Promise<unknown>;
+		settings(value?: { mode?: "manual" | "suggest" | "auto"; researchMode?: "off" | "manual" | "auto" }): unknown;
+	};
+	/** 小说长文消化（导演室研究库扩容，阶段 1） */
+	corpus: {
+		create(file: string): Promise<{ doc: unknown; estimatedCalls: number }>;
+		createVersion(baseDocId: string, file: string): Promise<{ doc: unknown; estimatedCalls: number; reusedChunks: number; newChunks: number }>;
+		createUrl(url: string): Promise<{ doc: unknown; estimatedCalls: number }>;
+		discover(): Promise<unknown>;
+		view(): unknown;
+		detail(id: string): unknown;
+		pause(id: string): unknown;
+		resume(id: string): unknown;
+		remove(id: string): Promise<{ removedMechanisms: number }>;
+	};
+	novelPlayUpgradePreview(targetDocId: string, targetRevision: string): unknown;
+	novelPlayUpgradeCommit(targetDocId: string, targetRevision: string, expectedLeafId?: string, expectedFromRevision?: string): unknown;
+}
+
+export interface SessionInfoLite {
+	path: string;
+	id: string;
+	name?: string;
+	firstMessage: string;
+	modified: number;
+	messageCount: number;
+	current: boolean;
+	preview?: string;
+	cardName?: string;
+}
+
+export interface SessionSearchHit {
+	path: string;
+	name?: string;
+	firstMessage: string;
+	modified: number;
+	messageCount: number;
+	snippet: string;
+	current: boolean;
+}
+
+// ---------- 基础工具 ----------
+
+const MAX_BODY = 32 * 1024 * 1024; // ST 聊天记录/预设上传上限 32MB
+const MAX_UPLOAD = 64 * 1024 * 1024; // 上传区文件上限 64MB
+
+function readBodyRaw(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		let size = 0;
+		const chunks: Buffer[] = [];
+		req.on("data", (c: Buffer) => {
+			size += c.length;
+			if (size > maxBytes) {
+				reject(new Error("请求体过大"));
+				req.destroy();
+				return;
+			}
+			chunks.push(c);
+		});
+		req.on("end", () => resolve(Buffer.concat(chunks)));
+		req.on("error", reject);
+	});
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+	return readBodyRaw(req, MAX_BODY).then((b) => b.toString("utf8"));
+}
+
+function sendJson(res: ServerResponse, code: number, obj: unknown): void {
+	res.writeHead(code, { "content-type": "application/json; charset=utf-8" });
+	res.end(JSON.stringify(obj));
+}
+
+const resolvePath = (cwd: string, p: string) => (isAbsolute(p) ? p : join(cwd, p));
+
+/** 带 .bak 备份的 JSON 写盘（tab 缩进，与手写配置一致） */
+export function writeJsonWithBackup(path: string, data: unknown): void {
+	writeJsonAtomicWithBackup(path, data, { spacing: "\t" });
+}
+
+// ---------- 配置读写 ----------
+
+export const configPath = (cwd: string) => resolveConfigPath(cwd);
+
+export function loadConfig(cwd: string): RpConfig {
+	const p = configPath(cwd);
+	if (!existsSync(p)) return { ...DEFAULT_CONFIG };
+	const raw = { ...DEFAULT_CONFIG, ...(JSON.parse(readFileSync(p, "utf8")) as Partial<RpConfig>) };
+	delete (raw as unknown as Record<string, unknown>).creationMode;
+	if (raw.generationMode === "direct" || raw.generationMode === "director") { delete raw.literaryQuality; delete raw.literaryProfileEveryNTurns; }
+	// 规范化：旧 lorebook 单本 → lorebooks 数组
+	raw.stepModels = normalizeStepModels(raw.stepModels);
+	return setMountedLorebooks(raw, mountedLorebookPaths(raw));
+}
+
+/**
+ * 一档皮肤快照(hello 与 GET /api/cardfront 唯一组装点)。
+ * 读盘失败不抛:无皮肤即可,前端清空 cardSkin。
+ * 规则表 = 预设自带 regex_scripts + 卡自带 regex_scripts(顺序同酒馆 PRESET → SCOPED)。
+ */
+/** Shared binding list: inspector and actual display chain read the same original sources. */
+function loadBoundRegexMaterials(cwd: string) {
+ const config = loadConfig(cwd);
+ let raw: Record<string, unknown> | null = null, charName = "", cardError: string | undefined;
+ try { raw=readCardRawJson(resolvePath(cwd,config.card)).raw as Record<string,unknown>; charName=loadCardFile(resolvePath(cwd,config.card)).name; }
+ catch { cardError="角色卡读取失败"; try {charName=loadCardFile(resolvePath(cwd,config.card)).name;}catch{} }
+ const sources: BoundRegexSource[]=[];
+ const globalPath=join(cwd,".liyuan","regex-global.json");
+ if(existsSync(globalPath)){
+  try{const stat=lstatSync(globalPath);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>4*1024*1024)throw Error("unsafe global regex file");
+   const data=JSON.parse(readFileSync(globalPath,"utf8"));const scripts=Array.isArray(data)?data:Array.isArray(data.regex_scripts)?data.regex_scripts:extractRegexScripts(data);
+   sources.push({id:"global",kind:"global",name:"全局美化",path:".liyuan/regex-global.json",scripts});
+  }catch{sources.push({id:"global",kind:"global",name:"全局美化",path:".liyuan/regex-global.json",scripts:[],error:"全局规则读取失败，未启用或改写原文件"});}
+ }
+
+ if (config.preset) {
+  try { const effective=loadEffectivePreset(cwd);if(!effective.doc)throw Error("missing preset");sources.push({id:"preset",kind:"preset",name:effective.doc?.name||basename(config.preset),path:config.preset,draft:effective.fromOverride,scripts:effective.doc?extractRegexScripts(effective.doc.raw):[]}); }
+  catch { sources.push({id:"preset",kind:"preset",name:basename(config.preset),path:config.preset,scripts:[],error:"预设读取失败"}); }
+ }
+ for (const [index,relative] of mountedLorebookPaths(config).entries()) {
+  try { const path=resolvePath(cwd,relative); if(!existsSync(path))throw Error();sources.push({id:"lorebook:"+index,kind:"lorebook",name:basename(relative),path:relative,scripts:loadLorebookRegexScripts(path)}); }
+  catch {sources.push({id:"lorebook:"+index,kind:"lorebook",name:basename(relative),path:relative,scripts:[],error:"世界书读取失败"});}
+ }
+ sources.push({id:"card",kind:"card",name:charName||basename(config.card),path:config.card,scripts:raw?extractRegexScripts(raw):[],...(cardError?{error:cardError}:{})});
+ return {config,raw,charName,sources};
+}
+export function loadCardFrontSnapshot(cwd: string): CardFrontSnapshot {
+ const {config,raw,charName,sources}=loadBoundRegexMaterials(cwd);
+ const regexSources: RegexScriptSource[]=sources.filter(source=>source.kind!=="card").map(source=>({source:source.path,scripts:source.scripts}));
+ return buildCardFrontSnapshot(config,raw,charName,regexSources);
+}
+export function loadRegexInspectorSnapshot(cwd:string): RegexInspectorSnapshot {
+ const {config,charName,sources}=loadBoundRegexMaterials(cwd);
+ return {cardPath:config.card,charName,userName:config.userName,skinEnabled:!(config.cardSkinOff??[]).includes(config.card),...inspectBoundRegex(sources)};
+}
+
+/** config PUT 白名单（card 不在内：换卡必须走 /api/card/switch 的完整流程） */
+const CONFIG_EDITABLE = new Set([
+	"userName",
+	"userPersona",
+	"displayName",
+	"language",
+	"scanDepth",
+	"maxLoreInjections",
+	"greeting",
+	"greetingIndex",
+	"importStripTags",
+	"lorebook",
+	"lorebooks",
+	"preset",
+	"disabledLore",
+	"backendControl",
+	"assistantModel",
+	"compactEveryNTurns",
+	"literaryQuality",
+	"generationMode",
+	"generationTimeoutMinutes",
+	"analysisTimeoutMinutes",
+	"analysisRecoveryModel",
+	"allowDegradedGeneration",
+	"literaryProfileEveryNTurns",
+	"literaryWorldEnabled",
+	"literaryEcologyEnabled",
+	"webResearchMode",
+	"webResearchPublicTerms",
+	"researchSearchSchedule",
+	"novelDigest",
+	"stepModels",
+]);
+
+export function applyConfigPatch(config: RpConfig, patch: Record<string, unknown>): RpConfig {
+	const next = { ...config } as Record<string, unknown>;
+	for (const [k, v] of Object.entries(patch)) {
+		if (!CONFIG_EDITABLE.has(k)) continue;
+		if (v === null || v === undefined || v === "") {
+			delete next[k]; // 空值 = 删除可选键（displayName/lorebook/preset 等）
+		} else {
+			next[k] = v;
+		}
+	}
+	// 必填字段兜底
+	if (typeof next.userName !== "string" || !next.userName) next.userName = DEFAULT_CONFIG.userName;
+	if (typeof next.language !== "string" || !next.language) next.language = DEFAULT_CONFIG.language;
+	next.scanDepth = clampInt(next.scanDepth, 1, 50, DEFAULT_CONFIG.scanDepth);
+	next.maxLoreInjections = clampInt(next.maxLoreInjections, 0, 20, DEFAULT_CONFIG.maxLoreInjections);
+	// 固定楼层压缩周期：0=关闭主动压缩；上限防手滑（500 轮≈永不触发）
+	next.compactEveryNTurns = clampInt(next.compactEveryNTurns, 0, 500, DEFAULT_CONFIG.compactEveryNTurns ?? 30);
+	if (!["off", "profile", "guided"].includes(String(next.literaryQuality))) next.literaryQuality = "off";
+	if (next.generationMode !== undefined && next.generationMode !== "direct" && next.generationMode !== "director") next.generationMode = "director";
+	if (next.generationTimeoutMinutes !== undefined) next.generationTimeoutMinutes = clampInt(next.generationTimeoutMinutes, 1, 120, 60);
+	if (next.analysisTimeoutMinutes !== undefined) next.analysisTimeoutMinutes = clampInt(next.analysisTimeoutMinutes, 1, 30, 10);
+	if (next.analysisRecoveryModel !== undefined) {
+		const m = next.analysisRecoveryModel as { provider?:unknown; id?:unknown } | null;
+		if (!m || typeof m.provider !== "string" || !m.provider.trim() || typeof m.id !== "string" || !m.id.trim()) delete next.analysisRecoveryModel;
+		else next.analysisRecoveryModel = { provider:m.provider.trim(), id:m.id.trim() };
+	}
+	next.allowDegradedGeneration = next.allowDegradedGeneration === true;
+	next.literaryWorldEnabled = next.literaryWorldEnabled === true;
+	next.literaryEcologyEnabled = next.literaryEcologyEnabled === true;
+	next.literaryProfileEveryNTurns = clampInt(
+		next.literaryProfileEveryNTurns,
+		1,
+		100,
+		DEFAULT_CONFIG.literaryProfileEveryNTurns ?? 8,
+	);
+	if (!["off", "auto", "manual"].includes(String(next.webResearchMode))) next.webResearchMode = "off";
+    next.webResearchPublicTerms = Array.isArray(next.webResearchPublicTerms)
+        ? [...new Set(next.webResearchPublicTerms.filter((term): term is string => typeof term === "string").map(term => term.normalize("NFKC").trim()).filter(term => term.length >= 2 && term.length <= 80))].slice(0, 64) : [];
+	const rss = next.researchSearchSchedule && typeof next.researchSearchSchedule === "object" ? next.researchSearchSchedule as Record<string, unknown> : {};
+	const rssDef = DEFAULT_CONFIG.researchSearchSchedule ?? { enabled: false, hour: 6, minute: 0, maxPerRun: 3, topics: [] };
+	next.researchSearchSchedule = {
+		enabled: rss.enabled === true,
+		hour: clampInt(rss.hour, 0, 23, rssDef.hour),
+		minute: clampInt(rss.minute, 0, 59, rssDef.minute),
+		maxPerRun: clampInt(rss.maxPerRun, 1, 8, rssDef.maxPerRun),
+		topics: Array.isArray(rss.topics) ? rss.topics.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map((item) => item.trim().slice(0, 200)).slice(0, 8) : rssDef.topics,
+	};
+	next.stepModels = normalizeStepModels(next.stepModels);
+	// 小说长文消化：正文关键路径之外；自动计划显式开启才产生后台抓取成本。
+	if (next.novelDigest !== undefined && next.novelDigest !== null && typeof next.novelDigest === "object") {
+		const nd = next.novelDigest as { enabled?: unknown; chunkChars?: unknown; maxCallsPerDoc?: unknown; autoSchedule?: { enabled?: unknown; hour?: unknown; minute?: unknown; maxPerRun?: unknown; queries?: unknown } };
+		const def = DEFAULT_CONFIG.novelDigest ?? { enabled: true, chunkChars: 20000, maxCallsPerDoc: 800 };
+		const auto = nd.autoSchedule && typeof nd.autoSchedule === "object" ? nd.autoSchedule : {};
+		const autoDef = def.autoSchedule ?? { enabled: false, hour: 5, minute: 0, maxPerRun: 3, queries: ["学園 日常", "現代 日常 社会人", "青春 日常"] };
+		next.novelDigest = {
+			enabled: nd.enabled === true || nd.enabled === false ? nd.enabled : def.enabled,
+			chunkChars: clampInt(nd.chunkChars as number, 1000, 50000, def.chunkChars),
+			maxCallsPerDoc: clampInt(nd.maxCallsPerDoc as number, 100, 20000, def.maxCallsPerDoc),
+			autoSchedule: {
+				enabled: auto.enabled === true,
+				hour: clampInt(auto.hour as number, 0, 23, autoDef.hour),
+				minute: clampInt(auto.minute as number, 0, 59, autoDef.minute),
+				maxPerRun: clampInt(auto.maxPerRun as number, 1, 3, autoDef.maxPerRun),
+				queries: Array.isArray(auto.queries) ? auto.queries.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim().slice(0, 80)).slice(0, 8) : autoDef.queries,
+			},
+		};
+	} else if (next.novelDigest === null || next.novelDigest === undefined) {
+		next.novelDigest = DEFAULT_CONFIG.novelDigest ?? { enabled: true, chunkChars: 20000, maxCallsPerDoc: 800 };
+	}
+	next.greeting = next.greeting === true;
+	// creationMode 已退役：旧配置及旧客户端也不能重新保存 ask。
+	delete next.creationMode;
+	// 助手模型：只认 { provider, id } 形；非法值删除（缺省=跟随剧情模型）
+	if (next.assistantModel !== undefined) {
+		const am = next.assistantModel as { provider?: unknown; id?: unknown } | null;
+		if (
+			!am ||
+			typeof am !== "object" ||
+			typeof am.provider !== "string" ||
+			!am.provider ||
+			typeof am.id !== "string" ||
+			!am.id
+		) {
+			delete next.assistantModel;
+		} else {
+			next.assistantModel = { provider: am.provider, id: am.id };
+		}
+	}
+	// 挂载书：lorebooks 数组优先；兼容旧单本 lorebook
+	const paths = mountedLorebookPaths(next as unknown as RpConfig);
+	Object.assign(next, setMountedLorebooks(next as unknown as RpConfig, paths));
+	if (next.generationMode === "direct" || next.generationMode === "director") { delete next.literaryQuality; delete next.literaryProfileEveryNTurns; }
+	return next as unknown as RpConfig;
+}
+
+function clampInt(v: unknown, min: number, max: number, dflt: number): number {
+	const n = typeof v === "number" ? Math.round(v) : Number.parseInt(String(v), 10);
+	if (!Number.isFinite(n)) return dflt;
+	return Math.min(max, Math.max(min, n));
+}
+
+// ---------- 世界书（服务端只读副本，与扩展同一装配路径） ----------
+
+export type LoreSource = "card" | "file" | "agent";
+
+/** 与台上素材同源：卡内书 → 已挂载独立书 → 本卡补充；先应用来源覆盖再去重。 */
+function loadMergedLoreWithSource(cwd: string, config: RpConfig): {
+	entries: LorebookEntry[]; sourceOf: (e: LorebookEntry) => LoreSource; cardName: string; paths: string[];
+} {
+	const card = loadCardFile(resolvePath(cwd, config.card));
+	const paths = mountedLorebookPaths(config);
+	const sources = new Map<LorebookEntry, LoreSource>();
+	const tag = (entries: LorebookEntry[], source: LoreSource, path: string) =>
+		applyLoreSourceState(entries, config, source, path).map((entry) => { sources.set(entry, source); return entry; });
+	const fileGroups = paths.map((path) => {
+		const abs = resolvePath(cwd, path);
+		return existsSync(abs) ? tag(loadLorebookFile(abs), "file", path) : [];
+	});
+	const overlay = overlayPathFor(cwd, card.name);
+	const entries = mergeEntries(tag(card.book, "card", config.card), ...fileGroups,
+		existsSync(overlay) ? tag(loadLorebookFile(overlay), "agent", config.card) : []);
+	return { entries, sourceOf: (e) => sources.get(e) ?? "card", cardName: card.name, paths };
+}
+
+export function loadMergedLore(cwd: string, config: RpConfig): LorebookEntry[] {
+	return loadMergedLoreWithSource(cwd, config).entries;
+}
+
+function collectActiveLoreForExport(cwd: string, config: RpConfig): LorebookEntry[] {
+	return loadMergedLore(cwd, config);
+}
+
+/** 身份绑定配置卡路径和原始文件修订；相同正文/同名卡不能替代此身份。 */
+function currentCardIdentity(cwd: string, config: RpConfig): string {
+	return createHash("sha256").update(config.card.replace(/\\/g, "/")).update("\0")
+		.update(readFileSync(resolvePath(cwd, config.card))).digest("hex");
+}
+
+type LoreTargetInput = { source?: string; path?: string; cardIdentity?: string };
+type LoreTarget = { source: LoreSource; path: string; abs: string; name: string; entries: Array<LorebookEntry & { entryKey: string }>; cardIdentity?: string };
+function loreTarget(cwd: string, config: RpConfig, input: LoreTargetInput, requireIdentity = true): LoreTarget {
+	const path = (input.path ?? "").replace(/\\/g, "/").trim();
+	const source = input.source || (path === "agent" ? "agent" : path ? "file" : "");
+	if (source === "card" || source === "agent") {
+		const cardIdentity = currentCardIdentity(cwd, config);
+		if ((requireIdentity || input.cardIdentity) && input.cardIdentity !== cardIdentity) {
+			throw new Error("角色卡已切换或修订，请刷新世界书后重试（cardIdentity 不匹配）");
+		}
+		const card = loadCardFile(resolvePath(cwd, config.card));
+		const abs = source === "card" ? resolvePath(cwd, config.card) : overlayPathFor(cwd, card.name);
+		let rawEntries: unknown;
+		if (source === "card") {
+			const raw = readCardRawJson(abs).raw;
+			const data = raw.data && typeof raw.data === "object" ? raw.data as Record<string, unknown> : raw;
+			const book = ("character_book" in data ? data.character_book : raw.character_book) as Record<string, unknown> | undefined;
+			rawEntries = book?.entries;
+		} else if (existsSync(abs)) rawEntries = (readJsonFile(abs) as Record<string, unknown>).entries;
+		return { source, path: config.card, abs, cardIdentity, name: source === "card" ? card.name : "agent 补充设定",
+			entries: normalizeEntriesWithKeys(rawEntries) };
+	}
+	if (source !== "file" || !path) throw new Error("缺少明确世界书来源 source 和路径 path");
+	const known = listLorebookFiles(cwd, config).find((book) => book.path === path);
+	if (!known) throw new Error("不是已知的世界书文件");
+	const abs = resolvePath(cwd, path);
+	return { source: "file", path, abs, name: known.name, entries: normalizeEntriesWithKeys((readJsonFile(abs) as Record<string, unknown>).entries) };
+}
+function loreTargetQuery(query: URLSearchParams): LoreTargetInput {
+	return { source: query.get("source") ?? undefined, path: query.get("path") ?? undefined,
+		cardIdentity: query.get("cardIdentity") ?? undefined };
+}
+function writeLoreTarget<T>(target: LoreTarget, mutate: (book: Record<string, unknown>) => T): T {
+	if (target.source === "card") return editCardLorebook(target.abs, mutate);
+	const book = readJsonFile(target.abs) as Record<string, unknown>;
+	const result = mutate(book);
+	writeFileSync(target.abs, `${JSON.stringify(book, null, "\t")}\n`, "utf8");
+	return result;
+}
+/** 文件/配置的同步修改失败时回滚原字节；热刷新在此边界之外，不重放写操作。 */
+function withLoreRollback<T>(cwd: string, target: LoreTarget, run: () => T): T {
+	const original = readFileSync(target.abs);
+	const configFile = configPath(cwd);
+	const configBefore = existsSync(configFile) ? readFileSync(configFile) : null;
+	try { return run(); }
+	catch (error) {
+		try {
+			if (!readFileSync(target.abs).equals(original)) {
+				if (target.source === "card") writeCardBytesAtomic(target.abs, original);
+				else writeFileSync(target.abs, original);
+			}
+			if (configBefore && (!existsSync(configFile) || !readFileSync(configFile).equals(configBefore))) writeFileSync(configFile, configBefore);
+			else if (!configBefore && existsSync(configFile)) unlinkSync(configFile);
+		} catch { throw new Error("世界书保存失败且回滚失败，请检查磁盘权限/空间并从备份恢复"); }
+		throw error;
+	}
+}
+
+/** 指纹只在选中的来源内定位；含重复正文的单条编辑拒绝含糊写入。 */
+function requireLoreEntry(target: LoreTarget, fp: string, entryKey?: string): LorebookEntry {
+	const matches = target.entries.filter((e) => loreFingerprint(e.content) === fp && (entryKey === undefined || e.entryKey === entryKey));
+	if (matches.length !== 1) throw new Error(matches.length ? "同一本书存在重复正文，请提供明确行键 entryKey" : "条目不存在（世界书可能已更换）");
+	return matches[0];
+}
+/** 来源豁免只绕过旧的全局 disabledLore；原生 enabled:false 仍由卡/书原文决定。 */
+function updateLoreOverride(cwd: string, config: RpConfig, target: LoreTarget, rows: Array<{ fingerprint: string; entryKey?: string }>, enabled: boolean): void {
+	const overrides = { ...config.loreEntryOverrides };
+	for (const row of rows) {
+		const key = loreSourceKey(target.source, target.path, row.fingerprint, row.entryKey);
+		if (enabled && config.disabledLore?.includes(row.fingerprint)) overrides[key] = true;
+		else delete overrides[key];
+	}
+	const next = { ...config };
+	if (Object.keys(overrides).length) next.loreEntryOverrides = overrides;
+	else delete next.loreEntryOverrides;
+	if (JSON.stringify(config.loreEntryOverrides) !== JSON.stringify(next.loreEntryOverrides)) writeJsonWithBackup(configPath(cwd), next);
+}
+
+const previewText = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+// ---------- 卡库（PLAN-PANELS §2.7）：扫描候选目录，卡头信息按 mtime 缓存 ----------
+
+const cardMetaCache = new Map<string, { mtimeMs: number; meta: { name: string; tags: string[] } | null }>();
+
+/** 卡库扫描目录：assets/cards + 当前卡所在目录（用户素材常在项目外） */
+function cardDirSpecs(cwd: string, config: RpConfig): Array<{ abs: string; relBase: string }> {
+	const specs = [{ abs: join(cwd, "assets", "cards"), relBase: "assets/cards" }];
+	const cardRel = config.card.replace(/\\/g, "/");
+	const base = cardRel.includes("/") ? cardRel.slice(0, cardRel.lastIndexOf("/")) : ".";
+	const abs = resolvePath(cwd, base);
+	if (!specs.some((s) => s.abs === abs)) specs.push({ abs, relBase: base });
+	return specs;
+}
+
+interface CardLibItem {
+	path: string;
+	name: string;
+	tags: string[];
+	isPng: boolean;
+	mtimeMs: number;
+}
+
+function listCardLibrary(cwd: string, config: RpConfig): CardLibItem[] {
+	const out: CardLibItem[] = [];
+	for (const spec of cardDirSpecs(cwd, config)) {
+		if (!existsSync(spec.abs)) continue;
+		for (const f of readdirSync(spec.abs)) {
+			if (!/\.(png|json)$/i.test(f)) continue;
+			const abs = join(spec.abs, f);
+			let mtimeMs = 0;
+			try {
+				mtimeMs = statSync(abs).mtimeMs;
+			} catch {
+				continue;
+			}
+			const cached = cardMetaCache.get(abs);
+			let meta = cached && cached.mtimeMs === mtimeMs ? cached.meta : undefined;
+			if (meta === undefined) {
+				try {
+					const c = loadCardFile(abs);
+					// 卡名为空视为非角色卡（同目录常混有预设等其他 JSON）
+					meta = c.name.trim() ? { name: c.name, tags: c.tags } : null;
+				} catch {
+					meta = null;
+				}
+				cardMetaCache.set(abs, { mtimeMs, meta });
+			}
+			if (!meta) continue;
+			out.push({ path: `${spec.relBase}/${f}`, name: meta.name, tags: meta.tags, isPng: /\.png$/i.test(f), mtimeMs });
+		}
+	}
+	out.sort((a, b) => a.name.localeCompare(b.name));
+	return out;
+}
+
+/** 校验 query 里的卡路径确属卡库（一切卡文件读操作的门），返回绝对路径 */
+function assertLibraryCard(cwd: string, config: RpConfig, relPath: string): string {
+	const item = listCardLibrary(cwd, config).find((c) => c.path === relPath);
+	if (!item) throw new Error("不是卡库中的角色卡");
+	return resolvePath(cwd, relPath);
+}
+
+// 卡收藏（借鉴 ST favorites）：独立小文件，不动 rp.config（免会话重载）
+const favsPath = (cwd: string) => join(cwd, ".liyuan-cache", "card-favs.json");
+
+function loadFavs(cwd: string): string[] {
+	try {
+		const j = JSON.parse(readFileSync(favsPath(cwd), "utf8")) as unknown;
+		return Array.isArray(j) ? j.filter((x): x is string => typeof x === "string") : [];
+	} catch {
+		return [];
+	}
+}
+
+function saveFavs(cwd: string, favs: string[]): void {
+	mkdirSync(join(cwd, ".liyuan-cache"), { recursive: true });
+	writeFileSync(favsPath(cwd), `${JSON.stringify(favs, null, "\t")}\n`, "utf8");
+}
+
+// ---------- 梨园 Agent 配置（liyuan.agent.json 真源；同步 runtime 为实现细节） ----------
+
+/** 读配置；若 providers 为空且会话有当前模型，自动收编一条渠道并落盘（标准化测试遗留） */
+function loadProjectAgentExtras(cwd: string): {
+	shellPath?: string;
+	skills?: string[];
+	enableSkillCommands?: boolean;
+} {
+	try {
+		const ps = JSON.parse(readFileSync(join(cwd, ".liyuan", "settings.json"), "utf8")) as Record<string, unknown>;
+		return {
+			shellPath: typeof ps.shellPath === "string" ? ps.shellPath : undefined,
+			skills: Array.isArray(ps.skills) ? ps.skills.filter((x): x is string => typeof x === "string") : undefined,
+			enableSkillCommands: typeof ps.enableSkillCommands === "boolean" ? ps.enableSkillCommands : undefined,
+		};
+	} catch {
+		return {};
+	}
+}
+
+function loadOrSeedAgentConfig(host: RestHost): { path: string; exists: boolean; config: LiyuanAgentConfig; seeded: boolean } {
+	// 仓库为空时，把当前启用配置拆进仓库（迁移）
+	const mig = migrateActiveConfigIntoProfiles(host.cwd);
+	if (mig.migrated) {
+		host.notify("info", `已建立配置仓库：${mig.ids.join("、")}`);
+	}
+
+	const loaded = loadAgentConfig(host.cwd);
+
+	// 已有配置：把残留 $ENV 收成配置文件明文（Agent 只读自己的配置文件）
+	// 并始终把 liyuan.agent.json 同步到 models.json，避免手改 agent.json 后重启/重开面板仍用旧 maxTokens
+	if (Object.keys(loaded.config.providers).length > 0) {
+		const cfg = loaded.config;
+		if (materializeEnvKeysInConfig(cfg)) {
+			saveAgentConfig(host.cwd, cfg);
+		}
+		syncAgentConfigToRuntime(host.cwd, host.agentDir(), cfg);
+		host.refreshModels();
+		return { path: loaded.path, exists: true, config: cfg, seeded: false };
+	}
+
+	const { current } = host.listModels();
+	if (!current) return { ...loaded, seeded: false };
+	const snap = host.providerSnapshot(current.provider);
+	if (!snap || snap.models.length === 0) return { ...loaded, seeded: false };
+
+	const extras = loadProjectAgentExtras(host.cwd);
+	// key 写入配置文件本身：一次性从环境取实值写入，之后不再依赖环境变量
+	const apiKey =
+		(snap.envKey && process.env[snap.envKey]?.trim()) ||
+		(current.provider === "deepseek" ? process.env.DEEPSEEK_API_KEY?.trim() : undefined) ||
+		undefined;
+
+	const provider = seedProviderFromRuntime({
+		provider: snap.provider,
+		baseUrl: snap.baseUrl,
+		api: snap.api,
+		apiKey,
+		models: snap.models,
+	});
+	const config: LiyuanAgentConfig = {
+		version: 1,
+		defaultProvider: current.provider,
+		defaultModel: current.id,
+		defaultThinkingLevel: current.thinkingLevel,
+		...extras,
+		providers: { [snap.provider]: provider },
+	};
+	saveAgentConfig(host.cwd, config);
+	syncAgentConfigToRuntime(host.cwd, host.agentDir(), config);
+	host.refreshModels();
+	return { path: loaded.path, exists: true, config, seeded: true };
+}
+
+function persistAgentConfig(host: RestHost, config: LiyuanAgentConfig): LiyuanAgentConfig {
+	// 换到非当前启用渠道的模型时，把该渠道从仓库补回 providers，避免 defaultProvider 悬空。
+	const normalized = repairDefaultProvider(host.cwd, normalizeAgentConfig(config));
+	saveAgentConfig(host.cwd, normalized);
+	syncAgentConfigToRuntime(host.cwd, host.agentDir(), normalized);
+	host.refreshModels();
+	return normalized;
+}
+
+/** 从 Agent 配置解析某模型的思考档：模型条目 > defaultThinkingLevel */
+function thinkingLevelFromConfig(
+	config: LiyuanAgentConfig,
+	provider: string,
+	modelId: string,
+): string | undefined {
+	const p = config.providers?.[provider];
+	const list = Array.isArray(p?.models) ? p.models : [];
+	const m = list.find((x) => String(x.id) === modelId);
+	const per = typeof m?.thinkingLevel === "string" ? m.thinkingLevel.trim() : "";
+	if (per) return per;
+	const def = typeof config.defaultThinkingLevel === "string" ? config.defaultThinkingLevel.trim() : "";
+	return def || undefined;
+}
+
+/**
+ * models.json 刷新后：重绑当前模型（contextWindow / maxTokens）
+ * 并把配置里的思考档写回会话（配置 → 当前生效，双向里「从配置上来」这一侧）
+ */
+async function rebindCurrentModel(host: RestHost, config?: LiyuanAgentConfig): Promise<void> {
+	const cur = host.listModels().current;
+	if (!cur) return;
+	try {
+		await host.selectModel(cur.provider, cur.id);
+	} catch {
+		// 模型可能暂不可用；配置已落盘，下次切换仍会带上新字段
+	}
+	const cfg = config ?? loadAgentConfig(host.cwd).config;
+	const after = host.listModels().current;
+	if (!after) return;
+	const think = thinkingLevelFromConfig(cfg, after.provider, after.id);
+	if (think) {
+		try {
+			host.setThinkingLevel(think);
+		} catch {
+			/* 模型不认该档位名时忽略 */
+		}
+	}
+}
+
+function resolveProbeKey(apiKey?: string): string | undefined {
+	if (!apiKey || apiKey === "placeholder") return undefined;
+	if (apiKey.startsWith("$")) {
+		const name = apiKey.slice(1).replace(/^\{|\}$/g, "");
+		const v = process.env[name];
+		return v || undefined;
+	}
+	if (apiKey.startsWith("!")) return undefined; // 命令取 key：探测跳过
+	return apiKey;
+}
+
+async function probeModelsEndpoint(
+	baseUrl: string,
+	apiKey?: string,
+): Promise<{ ok: boolean; status: number; detail: string; ids: string[] }> {
+	const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+	const headers: Record<string, string> = {};
+	const resolved = resolveProbeKey(apiKey);
+	if (resolved) headers.authorization = `Bearer ${resolved}`;
+	try {
+		const r = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
+		if (!r.ok) {
+			return { ok: false, status: r.status, detail: (await r.text()).slice(0, 300) || `HTTP ${r.status}`, ids: [] };
+		}
+		const json = (await r.json()) as {
+			data?: Array<{ id?: unknown; name?: unknown }>;
+			models?: Array<{ id?: unknown; name?: unknown }>;
+		};
+		const list = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : [];
+		const ids = list.map((m) => String(m.id ?? m.name ?? "").trim()).filter(Boolean);
+		return {
+			ok: true,
+			status: r.status,
+			detail: ids.length
+				? `连通（HTTP ${r.status}，${ids.length} 个模型）`
+				: `连通（HTTP ${r.status}，模型清单为空）`,
+			ids,
+		};
+	} catch (e) {
+		return { ok: false, status: 0, detail: e instanceof Error ? e.message : String(e), ids: [] };
+	}
+}
+
+// ---------- 多预设管理（PLAN-PANELS-V2 §2.6：assets/presets/ 存多份，config.preset 指向当前） ----------
+
+const PRESETS_DIR = "assets/presets";
+/** 面板未点「保存」时的运行时草稿（立即进 system；切换预设时丢弃） */
+const PRESET_OVERRIDE_REL = ".liyuan/preset-override.json";
+
+const presetSlug = (name: string) => name.trim().replace(/[\\/:*?"<>|\s]+/g, "-").replace(/^-+|-+$/g, "") || "preset";
+
+/** 预设路径白名单：历史单文件 liyuan-preset.json 或 assets/presets/ 顶层 .json */
+function validatePresetPath(p: string): string {
+	const norm = p.replace(/\\/g, "/");
+	if (norm === "liyuan-preset.json") return norm;
+	const base = norm.startsWith(`${PRESETS_DIR}/`) ? norm.slice(PRESETS_DIR.length + 1) : "";
+	if (!base || base.includes("/") || base.includes("..") || !base.endsWith(".json")) throw new Error("非法预设路径");
+	return norm;
+}
+
+export function presetOverridePath(cwd: string): string {
+	return join(cwd, PRESET_OVERRIDE_REL);
+}
+
+function clearPresetOverride(cwd: string): void {
+	const p = presetOverridePath(cwd);
+	if (existsSync(p)) {
+		try {
+			unlinkSync(p);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** 预设名＝文件名（酒馆预设没有 name 字段，名字在酒馆就是文件名） */
+export function presetNameFromFile(file: string): string {
+	const base = file.replace(/\\/g, "/").split("/").pop() ?? file;
+	return base.replace(/\.json$/i, "") || "preset";
+}
+
+function readPresetDoc(cwd: string, file: string): PresetDoc {
+	const abs = resolvePath(cwd, file);
+	return loadPresetDoc(JSON.parse(readFileSync(abs, "utf8")), presetNameFromFile(file));
+}
+
+/** 磁盘上的已保存预设（不含草稿） */
+export function loadDiskPreset(cwd: string): { path: string; doc: PresetDoc } | null {
+	const config = loadConfig(cwd);
+	if (!config.preset) return null;
+	if (!existsSync(resolvePath(cwd, config.preset))) return null;
+	return { path: config.preset, doc: readPresetDoc(cwd, config.preset) };
+}
+
+/** 运行时生效：草稿优先，否则磁盘。草稿与磁盘同格式（原文），只是没落盘 */
+export function loadEffectivePreset(cwd: string): { path: string | null; doc: PresetDoc | null; fromOverride: boolean } {
+	const config = loadConfig(cwd);
+	if (!config.preset) return { path: null, doc: null, fromOverride: false };
+	const ovr = presetOverridePath(cwd);
+	if (existsSync(ovr)) {
+		try {
+			return {
+				path: config.preset,
+				doc: loadPresetDoc(JSON.parse(readFileSync(ovr, "utf8")), presetNameFromFile(config.preset)),
+				fromOverride: true,
+			};
+		} catch {
+			/* fall through */
+		}
+	}
+	const disk = loadDiskPreset(cwd);
+	if (!disk) return { path: config.preset, doc: null, fromOverride: false };
+	return { path: disk.path, doc: disk.doc, fromOverride: false };
+}
+
+function listPresetFiles(cwd: string): Array<{ file: string; name: string }> {
+	const out: Array<{ file: string; name: string }> = [];
+	// 名字取文件名，但仍要解析一次确认是能读的 JSON——列表里不放坏文件
+	const readable = (abs: string): boolean => {
+		try {
+			JSON.parse(readFileSync(abs, "utf8"));
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const legacy = join(cwd, "liyuan-preset.json");
+	if (existsSync(legacy) && readable(legacy)) {
+		out.push({ file: "liyuan-preset.json", name: presetNameFromFile("liyuan-preset.json") });
+	}
+	const dir = join(cwd, PRESETS_DIR);
+	if (existsSync(dir)) {
+		for (const f of readdirSync(dir)) {
+			if (!f.endsWith(".json")) continue;
+			if (!readable(join(dir, f))) continue;
+			out.push({ file: `${PRESETS_DIR}/${f}`, name: presetNameFromFile(f) });
+		}
+	}
+	return out;
+}
+
+// ---------- 世界书文件管理（PLAN-PANELS-V2 §2.3：选书/导入/删除） ----------
+
+const LOREBOOKS_DIR = "assets/lorebooks";
+
+/** 世界书扫描目录：assets/lorebooks + 各挂载书所在目录（用户素材常在项目外） */
+function lorebookDirSpecs(cwd: string, config: RpConfig): Array<{ abs: string; relBase: string }> {
+	const specs = [{ abs: join(cwd, LOREBOOKS_DIR), relBase: LOREBOOKS_DIR }];
+	for (const rel of mountedLorebookPaths(config)) {
+		const base = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : ".";
+		const abs = resolvePath(cwd, base);
+		if (!specs.some((s) => s.abs === abs)) specs.push({ abs, relBase: base });
+	}
+	return specs;
+}
+
+const lorebookMetaCache = new Map<string, { mtimeMs: number; count: number | null; displayName: string }>();
+
+function listLorebookFiles(cwd: string, config: RpConfig): Array<{ path: string; name: string; entryCount: number }> {
+	const out: Array<{ path: string; name: string; entryCount: number }> = [];
+	for (const spec of lorebookDirSpecs(cwd, config)) {
+		if (!existsSync(spec.abs)) continue;
+		for (const f of readdirSync(spec.abs)) {
+			if (!f.endsWith(".json")) continue;
+			const abs = join(spec.abs, f);
+			let mtimeMs = 0;
+			try {
+				mtimeMs = statSync(abs).mtimeMs;
+			} catch {
+				continue;
+			}
+			const cached = lorebookMetaCache.get(abs);
+			// Prefer JSON `name` over bare filename — zip tools (Windows Compress-Archive)
+			// often corrupt non-ASCII filenames while leaving UTF-8 content intact.
+			let displayName = f.replace(/\.json$/i, "");
+			let count: number | null;
+			if (cached && cached.mtimeMs === mtimeMs) {
+				count = cached.count;
+				displayName = cached.displayName || displayName;
+			} else {
+				try {
+					const raw = readJsonFile(abs) as Record<string, unknown>;
+					const entries = normalizeEntries(raw.entries);
+					count = raw.entries && typeof raw.entries === "object" ? entries.length : null; // 空世界书也可浏览；卡/预设没有 entries
+					if (typeof raw.name === "string" && raw.name.trim()) {
+						displayName = raw.name.trim();
+					}
+				} catch {
+					count = null;
+				}
+				lorebookMetaCache.set(abs, { mtimeMs, count, displayName });
+			}
+			if (count === null) continue;
+			out.push({ path: `${spec.relBase}/${f}`, name: displayName, entryCount: count });
+		}
+	}
+	return out;
+}
+
+// ---------- persona 投影（PLAN-PANELS-V2 §2.5：config.userName/userPersona=当前 persona 的镜像） ----------
+
+function projectPersonaToConfig(cwd: string, p: Persona): void {
+	const config = loadConfig(cwd) as unknown as Record<string, unknown>;
+	config.userName = p.name;
+	config.userPersona = p.persona;
+	writeJsonWithBackup(configPath(cwd), config);
+}
+
+// ---------- 路由 ----------
+
+/** /api/* 请求处理；非 /api 路径返回 false 交回静态托管 */
+export interface ApiRequestPersistenceOptions {
+	/** Internal dependency seam for deterministic storage-failure regressions. */
+	writeConfig?: typeof writeJsonWithBackup;
+}
+export async function handleApiRequest(req: IncomingMessage, res: ServerResponse, host: RestHost, persistence: ApiRequestPersistenceOptions = {}): Promise<boolean> {
+	const url = (req.url ?? "/").split("?")[0];
+	if (!url.startsWith("/api/")) return false;
+	const query = new URLSearchParams((req.url ?? "").split("?")[1] ?? "");
+	const route = `${req.method} ${url}`;
+
+	/** 触发会话重载/切换的写操作在流式中拒绝 */
+	const refuseWhileStreaming = (): boolean => {
+		if (!host.isStreaming()) return false;
+		sendJson(res, 409, { error: "正在生成回复，请稍候（或先停止）再操作" });
+		return true;
+	};
+
+	try {
+		if (route === "GET /api/tavern/greeting-context") {
+			if (!host.readTavernGreetingSnapshot) { sendJson(res, 501, { error: "宿主不支持开场白上下文" }); return true; }
+			const { context } = host.readTavernGreetingSnapshot();
+			res.setHeader("cache-control", "no-store");
+			sendJson(res, 200, context);
+			return true;
+		}
+		if (route === "POST /api/tavern/greeting-select") {
+			if (!host.readTavernGreetingSnapshot || !host.selectTavernGreeting) { sendJson(res, 501, { error: "宿主不支持安全切换开场白" }); return true; }
+			const conflict = (error: string): never => { throw Object.assign(new Error(error), { statusCode: 409 }); };
+			const currentSnapshot = () => host.readTavernGreetingSnapshot!();
+			const sameBinding = (a: TavernGreetingExpected, b: TavernGreetingExpected) => a.sessionId === b.sessionId && a.card === b.card && a.leafId === b.leafId && a.greetingIndex === b.greetingIndex;
+			const before = currentSnapshot();
+			if (host.isStreaming() || before.busy) conflict("会话正忙，不能切换开场白");
+			if (before.hasStarted || !before.greetingOnly || before.context.messageCount !== 1) conflict("当前会话已开始，不能切换开场白");
+			const body = JSON.parse(await readBody(req)) as unknown;
+			if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("请求体必须是对象");
+			const value = body as Record<string, unknown>;
+			if (Object.keys(value).some((key) => key !== "index" && key !== "expected") || !Object.hasOwn(value, "index") || !Object.hasOwn(value, "expected")) throw new Error("请求体仅接受 index 与 expected");
+			if (typeof value.index !== "number" || !Number.isInteger(value.index)) throw new Error("index 必须是整数");
+			const rawExpected = value.expected;
+			if (!rawExpected || typeof rawExpected !== "object" || Array.isArray(rawExpected)) throw new Error("expected 必须是对象");
+			const expectedValue = rawExpected as Record<string, unknown>;
+			const expectedKeys = ["sessionId", "card", "leafId", "greetingIndex"];
+			if (Object.keys(expectedValue).length !== expectedKeys.length || expectedKeys.some((key) => !Object.hasOwn(expectedValue, key))) throw new Error("expected 字段不完整或含未知字段");
+			if (typeof expectedValue.sessionId !== "string" || typeof expectedValue.card !== "string" || !(expectedValue.leafId === null || typeof expectedValue.leafId === "string") || typeof expectedValue.greetingIndex !== "number" || !Number.isInteger(expectedValue.greetingIndex)) throw new Error("expected 字段格式无效");
+			const expected: TavernGreetingExpected = { sessionId: expectedValue.sessionId, card: expectedValue.card, leafId: expectedValue.leafId, greetingIndex: expectedValue.greetingIndex };
+			const index = value.index;
+
+			const afterBody = currentSnapshot();
+			const beforeBinding: TavernGreetingExpected = { sessionId: before.context.sessionId, card: before.context.card, leafId: before.context.leafId, greetingIndex: before.context.greetingIndex };
+			const currentBinding: TavernGreetingExpected = { sessionId: afterBody.context.sessionId, card: afterBody.context.card, leafId: afterBody.context.leafId, greetingIndex: afterBody.context.greetingIndex };
+			if (!sameBinding(beforeBinding, currentBinding) || !sameBinding(expected, currentBinding)) conflict("会话或开场白作用域已变化，请重新读取");
+			if (index < 0 || index >= afterBody.context.greetings.length || !afterBody.context.greetings[index]?.trim()) throw new Error("index 不对应有效的非空开场白");
+			if (host.isStreaming() || afterBody.busy) conflict("会话正忙，不能切换开场白");
+			if (afterBody.hasStarted || !afterBody.greetingOnly || afterBody.context.messageCount !== 1) conflict("当前会话已开始，不能切换开场白");
+			let applied: boolean;
+			try { applied = await host.selectTavernGreeting(index, expected); }
+			catch (error) { throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), { statusCode: (error as {statusCode?:number})?.statusCode ?? 500 }); }
+			const afterSwitch = currentSnapshot();
+			const fresh = afterSwitch.context;
+			if (!applied || host.isStreaming() || afterSwitch.busy || afterSwitch.hasStarted || !afterSwitch.greetingOnly || fresh.sessionId !== before.context.sessionId || fresh.card !== before.context.card || fresh.messageCount !== before.context.messageCount || fresh.greetingIndex !== index) conflict("开场白未能在原会话作用域中确认切换");
+			res.setHeader("cache-control", "no-store");
+			sendJson(res, 200, { context: fresh });
+			return true;
+		}
+		if (route === "POST /api/turn/retry-settlement") { if(refuseWhileStreaming())return true; if(!host.retrySettlement){sendJson(res,501,{error:"宿主不支持结算恢复"});return true;} sendJson(res,200,await host.retrySettlement());return true; }
+		if (route === "POST /api/turn/retry-veridis") {
+			if (refuseWhileStreaming()) return true;
+			const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+			if (!body || Array.isArray(body) || Object.keys(body).some(key => !["expectedSessionId", "expectedSourceEntryId"].includes(key)) ||
+				typeof body.expectedSessionId !== "string" || !body.expectedSessionId.trim() || typeof body.expectedSourceEntryId !== "string" || !body.expectedSourceEntryId.trim())
+				throw Error("必须提供 expectedSessionId 与 expectedSourceEntryId，且不能包含其它字段");
+			if (refuseWhileStreaming()) return true;
+			if (!host.retryVeridisRewrite) { sendJson(res, 501, { error: "宿主不支持 Veridis 单独补跑" }); return true; }
+			const result = await host.retryVeridisRewrite(body.expectedSessionId, body.expectedSourceEntryId);
+			sendJson(res, result.error || result.aborted ? 409 : 200, result); return true;
+		}
+		if (route === "GET /api/real-tests") { res.setHeader("cache-control","no-store"); sendJson(res,200,{records:listRealTests(host.cwd)}); return true; }
+		const realTestMatch = /^GET \/api\/real-tests\/([^/]+)$/.exec(route);
+		if (realTestMatch) { const record = readRealTest(host.cwd,decodeURIComponent(realTestMatch[1])); res.setHeader("cache-control","no-store"); sendJson(res,record?200:404,record??{error:"实战记录不存在"}); return true; }
+		// novel-play-api: deterministic integration marker
+		// novel-play-api: config mutation guard
+		const novelPlayConfigMutation = route === "PUT /api/config" || route === "POST /api/card/switch";
+		if (novelPlayConfigMutation && isNovelPlayStartLocked(host)) { sendJson(res, 409, { error: "小说开演启动期间不能修改角色或配置" }); return true; }
+		if (await handleNovelPlayApiRequest(req, res, host)) return true;
+		const proposalRoute = /^POST \/api\/outline\/proposals\/([^/]+)\/(confirm|reject)$/.exec(route);
+		if (proposalRoute) {
+			if (refuseWhileStreaming()) return true;
+			const body = JSON.parse((await readBody(req)) || "{}") as { proposalHash?: string; reason?: string };
+			const id = decodeURIComponent(proposalRoute[1]);
+			if (proposalRoute[2] === "confirm") {
+				if (!body.proposalHash) throw new Error("缺少 proposalHash");
+				sendJson(res, 200, await host.outline.confirm(id, body.proposalHash));
+			} else {
+				host.outline.reject(id, body.reason);
+				sendJson(res, 200, { ok: true, view: host.outline.getView() });
+			}
+			return true;
+		}
+		// 小说消化子路由：GET/:id、pause、resume、DELETE
+		const corpusDetail = /^GET \/api\/outline\/corpus\/([^/]+)$/.exec(route);
+		if (corpusDetail) { sendJson(res, 200, host.corpus.detail(decodeURIComponent(corpusDetail[1]))); return true; }
+		const corpusPause = /^POST \/api\/outline\/corpus\/([^/]+)\/pause$/.exec(route);
+		if (corpusPause) { sendJson(res, 200, host.corpus.pause(decodeURIComponent(corpusPause[1]))); return true; }
+		const corpusResume = /^POST \/api\/outline\/corpus\/([^/]+)\/resume$/.exec(route);
+		if (corpusResume) { sendJson(res, 200, host.corpus.resume(decodeURIComponent(corpusResume[1]))); return true; }
+		const corpusDelete = /^DELETE \/api\/outline\/corpus\/([^/]+)$/.exec(route);
+		if (corpusDelete) { sendJson(res, 200, await host.corpus.remove(decodeURIComponent(corpusDelete[1]))); return true; }
+		// 研究搜索记录子路由：再次提炼
+		const researchRetry = /^POST \/api\/outline\/research\/search\/logs\/([^/]+)\/retry$/.exec(route);
+		if (researchRetry) { sendJson(res, 200, await host.outline.researchRetrySearchExtraction(decodeURIComponent(researchRetry[1]))); return true; }
+  if(/^(POST|PUT|DELETE) \/api\/outline\/(?:chat(?:\/stream)?|chats(?:\/[^/]+)?|discussions(?:\/.*)?)$/.test(route)&&refuseWhileStreaming())return true;
+  const discussionRoute=/^(GET|PUT|POST) \/api\/outline\/discussions\/([^/]+)(?:\/(select|chats))?$/.exec(route);
+  if(discussionRoute){const id=decodeURIComponent(discussionRoute[2]);if(discussionRoute[1]==="GET"&&discussionRoute[3]==="chats"){sendJson(res,200,host.outline.discussionPage(id,query.get("before")??undefined,query.get("contextKey")??undefined));return true;}if(discussionRoute[1]==="PUT"&&!discussionRoute[3]){const body=JSON.parse(await readBody(req));sendJson(res,200,host.outline.renameDiscussion(id,body.title,body.contextKey));return true;}if(discussionRoute[1]==="POST"&&discussionRoute[3]==="select"){const body=JSON.parse((await readBody(req))||"{}");sendJson(res,200,host.outline.selectDiscussion(id,body.contextKey));return true;}}
+  if(route==="POST /api/outline/discussions"){const body=JSON.parse(await readBody(req));sendJson(res,200,host.outline.createDiscussion(body.title,body.contextKey));return true;}
+
+		const discussionDelete = /^DELETE \/api\/outline\/chats\/([^/]+)$/.exec(route);
+		if (discussionDelete) {
+			host.outline.deleteChat(decodeURIComponent(discussionDelete[1]), query.get("contextKey") ?? undefined,query.get("discussionId")??undefined);
+			sendJson(res, 200, { ok: true, chats: (host.outline.getView() as { chats?: unknown }).chats ?? [] }); return true;
+		}
+		switch (route) {
+			case "GET /api/outline": { sendJson(res, 200, host.outline.getView()); return true; }
+			case "POST /api/mvu/recover":{if(refuseWhileStreaming())return true;if(!host.recoverMvu){sendJson(res,501,{error:"MVU恢复未适配"});return true;}const body=JSON.parse((await readBody(req))||"{}");if(typeof body.sourceEntryId!=="string"||!body.sourceEntryId||typeof body.scopeKey!=="string"||!body.scopeKey)throw Error("MVU恢复必须绑定明确会话/卡与来源");sendJson(res,200,await host.recoverMvu(body.sourceEntryId,body.scopeKey));return true;}
+   case "GET /api/request-inspector":{sendJson(res,200,host.requestRecords(query.get("id")??undefined));return true;}
+   case "GET /api/turn-diagnostics": {
+				const parsed = Number.parseInt(query.get("limit") ?? "12", 10);
+				const limit = Number.isFinite(parsed) ? Math.max(1, Math.min(20, parsed)) : 12;
+				res.setHeader("cache-control", "no-store");
+				sendJson(res, 200, host.turnDiagnostics(limit)); return true;
+			}
+			case "GET /api/outline/versions": { sendJson(res, 200, host.outline.history()); return true; }
+			case "POST /api/outline/chat": {
+				const body = JSON.parse(await readBody(req)) as { message?: string; researchMode?: string; discussionId?: string; contextKey?: string; focus?: "open" | "next-beat" | "dialogue" | "character" | "diagnose" | "daily" };
+				if (typeof body.message !== "string" || !body.message.trim() || body.message.length > 4000) throw new Error("请输入 1–4000 字的讨论消息");
+				sendJson(res, 200, await host.outline.chat(body.message, { research: body.researchMode === "manual" || body.researchMode === "auto" || body.researchMode === "refresh", focus: body.focus, contextKey: body.contextKey,discussionId:body.discussionId })); return true;
+			}
+			case "POST /api/outline/chat/stream": {
+				const body = JSON.parse(await readBody(req)) as { message?: string; researchMode?: string; discussionId?: string; contextKey?: string; focus?: "open" | "next-beat" | "dialogue" | "character" | "diagnose" | "daily" };
+				if (typeof body.message !== "string" || !body.message.trim() || body.message.length > 4000) throw new Error("请输入 1–4000 字的讨论消息");
+				await streamOutlineDiscussion(req, res, options => host.outline.chat(body.message!, { ...options, contextKey: body.contextKey,discussionId:body.discussionId, research: body.researchMode === "manual" || body.researchMode === "auto" || body.researchMode === "refresh", focus: body.focus }));
+				return true;
+			}
+			case "POST /api/outline/bootstrap": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse((await readBody(req)) || "{}") as { experienceWish?: string };
+				sendJson(res, 200, await host.outline.bootstrap(body.experienceWish)); return true;
+			}
+			case "POST /api/outline/reconcile": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse((await readBody(req)) || "{}") as { leafId?: string };
+				sendJson(res, 200, await host.outline.reconcile(body.leafId)); return true;
+			}
+			case "GET /api/outline/research": { sendJson(res, 200, host.outline.researchView()); return true; }
+			case "POST /api/outline/research/refresh": {
+				const body = JSON.parse((await readBody(req)) || "{}") as { topic?: string };
+				sendJson(res, 200, await host.outline.research(body.topic)); return true;
+			}
+			case "POST /api/outline/research/search": {
+				const body = JSON.parse((await readBody(req)) || "{}") as { topic?: string };
+				sendJson(res, 200, await host.outline.researchSearch(body.topic)); return true;
+			}
+			case "GET /api/outline/research/search/logs": {
+				res.setHeader("cache-control", "no-store");
+				sendJson(res, 200, { logs: host.outline.researchSearchLogs() }); return true;
+			}
+			case "GET /api/outline/research/search/schedule": {
+				res.setHeader("cache-control", "no-store");
+				sendJson(res, 200, host.outline.researchSearchScheduleStatus()); return true;
+			}
+			case "POST /api/outline/research/search/schedule/run": {
+				if (refuseWhileStreaming()) return true;
+				sendJson(res, 202, await host.outline.researchSearchScheduleRunNow()); return true;
+			}
+			case "PUT /api/outline/settings": {
+				const body = JSON.parse(await readBody(req)) as { mode?: "manual" | "suggest" | "auto"; researchMode?: "off" | "manual" | "auto" };
+				sendJson(res, 200, { settings: host.outline.settings(body) }); return true;
+			}
+			case "DELETE /api/outline/chats": {
+				host.outline.clearChats(query.get("contextKey") ?? undefined,query.get("discussionId")??undefined);
+				sendJson(res, 200, { ok: true, chats: [] }); return true;
+			}
+			// ---- 小说长文消化（导演室「藏书消化」页签） ----
+			case "POST /api/outline/corpus": {
+				const cfglite = loadConfig(host.cwd);
+				if (cfglite.novelDigest?.enabled === false) throw new Error("小说消化尚未启用");
+				const body = JSON.parse(await readBody(req)) as { file?: string };
+				const file = (body.file ?? "").trim();
+				if (!file) throw new Error("缺少 file（上传区文件名）");
+				sendJson(res, 201, await host.corpus.create(file)); return true;
+			}
+			case "POST /api/outline/corpus/version": {
+				const cfglite = loadConfig(host.cwd);
+				if (cfglite.novelDigest?.enabled === false) throw new Error("小说消化尚未启用");
+				const body = JSON.parse(await readBody(req)) as { baseDocId?: string; file?: string };
+				const baseDocId = (body.baseDocId ?? "").trim();
+				const file = (body.file ?? "").trim();
+				if (!baseDocId || !file) throw new Error("缺少 baseDocId 或 file");
+				sendJson(res, 201, await host.corpus.createVersion(baseDocId, file)); return true;
+			}
+			case "POST /api/outline/corpus/url": {
+				const cfglite = loadConfig(host.cwd);
+				if (cfglite.novelDigest?.enabled === false) throw new Error("小说消化尚未启用");
+				const body = JSON.parse(await readBody(req)) as { url?: string };
+				const value = (body.url ?? "").trim();
+				if (!value) throw new Error("缺少 url（Kakuyomu 作品 URL）");
+				sendJson(res, 201, await host.corpus.createUrl(value)); return true;
+			}
+			case "POST /api/outline/corpus/discover": {
+				const cfglite = loadConfig(host.cwd);
+				if (cfglite.novelDigest?.enabled === false) throw new Error("小说消化尚未启用");
+				sendJson(res, 202, await host.corpus.discover()); return true;
+			}
+			case "GET /api/outline/corpus": {
+				res.setHeader("cache-control", "no-store");
+				sendJson(res, 200, host.corpus.view()); return true;
+			}
+			// ---- 命令清单（输入框补全用；单一来源 src/commands.ts） ----
+			case "GET /api/commands": {
+				sendJson(res, 200, { commands: RP_COMMANDS });
+				return true;
+			}
+			// ---- 命令桥（agent 自操作 / 脚本化入口；PLAN-PHASE3 §6.3 三入口之一） ----
+			case "POST /api/command": {
+				const body = JSON.parse(await readBody(req)) as { text?: string };
+				const text = (body.text ?? "").trim();
+				const m = /^\/(\w+)(?:\s|$)/.exec(text);
+				if (!m || !RP_COMMANDS.some((c) => c.name === m[1])) {
+					throw new Error(`不是可用命令：${text.slice(0, 40)}（可用：${RP_COMMANDS.map((c) => `/${c.name}`).join(" ")}）`);
+				}
+				const queued = host.queueCommand(text);
+				sendJson(res, 200, { ok: true, queued, note: queued ? "生成中：已排队到本轮结束执行" : "已提交执行" });
+				return true;
+			}
+
+			// ---- 文生音（气泡配音 / 脚本） ----
+			case "POST /api/tts": {
+				const body = JSON.parse(await readBody(req)) as { text?: string; caption?: string };
+				const text = (body.text ?? "").trim();
+				if (!text) throw new Error("缺少 text");
+				const r = await host.ttsSpeak(text, body.caption?.trim() || undefined);
+				sendJson(res, 200, { ok: true, ...r });
+				return true;
+			}
+
+			// ---- 世界线（存档时间线） ----
+			case "GET /api/worldline": {
+				sendJson(res, 200, host.worldlineView() satisfies WorldlineView);
+				return true;
+			}
+			case "POST /api/worldline/delete-save": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { saveId?: string };
+				const saveId = (body.saveId ?? "").trim();
+				if (!saveId) throw new Error("缺少 saveId");
+				host.deleteWorldlineSave(saveId);
+				sendJson(res, 200, { ok: true, view: host.worldlineView() });
+				return true;
+			}
+			case "POST /api/worldline/rename": {
+				const body = JSON.parse(await readBody(req)) as { worldlineId?: string; name?: string };
+				const worldlineId = (body.worldlineId ?? "").trim();
+				const name = (body.name ?? "").trim();
+				if (!worldlineId || !name) throw new Error("需要 worldlineId 与 name");
+				host.renameWorldline(worldlineId, name);
+				sendJson(res, 200, { ok: true, view: host.worldlineView() });
+				return true;
+			}
+
+			// ---- 上传区（附件随消息模型）：原始字节直传，文件名走 query（免 multipart 解析依赖）。
+			// 不触碰会话：流式中也允许（agent 下一轮注入的【上传文件】速览自然可见）
+			case "POST /api/upload": {
+				const rawName = (query.get("name") ?? "").trim();
+				if (!rawName) throw new Error("缺少 name（URL 编码的原始文件名）");
+				const data = await readBodyRaw(req, MAX_UPLOAD);
+				if (data.length === 0) throw new Error("文件内容为空");
+				const saved = saveUpload(host.cwd, rawName, data);
+				sendJson(res, 200, { ok: true, file: saved.file, bytes: saved.bytes, size: formatBytes(saved.bytes) });
+				return true;
+			}
+			case "GET /api/uploads": {
+				const map = (u: { file: string; name: string; bytes: number; mtimeMs: number }) => ({
+					file: u.file,
+					name: u.name,
+					size: formatBytes(u.bytes),
+					mtimeMs: u.mtimeMs,
+				});
+				sendJson(res, 200, {
+					/** 我的上传：.liyuan-uploads/ */
+					uploads: listUploads(host.cwd).map(map),
+					/** 本地图片：.liyuan-media/（AI show_image 等） */
+					media: listMedia(host.cwd).map(map),
+				});
+				return true;
+			}
+			case "DELETE /api/uploads": {
+				const file = query.get("file") ?? "";
+				// 只许删 .liyuan-uploads/ 或 .liyuan-media/ 顶层文件
+				let base = "";
+				let dir = "";
+				if (file.startsWith(".liyuan-uploads/") || file.startsWith(".rp-uploads/")) {
+					base = file.replace(/^\.(liyuan|rp)-uploads\//, "");
+					dir = ".liyuan-uploads";
+				} else if (file.startsWith(".liyuan-media/") || file.startsWith(".rp-media/")) {
+					base = file.replace(/^\.(liyuan|rp)-media\//, "");
+					dir = ".liyuan-media";
+				}
+				if (!dir || !base || base.includes("/") || base.includes("\\") || base.includes("..")) {
+					throw new Error("非法路径");
+				}
+				const abs = join(host.cwd, dir, base);
+				if (!existsSync(abs)) throw new Error("文件不存在");
+				unlinkSync(abs);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+
+			// ---- 知识库（柱 3）：面板只读展示 + 挂载状态；建库/挂载/写入经由对话（agent 是入口） ----
+			case "GET /api/codex": {
+				const mounted = new Set(host.mountedCodexes());
+				sendJson(res, 200, {
+					mounted: [...mounted],
+					codexes: listCodexes(host.cwd).map((c) => ({
+						name: c.name,
+						description: c.description,
+						entryCount: c.entryCount,
+						mounted: mounted.has(c.name),
+					})),
+				});
+				return true;
+			}
+			case "GET /api/codex/entries": {
+				const name = query.get("name") ?? "";
+				const entries = loadCodexEntries(host.cwd, name);
+				if (!entries) throw new Error(`知识库不存在：${name}`);
+				sendJson(res, 200, {
+					entries: entries.map((e) => ({
+						fingerprint: loreFingerprint(e.content),
+						/** 前端主标题：名字 */
+						name: e.comment || e.keys[0] || "（未命名）",
+						comment: e.comment,
+						keys: e.keys,
+						constant: e.constant,
+						/** 前端正文：信息 */
+						content: e.content,
+						chars: e.content.length,
+					})),
+				});
+				return true;
+			}
+			/**
+			 * 用户添加条目：只收 name（名字）+ info（信息），后端译为标准 lore 条目
+			 * （comment/keys/content；keys 从名字自动派生，可被检索）。
+			 */
+			case "POST /api/codex/entries": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as {
+					codex?: string;
+					name?: string;
+					info?: string;
+					/** 兼容旧字段 / agent 同形 */
+					title?: string;
+					content?: string;
+					keys?: string[];
+				};
+				const codexName = (body.codex ?? "").trim();
+				if (!codexName) throw new Error("缺少知识库名 codex");
+				const title = (body.name ?? body.title ?? "").trim();
+				const info = (body.info ?? body.content ?? "").trim();
+				if (!title) throw new Error("名字不能为空");
+				if (!info) throw new Error("信息不能为空");
+				const input = userEntryToCodexInput(
+					title,
+					info,
+					Array.isArray(body.keys) ? body.keys.filter((k): k is string => typeof k === "string") : undefined,
+				);
+				const r = appendCodexEntry(host.cwd, codexName, input);
+				if (!r.ok) throw new Error(r.error);
+				if (!r.entry) {
+					sendJson(res, 200, { ok: true, duplicate: true, fingerprint: loreFingerprint(input.content) });
+					return true;
+				}
+				if (host.mountedCodexes().some((n) => n.toLowerCase() === codexName.toLowerCase())) {
+					await host.reloadSession();
+				}
+				host.notify("info", `已写入「${codexName}」：${r.entry.comment}`);
+				sendJson(res, 200, {
+					ok: true,
+					duplicate: false,
+					fingerprint: loreFingerprint(r.entry.content),
+					name: r.entry.comment,
+				});
+				return true;
+			}
+			case "DELETE /api/codex/entries": {
+				if (refuseWhileStreaming()) return true;
+				const codexName = (query.get("codex") ?? query.get("name") ?? "").trim();
+				const fp = (query.get("fp") ?? query.get("fingerprint") ?? "").trim();
+				if (!codexName) throw new Error("缺少知识库名");
+				if (!fp) throw new Error("缺少条目 fingerprint");
+				const r = deleteCodexEntry(host.cwd, codexName, fp);
+				if (!r.ok) throw new Error(r.error);
+				if (!r.removed) throw new Error("条目不存在（可能已删除）");
+				if (host.mountedCodexes().some((n) => n.toLowerCase() === codexName.toLowerCase())) {
+					await host.reloadSession();
+				}
+				host.notify("info", `已从「${codexName}」删除一条`);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			// 导出知识库为世界书 JSON（公开格式，可互通酒馆等；柱 3）
+			case "GET /api/codex/export": {
+				const name = query.get("name") ?? "";
+				const entries = loadCodexEntries(host.cwd, name);
+				if (!entries) throw new Error(`知识库不存在：${name}`);
+				sendJson(res, 200, { name, json: exportStLorebook(name, entries) });
+				return true;
+			}
+
+			// ---- 内置向量记忆（按「角色卡+对话」隔离；设置面板一等公民） ----
+			case "GET /api/memory": {
+				sendJson(res, 200, getMemoryStatus(host.cwd, host.memoryScope()));
+				return true;
+			}
+			case "PUT /api/memory": {
+				const body = JSON.parse(await readBody(req)) as {
+					enabled?: boolean;
+					searchTopK?: number;
+					injectOnTurn?: boolean;
+					embedMode?: "local" | "cloud";
+					cloudEmbed?: { baseUrl?: string; apiKey?: string; model?: string };
+					stores?: Array<{
+						id: string;
+						enabled?: boolean;
+						everyNTurns?: number;
+						maxChunks?: number;
+						name?: string;
+					}>;
+				};
+				const sc = host.memoryScope();
+				const cur = getMemoryStatus(host.cwd, sc).config;
+				updateMemoryConfig(host.cwd, {
+					...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
+					...(typeof body.searchTopK === "number" ? { searchTopK: body.searchTopK } : {}),
+					...(typeof body.injectOnTurn === "boolean" ? { injectOnTurn: body.injectOnTurn } : {}),
+					...(body.embedMode === "local" || body.embedMode === "cloud" ? { embedMode: body.embedMode } : {}),
+					...(body.cloudEmbed
+						? {
+								cloudEmbed: {
+									baseUrl: body.cloudEmbed.baseUrl ?? cur.cloudEmbed.baseUrl,
+									apiKey: body.cloudEmbed.apiKey ?? "",
+									model: body.cloudEmbed.model ?? cur.cloudEmbed.model,
+								},
+							}
+						: {}),
+				});
+				if (Array.isArray(body.stores)) {
+					for (const s of body.stores) {
+						if (!s?.id) continue;
+						updateStoreConfig(host.cwd, s.id, {
+							...(typeof s.enabled === "boolean" ? { enabled: s.enabled } : {}),
+							...(typeof s.everyNTurns === "number" ? { everyNTurns: s.everyNTurns } : {}),
+							...(typeof s.maxChunks === "number" ? { maxChunks: s.maxChunks } : {}),
+							...(typeof s.name === "string" ? { name: s.name } : {}),
+						});
+					}
+				}
+				sendJson(res, 200, getMemoryStatus(host.cwd, sc));
+				return true;
+			}
+			case "POST /api/memory/search": {
+				const body = JSON.parse(await readBody(req)) as { storeId?: string; query?: string; topK?: number };
+				const storeId = (body.storeId ?? "narrative").trim();
+				const query = (body.query ?? "").trim();
+				if (!query) throw new Error("缺少 query");
+				const hits = await memorySearch(host.cwd, host.memoryScope(), storeId, query, body.topK);
+				sendJson(res, 200, { hits });
+				return true;
+			}
+			case "POST /api/memory/import": {
+				const body = JSON.parse(await readBody(req)) as {
+					storeId?: string;
+					text?: string;
+					fileName?: string;
+				};
+				// 仅额外库；剧情库禁止导入
+				const storeId = (body.storeId ?? "external").trim() || "external";
+				const text = (body.text ?? "").trim();
+				if (!text) throw new Error("缺少 text");
+				const sc = host.memoryScope();
+				const r = await memoryImportText(host.cwd, sc, storeId, text, body.fileName);
+				if (r.added > 0) {
+					const label = body.fileName?.trim() || "额外库";
+					host.notify(
+						"info",
+						`向量记忆：向量化成功 · 额外库 +${r.added} 条（「${label}」· 当前对话）`,
+					);
+				} else if (r.chunks > 0) {
+					host.notify("info", "向量记忆：内容已在库中（无新增）");
+				}
+				sendJson(res, 200, { ok: true, ...r, ...getMemoryStatus(host.cwd, sc) });
+				return true;
+			}
+			case "POST /api/memory/manual": {
+				// 手动向量化 → 仅额外库，每段/块一条
+				const body = JSON.parse(await readBody(req)) as {
+					text?: string;
+					title?: string;
+					storeId?: string;
+				};
+				const text = (body.text ?? "").trim();
+				if (!text) throw new Error("缺少 text");
+				const sc = host.memoryScope();
+				const r = await memoryManualAdd(host.cwd, sc, text, {
+					title: body.title,
+					storeId: body.storeId,
+				});
+				if (r.added > 0) {
+					host.notify(
+						"info",
+						`向量记忆：手动向量化成功 · 额外库 +${r.added} 条（当前对话）`,
+					);
+				} else {
+					host.notify("info", "向量记忆：内容已在库中（无新增）");
+				}
+				sendJson(res, 200, { ok: true, ...r, ...getMemoryStatus(host.cwd, sc) });
+				return true;
+			}
+			case "GET /api/memory/chunks": {
+				const storeId = (query.get("storeId") ?? "external").trim() || "external";
+				const sc = host.memoryScope();
+				const chunks = memoryListChunks(host.cwd, sc, storeId);
+				sendJson(res, 200, { storeId, chunks });
+				return true;
+			}
+			case "GET /api/memory/events": {
+				const sc = host.memoryScope();
+				const events = memoryListEventDigests(host.cwd, sc);
+				sendJson(res, 200, { events, total: events.length, scope: sc });
+				return true;
+			}
+			case "GET /api/memory/diff": {
+				const sc = host.memoryScope();
+				const rawLimit = Number(query.get("limit") ?? 50);
+				const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 50;
+				const diff = memoryListDiff(host.cwd, sc, limit);
+				sendJson(res, 200, { diff, total: diff.length, scope: sc });
+				return true;
+			}
+			case "DELETE /api/memory/chunk": {
+				const storeId = (query.get("storeId") ?? "").trim();
+				const id = (query.get("id") ?? "").trim();
+				if (!storeId) throw new Error("缺少 storeId");
+				if (!id) throw new Error("缺少 id");
+				const sc = host.memoryScope();
+				const ok = await memoryDeleteChunk(host.cwd, sc, storeId, id);
+				if (!ok) throw new Error("条目不存在或已删除");
+				host.notify("info", "向量记忆：已删除 1 条");
+				sendJson(res, 200, { ok: true, ...getMemoryStatus(host.cwd, sc) });
+				return true;
+			}
+			case "POST /api/memory/chunk/delete": {
+				// 兼容不便发 DELETE body 的客户端
+				const body = JSON.parse(await readBody(req)) as { storeId?: string; id?: string };
+				const storeId = (body.storeId ?? "").trim();
+				const id = (body.id ?? "").trim();
+				if (!storeId) throw new Error("缺少 storeId");
+				if (!id) throw new Error("缺少 id");
+				const sc = host.memoryScope();
+				const ok = await memoryDeleteChunk(host.cwd, sc, storeId, id);
+				if (!ok) throw new Error("条目不存在或已删除");
+				host.notify("info", "向量记忆：已删除 1 条");
+				sendJson(res, 200, { ok: true, ...getMemoryStatus(host.cwd, sc) });
+				return true;
+			}
+			case "POST /api/memory/probe-embed": {
+				const r = await probeCloudEmbed(host.cwd);
+				sendJson(res, 200, r);
+				return true;
+			}
+			case "POST /api/memory/reembed": {
+				// 保留原文，按当前 embed 模式重算向量（换 local/cloud 后用）
+				const body = JSON.parse((await readBody(req)) || "{}") as { storeId?: string };
+				const sc = host.memoryScope();
+				const r = await memoryReembedScope(host.cwd, sc, {
+					storeId: body.storeId?.trim() || undefined,
+				});
+				const modeLabel = r.mode === "cloud" ? `云端(${r.model})` : "本地";
+				if (r.totalChunks === 0) {
+					host.notify("info", "向量记忆：当前对话库为空，无需重向量化");
+				} else {
+					host.notify(
+						"info",
+						`向量记忆：重向量化完成 · ${r.totalUpdated}/${r.totalChunks} 条 → ${modeLabel}（当前对话）`,
+					);
+				}
+				sendJson(res, 200, { ok: true, ...r, ...getMemoryStatus(host.cwd, sc) });
+				return true;
+			}
+			case "POST /api/memory/clear": {
+				const body = JSON.parse(await readBody(req)) as { storeId?: string };
+				const storeId = (body.storeId ?? "").trim();
+				if (!storeId) throw new Error("缺少 storeId");
+				const sc = host.memoryScope();
+				await memoryClearStore(host.cwd, sc, storeId);
+				sendJson(res, 200, { ok: true, ...getMemoryStatus(host.cwd, sc) });
+				return true;
+			}
+			case "DELETE /api/memory/store": {
+				const storeId = (query.get("id") ?? "").trim();
+				if (!storeId) throw new Error("缺少 id");
+				const sc = host.memoryScope();
+				await memoryRemoveStore(host.cwd, sc, storeId);
+				sendJson(res, 200, { ok: true, ...getMemoryStatus(host.cwd, sc) });
+				return true;
+			}
+
+			// ---- 技能库：面板只读展示 + /skill:name 显式触发（触发经会话通道，同输入框打命令） ----
+			case "GET /api/skills": {
+				sendJson(res, 200, {
+					skills: listSkills(host.cwd).map((s) => ({
+						name: s.name,
+						description: s.description,
+						file: s.file,
+						disableModelInvocation: s.disableModelInvocation === true,
+					})),
+				});
+				return true;
+			}
+			case "GET /api/skills/content": {
+				const file = query.get("file") ?? "";
+				const base = file.startsWith(".liyuan-skills/") ? file.slice(".liyuan-skills/".length) : "";
+				if (!base || base.includes("/") || base.includes("\\") || base.includes("..") || !base.endsWith(".md")) {
+					throw new Error("非法路径");
+				}
+				const abs = join(host.cwd, ".liyuan-skills", base);
+				if (!existsSync(abs)) throw new Error("技能文件不存在");
+				sendJson(res, 200, { content: readFileSync(abs, "utf8") });
+				return true;
+			}
+			// 技能写入/更新（PLAN-PANELS §2.6）：同名覆盖=更新，frontmatter 由 saveSkill 统一生成
+			case "POST /api/skills": {
+				const body = JSON.parse(await readBody(req)) as {
+					name?: string;
+					description?: string;
+					content?: string;
+					disableModelInvocation?: boolean;
+				};
+				const name = (body.name ?? "").trim();
+				const content = (body.content ?? "").trim();
+				if (!name) throw new Error("缺少技能名");
+				if (!content) throw new Error("技能内容为空");
+				const r = saveSkill(host.cwd, {
+					name,
+					description: (body.description ?? "").trim(),
+					content,
+					disableModelInvocation: body.disableModelInvocation === true,
+				});
+				sendJson(res, 200, { ok: true, ...r, note: "system prompt 里的技能索引在下次会话重载时更新" });
+				return true;
+			}
+			case "DELETE /api/skills": {
+				const file = query.get("file") ?? "";
+				const base = file.startsWith(".liyuan-skills/") ? file.slice(".liyuan-skills/".length) : "";
+				if (!base || base.includes("/") || base.includes("\\") || base.includes("..") || !base.endsWith(".md")) {
+					throw new Error("非法路径");
+				}
+				const abs = join(host.cwd, ".liyuan-skills", base);
+				if (!existsSync(abs)) throw new Error("技能文件不存在");
+				unlinkSync(abs);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+
+			// ---- MCP 外设（柱 4）：多源发现 + 本对话开关 + 项目手写 + 探测 ----
+			case "GET /api/mcp": {
+				const hub = getMcpHub(host.cwd);
+				const catalog = discoverMcpCatalog(host.cwd);
+				const statuses = hub.statusList();
+				// hub 尚未 session_start 时 sessionEnabled 为空：仍展示目录，enabled 全 false
+				const byId = new Map(statuses.map((s) => [s.id, s]));
+				const servers = catalog.map((e) => {
+					const st = byId.get(e.id);
+					if (st) return st;
+					return {
+						id: e.id,
+						name: e.name,
+						enabled: false,
+						defaultEnabled: e.enabled,
+						transport: e.transport,
+						status: "disconnected" as const,
+						tools: [],
+						summary:
+							e.transport === "stdio"
+								? `${e.command ?? ""} ${(e.args ?? []).join(" ")}`.trim()
+								: (e.url ?? ""),
+						source: e.source,
+						sources: e.sources,
+						discovered: e.discovered,
+						builtin: e.builtin,
+					};
+				});
+				const project = loadMcpConfig(host.cwd);
+				sendJson(res, 200, {
+					servers,
+					sessionEnabled: hub.getSessionEnabled(),
+					// 项目手写条目（编辑表单回填）
+					config: project.servers,
+					// 发现项的完整配置（编辑发现项→建项目覆盖时预填表单）
+					catalog: catalog.map((e) => ({
+						id: e.id,
+						name: e.name,
+						enabled: e.enabled,
+						transport: e.transport,
+						command: e.command,
+						args: e.args,
+						env: e.env,
+						cwd: e.cwd,
+						url: e.url,
+						headers: e.headers,
+					})),
+					// 发现摘要（调试/面板提示）
+					discovered: catalog.length,
+				});
+				return true;
+			}
+			case "POST /api/mcp/sync": {
+				try {
+					await host.promptCommand("/mcpsync");
+				} catch {
+					// 扩展未装载：仅 hub 侧对账
+					const hub = getMcpHub(host.cwd);
+					await hub.sync();
+				}
+				sendJson(res, 200, { ok: true, servers: getMcpHub(host.cwd).statusList() });
+				return true;
+			}
+			// 本对话启用/关闭（agent 绑会话）；可选写入「新对话默认」
+			case "POST /api/mcp/enable": {
+				const body = JSON.parse(await readBody(req)) as {
+					id?: string;
+					enabled?: boolean;
+					/** true=同时写入项目 defaults，影响之后的新对话 */
+					persistDefault?: boolean;
+				};
+				const id = sanitizeServerId(String(body.id ?? ""));
+				if (!id) throw new Error("缺少 id");
+				const on = body.enabled === true;
+				if (body.persistDefault === true) {
+					setDefaultEnabled(host.cwd, id, on);
+				}
+				try {
+					await host.promptCommand(`/mcpset ${id} ${on ? "on" : "off"}`);
+				} catch (e) {
+					throw new Error(`切换失败：${e instanceof Error ? e.message : String(e)}`);
+				}
+				sendJson(res, 200, {
+					ok: true,
+					id,
+					enabled: on,
+					servers: getMcpHub(host.cwd).statusList(),
+					sessionEnabled: getMcpHub(host.cwd).getSessionEnabled(),
+				});
+				return true;
+			}
+			case "POST /api/mcp/servers": {
+				const body = JSON.parse(await readBody(req)) as Partial<McpServerConfig> & { id?: string };
+				const cfg = loadMcpConfig(host.cwd);
+				const name = String(body.name ?? body.id ?? "").trim();
+				if (!name && !body.command && !body.url) throw new Error("请填写名称，以及 command 或 url");
+				const id = body.id?.trim()
+					? sanitizeServerId(body.id)
+					: allocateServerId(host.cwd, name || body.command || "server");
+				if (!id) throw new Error("无效的服务器 id");
+				if (cfg.servers.some((s) => s.id === id)) throw new Error(`id「${id}」已在项目配置中`);
+				// 手写添加默认关（与发现一致）；调用方可显式 enabled:true
+				const server: McpServerConfig = {
+					id,
+					name: name || id,
+					enabled: body.enabled === true,
+					transport: body.transport === "http" || body.transport === "sse" ? body.transport : "stdio",
+					command: typeof body.command === "string" ? body.command.trim() : undefined,
+					args: Array.isArray(body.args) ? body.args.filter((x): x is string => typeof x === "string") : undefined,
+					env: body.env && typeof body.env === "object" ? (body.env as Record<string, string>) : undefined,
+					cwd: typeof body.cwd === "string" ? body.cwd.trim() : undefined,
+					url: typeof body.url === "string" ? body.url.trim() : undefined,
+					headers: body.headers && typeof body.headers === "object" ? (body.headers as Record<string, string>) : undefined,
+				};
+				const v = validateServerConfig(server);
+				if (v) throw new Error(v);
+				cfg.servers.push(server);
+				if (server.enabled) {
+					cfg.defaults = { ...(cfg.defaults ?? {}), [id]: true };
+				}
+				saveMcpConfig(host.cwd, cfg);
+				if (server.enabled) {
+					try {
+						await host.promptCommand(`/mcpset ${id} on`);
+					} catch {
+						// ignore
+					}
+				}
+				host.notify("info", `MCP「${server.name}」已写入项目配置`);
+				sendJson(res, 200, {
+					ok: true,
+					server,
+					servers: getMcpHub(host.cwd).statusList(),
+				});
+				return true;
+			}
+			case "PUT /api/mcp/servers": {
+				const body = JSON.parse(await readBody(req)) as Partial<McpServerConfig> & { id?: string };
+				const id = sanitizeServerId(String(body.id ?? ""));
+				if (!id) throw new Error("缺少 id");
+				const cfg = loadMcpConfig(host.cwd);
+				const idx = cfg.servers.findIndex((s) => s.id === id);
+				// 仅项目手写可改 endpoint；发现项请用 enable 开关
+				if (idx < 0) {
+					if (typeof body.enabled === "boolean") {
+						// 发现项：只改开关
+						setDefaultEnabled(host.cwd, id, body.enabled);
+						try {
+							await host.promptCommand(`/mcpset ${id} ${body.enabled ? "on" : "off"}`);
+						} catch {
+							// ignore
+						}
+						sendJson(res, 200, {
+							ok: true,
+							servers: getMcpHub(host.cwd).statusList(),
+							sessionEnabled: getMcpHub(host.cwd).getSessionEnabled(),
+						});
+						return true;
+					}
+					throw new Error(`项目中无手写条目「${id}」（发现项只能开关，或先「添加」做项目覆盖）`);
+				}
+				const prev = cfg.servers[idx];
+				const server: McpServerConfig = {
+					...prev,
+					name: typeof body.name === "string" && body.name.trim() ? body.name.trim() : prev.name,
+					enabled: typeof body.enabled === "boolean" ? body.enabled : prev.enabled,
+					transport:
+						body.transport === "http" || body.transport === "sse" || body.transport === "stdio"
+							? body.transport
+							: prev.transport,
+					command: body.command !== undefined ? String(body.command).trim() : prev.command,
+					args: body.args !== undefined
+						? Array.isArray(body.args)
+							? body.args.filter((x): x is string => typeof x === "string")
+							: prev.args
+						: prev.args,
+					env: body.env !== undefined
+						? body.env && typeof body.env === "object"
+							? (body.env as Record<string, string>)
+							: undefined
+						: prev.env,
+					cwd: body.cwd !== undefined ? String(body.cwd).trim() || undefined : prev.cwd,
+					url: body.url !== undefined ? String(body.url).trim() || undefined : prev.url,
+					headers: body.headers !== undefined
+						? body.headers && typeof body.headers === "object"
+							? (body.headers as Record<string, string>)
+							: undefined
+						: prev.headers,
+				};
+				const v = validateServerConfig(server);
+				if (v) throw new Error(v);
+				cfg.servers[idx] = server;
+				cfg.defaults = { ...(cfg.defaults ?? {}), [id]: server.enabled === true };
+				saveMcpConfig(host.cwd, cfg);
+				try {
+					await host.promptCommand(`/mcpset ${id} ${server.enabled ? "on" : "off"}`);
+				} catch {
+					// ignore
+				}
+				sendJson(res, 200, { ok: true, server, servers: getMcpHub(host.cwd).statusList() });
+				return true;
+			}
+			case "DELETE /api/mcp/servers": {
+				const id = sanitizeServerId(query.get("id") ?? "");
+				if (!id) throw new Error("缺少 id");
+				const cfg = loadMcpConfig(host.cwd);
+				const next = cfg.servers.filter((s) => s.id !== id);
+				if (next.length === cfg.servers.length) {
+					throw new Error(`项目中无手写「${id}」（发现项不能删除，关掉即可）`);
+				}
+				cfg.servers = next;
+				if (cfg.defaults) {
+					const d = { ...cfg.defaults };
+					delete d[id];
+					cfg.defaults = d;
+				}
+				saveMcpConfig(host.cwd, cfg);
+				try {
+					await host.promptCommand(`/mcpset ${id} off`);
+				} catch {
+					// ignore
+				}
+				host.notify("info", `已删除项目 MCP「${id}」`);
+				sendJson(res, 200, { ok: true, servers: getMcpHub(host.cwd).statusList() });
+				return true;
+			}
+			case "POST /api/mcp/probe": {
+				const body = JSON.parse(await readBody(req)) as Partial<McpServerConfig> & { id?: string };
+				// 允许只传 id：从目录取 endpoint
+				let server: McpServerConfig;
+				if (body.id && !body.command && !body.url) {
+					const hit = discoverMcpCatalog(host.cwd).find((s) => s.id === sanitizeServerId(body.id!));
+					if (!hit) throw new Error(`目录中无「${body.id}」`);
+					server = {
+						id: hit.id,
+						name: hit.name,
+						enabled: true,
+						transport: hit.transport,
+						command: hit.command,
+						args: hit.args,
+						env: hit.env,
+						cwd: hit.cwd,
+						url: hit.url,
+						headers: hit.headers,
+					};
+				} else {
+					server = {
+						id: sanitizeServerId(String(body.id ?? "probe")) || "probe",
+						name: String(body.name ?? "probe"),
+						enabled: true,
+						transport: body.transport === "http" || body.transport === "sse" ? body.transport : "stdio",
+						command: typeof body.command === "string" ? body.command.trim() : undefined,
+						args: Array.isArray(body.args) ? body.args.filter((x): x is string => typeof x === "string") : undefined,
+						env: body.env && typeof body.env === "object" ? (body.env as Record<string, string>) : undefined,
+						cwd: typeof body.cwd === "string" ? body.cwd.trim() : undefined,
+						url: typeof body.url === "string" ? body.url.trim() : undefined,
+						headers:
+							body.headers && typeof body.headers === "object" ? (body.headers as Record<string, string>) : undefined,
+					};
+				}
+				const result = await probeMcpServer(server);
+				sendJson(res, 200, result);
+				return true;
+			}
+
+			// ---- Agent 自建面板：liyuan-panels 社区格式导入（柱 2）。导出走前端（内容已在 wire，零服务端） ----
+			case "POST /api/panels/import": {
+				const body = JSON.parse(await readBody(req)) as {
+					format?: unknown;
+					panels?: unknown;
+					name?: unknown;
+					kind?: unknown;
+					content?: unknown;
+				};
+				// 宽进：标准 {format:"liyuan-panels",panels:[…]}，也容单面板裸对象 {name,kind,content}
+				const list = Array.isArray(body.panels)
+					? (body.panels as Array<{ name?: unknown; kind?: unknown; content?: unknown }>)
+					: typeof body.name === "string" && typeof body.content === "string"
+						? [body]
+						: null;
+				if (!list || list.length === 0) {
+					throw new Error('格式不对：需要 liyuan-panels JSON（{"format":"liyuan-panels","version":1,"panels":[{"name","kind","content"}]}）');
+				}
+				const result = await host.importPanels(list);
+				if (result.imported > 0) {
+					host.notify("info", `已导入 ${result.imported} 个面板${result.errors.length ? `（${result.errors.length} 个失败）` : ""}`);
+				}
+				sendJson(res, result.imported > 0 ? 200 : 400, { ok: result.imported > 0, ...result });
+				return true;
+			}
+			// 用户从面板坞删除：同 agent panel_close（归档，出活跃列表；fs.watch + panelsync）
+			case "DELETE /api/panels": {
+				const name = (query.get("name") ?? "").trim();
+				if (!name) throw new Error("缺少 name");
+				await host.closePanel(name);
+				host.notify("info", `已删除面板「${name}」`);
+				sendJson(res, 200, { ok: true, name });
+				return true;
+			}
+			// 用户手改面板源码（markdown/svg/html 通用）：写盘 + 收编，下轮 agent 可见
+			case "PUT /api/panels": {
+				const body = JSON.parse(await readBody(req)) as {
+					name?: unknown;
+					content?: unknown;
+					kind?: unknown;
+				};
+				const name = typeof body.name === "string" ? body.name.trim() : "";
+				if (!name) throw new Error("缺少 name");
+				if (typeof body.content !== "string") throw new Error("缺少 content");
+				const kind = typeof body.kind === "string" && body.kind.trim() ? body.kind.trim() : undefined;
+				const saved = await host.savePanel({ name, content: body.content, kind });
+				host.notify("info", `已保存面板「${saved.name}」`);
+				sendJson(res, 200, { ok: true, ...saved });
+				return true;
+			}
+
+			// ---- 会话管理（PLAN-PANELS §2.1）：重命名/删除/导出/全文搜索 ----
+			case "GET /api/sessions/search": {
+				sendJson(res, 200, { hits: await host.searchSessions(query.get("q") ?? "") });
+				return true;
+			}
+			case "POST /api/sessions/rename": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { path?: string; name?: string };
+				if (!body.path || !body.name?.trim()) throw new Error("缺少 path / name");
+				await host.renameSession(body.path, body.name);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "DELETE /api/sessions": {
+				if (refuseWhileStreaming()) return true;
+				const path = query.get("path") ?? "";
+				if (!path) throw new Error("缺少 path");
+				await host.deleteSession(path);
+				host.notify("info", "会话已删除");
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "GET /api/sessions/export": {
+				const path = query.get("path") ?? "";
+				if (!path) throw new Error("缺少 path");
+				const content = await host.readSessionFile(path);
+				res.writeHead(200, {
+					"content-type": "application/x-ndjson; charset=utf-8",
+					"content-disposition": `attachment; filename="session.jsonl"; filename*=UTF-8''${encodeURIComponent(basename(path))}`,
+				});
+				res.end(content);
+				return true;
+			}
+
+			// ---- 卡前端(一档皮肤,spec 2026-07-22 §7 P1) ----
+			case "GET /api/cardfront/regex": {
+    sendJson(res,200,loadRegexInspectorSnapshot(host.cwd));return true;
+   }
+   case "GET /api/cardfront": {
+				// 与 GET /api/card 同：当前卡用 resolvePath（支持按路径换卡的非库内路径）
+				// 载荷必须与 hello.cardfront 同源(buildCardFrontSnapshot)
+				sendJson(res, 200, loadCardFrontSnapshot(host.cwd));
+				return true;
+			}
+			case "PUT /api/cardfront": {
+				const body = JSON.parse(await readBody(req)) as { enabled?: boolean };
+				if (typeof body.enabled !== "boolean") throw new Error("enabled 必须是布尔值");
+				const config = loadConfig(host.cwd);
+				writeJsonWithBackup(configPath(host.cwd), setSkinEnabled(config, config.card, body.enabled));
+				sendJson(res, 200, { ok: true, enabled: body.enabled });
+				return true;
+			}
+
+			// ---- 卡库（PLAN-PANELS §2.7）：清单/立绘/导入/收藏 ----
+			case "GET /api/cards": {
+				const config = loadConfig(host.cwd);
+				const favs = new Set(loadFavs(host.cwd));
+				sendJson(res, 200, {
+					current: config.card,
+					cards: listCardLibrary(host.cwd, config).map((c) => ({ ...c, fav: favs.has(c.path) })),
+				});
+				return true;
+			}
+			case "GET /api/cards/image": {
+				const p = query.get("path") ?? "";
+				const abs = assertLibraryCard(host.cwd, loadConfig(host.cwd), p);
+				if (!/\.png$/i.test(abs)) throw new Error("该卡没有内嵌立绘（JSON 卡）");
+				// 路径稳定即可长缓存；避免卡库↔详情来回时封面反复重下
+				let mtime = 0;
+				try {
+					mtime = statSync(abs).mtimeMs;
+				} catch {
+					/* ignore */
+				}
+				res.writeHead(200, {
+					"content-type": "image/png",
+					"cache-control": "public, max-age=604800, immutable",
+					etag: `"${mtime.toString(16)}"`,
+				});
+				res.end(readFileSync(abs));
+				return true;
+			}
+			case "POST /api/cards/import": {
+				const rawName = (query.get("name") ?? "").trim();
+				if (!rawName || !/\.(png|json)$/i.test(rawName)) throw new Error("文件名必须以 .png 或 .json 结尾");
+				const safe = rawName.replace(/[\\/:*?"<>|]/g, "-");
+				const dir = join(host.cwd, "assets", "cards");
+				mkdirSync(dir, { recursive: true });
+				const dest = join(dir, safe);
+				if (existsSync(dest)) throw new Error(`同名卡已存在：${safe}`);
+				const data = await readBodyRaw(req, MAX_UPLOAD);
+				if (data.length === 0) throw new Error("文件内容为空");
+				writeFileSync(dest, data);
+				try {
+					const card = loadCardFile(dest);
+					if (!card.name.trim()) throw new Error("卡名为空");
+					host.notify("info", `已导入角色卡「${card.name}」`);
+					sendJson(res, 200, {
+						ok: true,
+						path: `assets/cards/${safe}`,
+						name: card.name,
+						embeddedLoreCount: card.book.length,
+					});
+				} catch (e) {
+					unlinkSync(dest); // 坏卡不留盘
+					throw new Error(`不是有效的角色卡：${e instanceof Error ? e.message : String(e)}`);
+				}
+				return true;
+			}
+			/**
+			 * 删除角色卡。query：
+			 * - path：卡库内相对路径（必填）
+			 * - lore=1：连同配套世界书（assets/lorebooks/<卡名>.json 及 -N 变体）一起删并取消挂载
+			 * - data=1：连同相关数据（该卡全部会话、补充设定集、persona 卡锁定）一起删；
+			 *   不带则数据保留，重新导入同路径同名卡可无缝续玩
+			 * 删除当前使用中的卡：先自动切到默认卡（或卡库剩余第一张），最后一张卡拒删。
+			 */
+			case "DELETE /api/cards": {
+				if (refuseWhileStreaming()) return true;
+				const p = query.get("path") ?? "";
+				const wantLore = query.get("lore") === "1";
+				const wantData = query.get("data") === "1";
+				let config = loadConfig(host.cwd);
+				const abs = assertLibraryCard(host.cwd, config, p);
+				let cardName = basename(p).replace(/\.(png|json)$/i, "");
+				try {
+					cardName = loadCardFile(abs).name || cardName;
+				} catch {
+					// 坏卡也允许删，名字退回文件名
+				}
+				const isCurrent = !!config.card && resolvePath(host.cwd, config.card) === abs;
+
+				// 删当前卡：先切走（默认卡优先，其次卡库剩余第一张；没有可去处则拒绝）
+				let switchedTo: string | null = null;
+				if (isCurrent) {
+					const others = listCardLibrary(host.cwd, config).filter((c) => resolvePath(host.cwd, c.path) !== abs);
+					const fallback = others.find((c) => c.path === DEFAULT_CONFIG.card) ?? others[0];
+					if (!fallback) throw new Error("这是卡库里最后一张卡，删掉就没有可用角色了：请先导入其它卡");
+					const raw = config as unknown as Record<string, unknown>;
+					delete raw.displayName;
+					delete raw.greetingIndex;
+					raw.card = fallback.path;
+					writeJsonWithBackup(configPath(host.cwd), raw);
+					const persona = personaForCard(loadPersonas(host.cwd), fallback.path);
+					if (persona) projectPersonaToConfig(host.cwd, persona);
+					await host.switchToCard();
+					switchedTo = fallback.path;
+					config = loadConfig(host.cwd);
+				}
+
+				// 卡本体
+				unlinkSync(abs);
+				cardMetaCache.delete(abs);
+				const favs = loadFavs(host.cwd);
+				if (favs.includes(p)) {
+					saveFavs(host.cwd, favs.filter((f) => f !== p));
+				}
+
+				// 配套世界书：与 import-embedded-lore 同一命名推导（<卡名>.json / <卡名>-N.json）
+				let deletedLore = 0;
+				if (wantLore) {
+					const safeBase = cardName.replace(/[\\/:*?"<>|]/g, "-").trim() || "card-lore";
+					const rx = new RegExp(`^${safeBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(-\\d+)?\\.json$`, "i");
+					const dir = join(host.cwd, LOREBOOKS_DIR);
+					const gone: string[] = [];
+					if (existsSync(dir)) {
+						for (const f of readdirSync(dir)) {
+							if (!rx.test(f)) continue;
+							try {
+								unlinkSync(join(dir, f));
+								gone.push(`${LOREBOOKS_DIR}/${f}`);
+							} catch {
+								// 删不掉的留着，挂载也别拆
+							}
+						}
+					}
+					if (gone.length > 0) {
+						const mounted = mountedLorebookPaths(config).filter((m) => !gone.includes(m));
+						writeJsonWithBackup(configPath(host.cwd), setMountedLorebooks(config, mounted));
+						await host.softRefreshConfig();
+					}
+					deletedLore = gone.length;
+				}
+
+				// 相关数据：会话 + 补充设定集 + persona 卡锁定（保留则重新导入同路径卡即无缝续玩）
+				let deletedSessions = 0;
+				if (wantData) {
+					deletedSessions = await host.deleteCardSessions(p);
+					const overlay = overlayPathFor(host.cwd, cardName);
+					if (existsSync(overlay)) {
+						try {
+							unlinkSync(overlay);
+						} catch {
+							/* 不挡 */
+						}
+					}
+					const pstore = loadPersonas(host.cwd);
+					if (pstore.byCard[p]) {
+						const byCard = { ...pstore.byCard };
+						delete byCard[p];
+						savePersonas(host.cwd, { ...pstore, byCard });
+					}
+				}
+
+				host.notify(
+					"info",
+					`已删除角色卡「${cardName}」${wantLore && deletedLore > 0 ? `，配套世界书 ${deletedLore} 本` : ""}${wantData ? `，相关数据（会话 ${deletedSessions} 个）` : "（数据保留，重新导入可续玩）"}${switchedTo ? `；已切换到「${basename(switchedTo)}」` : ""}`,
+				);
+				sendJson(res, 200, { ok: true, deletedLore, deletedSessions, switchedTo });
+				return true;
+			}
+			case "POST /api/cards/fav": {
+				const body = JSON.parse(await readBody(req)) as { path?: string; fav?: boolean };
+				if (!body.path) throw new Error("缺少 path");
+				const favs = new Set(loadFavs(host.cwd));
+				if (body.fav) favs.add(body.path);
+				else favs.delete(body.path);
+				saveFavs(host.cwd, [...favs]);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+
+			// ---- 世界状态编辑（PLAN-PANELS §2.11）：用户主权，applyPatch 语义，不经模型 ----
+			case "PUT /api/state": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { patch?: Record<string, unknown> };
+				if (!body.patch || typeof body.patch !== "object") throw new Error("缺少 patch");
+				const r = await host.applyStatePatch(body.patch);
+				sendJson(res, 200, r);
+				return true;
+			}
+
+			// ---- 用户角色 persona（PLAN-PANELS-V2 §2.5）：多身份清单/创建/选择/编辑/删除/按卡锁定 ----
+			case "GET /api/personas": {
+				let store = loadPersonas(host.cwd);
+				const config = loadConfig(host.cwd);
+				// 迁移：首次使用且 config 已有单人设 → 自动收编为第一个 persona
+				if (store.personas.length === 0 && config.userName) {
+					const r = createPersona(store, { name: config.userName, persona: config.userPersona });
+					store = { ...r.store, current: r.id };
+					savePersonas(host.cwd, store);
+				}
+				const active = personaForCard(store, config.card);
+				sendJson(res, 200, {
+					personas: store.personas,
+					current: store.current,
+					lockedForCard: store.byCard[config.card] ?? null,
+					activeId: active?.id ?? null,
+				});
+				return true;
+			}
+			case "POST /api/personas": {
+				const body = JSON.parse(await readBody(req)) as { name?: string; persona?: string };
+				if (!body.name?.trim()) throw new Error("缺少名字");
+				const store = loadPersonas(host.cwd);
+				const r = createPersona(store, { name: body.name, persona: body.persona });
+				// 第一个 persona 自动成为全局默认
+				savePersonas(host.cwd, r.store.current === null ? { ...r.store, current: r.id } : r.store);
+				sendJson(res, 200, { ok: true, id: r.id });
+				return true;
+			}
+			case "PUT /api/personas": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { id?: string; name?: string; persona?: string };
+				if (!body.id) throw new Error("缺少 id");
+				const store = loadPersonas(host.cwd);
+				if (!findPersona(store, body.id)) throw new Error("身份不存在");
+				const next = updatePersona(store, body.id, { name: body.name, persona: body.persona });
+				savePersonas(host.cwd, next);
+				// 改的是当前生效身份 → 投影进 config 并重载
+				const config = loadConfig(host.cwd);
+				const active = personaForCard(next, config.card);
+				if (active?.id === body.id) {
+					projectPersonaToConfig(host.cwd, active);
+					await host.softRefreshConfig();
+				}
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "DELETE /api/personas": {
+				const id = query.get("id") ?? "";
+				const store = loadPersonas(host.cwd);
+				if (!findPersona(store, id)) throw new Error("身份不存在");
+				if (store.personas.length <= 1) throw new Error("至少保留一个身份");
+				savePersonas(host.cwd, deletePersona(host.cwd, store, id));
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "POST /api/personas/select": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { id?: string; lockToCard?: boolean };
+				const store = loadPersonas(host.cwd);
+				const p = findPersona(store, body.id ?? "");
+				if (!p) throw new Error("身份不存在");
+				const config = loadConfig(host.cwd);
+				const byCard = { ...store.byCard };
+				if (body.lockToCard === true) byCard[config.card] = p.id;
+				else if (body.lockToCard === false) delete byCard[config.card];
+				savePersonas(host.cwd, { ...store, current: body.lockToCard ? store.current : p.id, byCard });
+				projectPersonaToConfig(host.cwd, p);
+				await host.softRefreshConfig();
+				host.notify("info", `已切换身份：${p.name}`);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			/** 上传裁剪后的头像（raw PNG/JPEG 字节，ST 式方形头像由前端裁完再传） */
+			case "POST /api/personas/avatar": {
+				const id = (query.get("id") ?? "").trim();
+				if (!id) throw new Error("缺少 id");
+				const store = loadPersonas(host.cwd);
+				if (!findPersona(store, id)) throw new Error("身份不存在");
+				const data = await readBodyRaw(req, 8 * 1024 * 1024); // 裁后头像上限 8MB
+				const next = savePersonaAvatar(host.cwd, store, id, data);
+				savePersonas(host.cwd, next);
+				const p = findPersona(next, id)!;
+				host.notify("info", `已更新头像：${p.name}`);
+				sendJson(res, 200, { ok: true, avatar: p.avatar });
+				return true;
+			}
+			case "GET /api/personas/avatar": {
+				const id = (query.get("id") ?? "").trim();
+				if (!id) throw new Error("缺少 id");
+				const store = loadPersonas(host.cwd);
+				const p = findPersona(store, id);
+				if (!p?.avatar) {
+					res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+					res.end(JSON.stringify({ error: "无头像" }));
+					return true;
+				}
+				const abs = resolvePath(host.cwd, p.avatar);
+				if (!existsSync(abs)) {
+					res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+					res.end(JSON.stringify({ error: "头像文件缺失" }));
+					return true;
+				}
+				const buf = readFileSync(abs);
+				const isPng = buf[0] === 0x89 && buf[1] === 0x50;
+				res.writeHead(200, {
+					"content-type": isPng ? "image/png" : "image/jpeg",
+					// 头像 URL 常带 bust 参数；允许短缓存减少切换闪烁
+					"cache-control": "public, max-age=3600",
+					"content-length": buf.length,
+				});
+				res.end(buf);
+				return true;
+			}
+			case "DELETE /api/personas/avatar": {
+				const id = (query.get("id") ?? "").trim();
+				if (!id) throw new Error("缺少 id");
+				const store = loadPersonas(host.cwd);
+				if (!findPersona(store, id)) throw new Error("身份不存在");
+				const next = clearPersonaAvatar(host.cwd, store, id);
+				savePersonas(host.cwd, next);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+
+			// ---- 多预设管理（PLAN-PANELS-V2 §2.6） ----
+			case "GET /api/presets": {
+				const config = loadConfig(host.cwd);
+				sendJson(res, 200, { active: config.preset ?? null, presets: listPresetFiles(host.cwd) });
+				return true;
+			}
+			case "POST /api/presets/select": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { file?: string | null };
+				const config = loadConfig(host.cwd) as unknown as Record<string, unknown>;
+				// 切换预设：丢弃未保存草稿
+				clearPresetOverride(host.cwd);
+				if (body.file === null || body.file === "") {
+					delete config.preset; // 不用预设
+				} else {
+					const file = validatePresetPath(body.file ?? "");
+					if (!existsSync(resolvePath(host.cwd, file))) throw new Error("预设文件不存在");
+					config.preset = file;
+				}
+				writeJsonWithBackup(configPath(host.cwd), config);
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "POST /api/presets/saveas": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { name?: string };
+				const name = (body.name ?? "").trim();
+				if (!name) throw new Error("缺少预设名");
+				// 另存：取当前生效原文（含未保存草稿），整份复制到新文件；名字＝新文件名
+				const current = loadEffectivePreset(host.cwd).doc?.raw ?? {};
+				const file = `${PRESETS_DIR}/${presetSlug(name)}.json`;
+				const abs = resolvePath(host.cwd, file);
+				if (existsSync(abs)) throw new Error(`同名预设文件已存在：${file}`);
+				mkdirSync(join(host.cwd, PRESETS_DIR), { recursive: true });
+				clearPresetOverride(host.cwd);
+				writeJsonWithBackup(abs, current);
+				writeJsonWithBackup(configPath(host.cwd), { ...loadConfig(host.cwd), preset: file });
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, file });
+				return true;
+			}
+			// 重命名＝重命名文件（预设名就是文件名，原文一个字节不动）
+			case "POST /api/presets/rename": {
+				const body = JSON.parse(await readBody(req)) as { file?: string; name?: string };
+				const file = validatePresetPath(body.file ?? "");
+				const name = (body.name ?? "").trim();
+				if (!name) throw new Error("缺少新名字");
+				const abs = resolvePath(host.cwd, file);
+				if (!existsSync(abs)) throw new Error("预设文件不存在");
+				const nextFile = `${PRESETS_DIR}/${presetSlug(name)}.json`;
+				if (nextFile === file) {
+					sendJson(res, 200, { ok: true, file });
+					return true;
+				}
+				const nextAbs = resolvePath(host.cwd, nextFile);
+				if (existsSync(nextAbs)) throw new Error(`同名预设文件已存在：${nextFile}`);
+				mkdirSync(join(host.cwd, PRESETS_DIR), { recursive: true });
+				renameSync(abs, nextAbs);
+				const config = loadConfig(host.cwd);
+				if (config.preset === file) {
+					writeJsonWithBackup(configPath(host.cwd), { ...config, preset: nextFile });
+					await host.softRefreshConfig();
+				}
+				sendJson(res, 200, { ok: true, file: nextFile });
+				return true;
+			}
+			case "DELETE /api/presets": {
+				if (refuseWhileStreaming()) return true;
+				const file = validatePresetPath(query.get("file") ?? "");
+				const abs = resolvePath(host.cwd, file);
+				if (!existsSync(abs)) throw new Error("预设文件不存在");
+				unlinkSync(abs);
+				const config = loadConfig(host.cwd) as unknown as Record<string, unknown>;
+				if (config.preset === file) {
+					clearPresetOverride(host.cwd);
+					delete config.preset;
+					writeJsonWithBackup(configPath(host.cwd), config);
+					await host.softRefreshConfig();
+				}
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			// 导入：**原文原样落盘**，不转换、不分拣、不判断（PLAN-PRESET-PIPELINES §四之一）
+			case "POST /api/presets/import": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { name?: string; json?: Record<string, unknown> };
+				if (!body.json || typeof body.json !== "object") throw new Error("缺少预设 JSON");
+				const name = (body.name ?? "").trim() || "imported-preset";
+				const file = `${PRESETS_DIR}/${presetSlug(name)}.json`;
+				const abs = resolvePath(host.cwd, file);
+				mkdirSync(join(host.cwd, PRESETS_DIR), { recursive: true });
+				clearPresetOverride(host.cwd);
+				writeJsonWithBackup(abs, body.json);
+				writeJsonWithBackup(configPath(host.cwd), { ...loadConfig(host.cwd), preset: file });
+				await host.softRefreshConfig();
+				const doc = loadPresetDoc(body.json, presetNameFromFile(file));
+				sendJson(res, 200, {
+					ok: true,
+					file,
+					kind: doc.kind,
+					blockCount: doc.entries.length,
+					enabledCount: doc.entries.filter((e) => e.enabled).length,
+				});
+				return true;
+			}
+			// 导出：原文原样吐回（酒馆能直接吃回去）
+			case "GET /api/presets/export": {
+				const file = validatePresetPath(query.get("file") ?? "");
+				const abs = resolvePath(host.cwd, file);
+				sendJson(res, 200, { name: presetNameFromFile(file), json: JSON.parse(readFileSync(abs, "utf8")) });
+				return true;
+			}
+
+			// ---- 世界书文件管理（PLAN-PANELS-V2 §2.3：选书/导入/删除） ----
+			case "GET /api/lorebooks": {
+				const config = loadConfig(host.cwd);
+				const active = mountedLorebookPaths(config);
+				sendJson(res, 200, {
+					/** 多本同时挂载；兼容旧前端：active 现为 string[] */
+					active,
+					/** @deprecated 旧单本字段：取 active[0] 或 null */
+					activeOne: active[0] ?? null,
+					books: listLorebookFiles(host.cwd, config),
+					embeddedCard: (() => {
+						const card = loadCardFile(resolvePath(host.cwd, config.card));
+						return { path: config.card, name: card.name, cardIdentity: currentCardIdentity(host.cwd, config),
+							entryCount: card.book.length,
+							enabledCount: applyLoreSourceState(card.book, config, "card", config.card).filter((e) => e.enabled).length };
+					})(),
+				});
+				return true;
+			}
+			/**
+			 * 挂载多选：
+			 * - { paths: string[] } 整体覆盖挂载列表（[] = 一本都不挂）
+			 * - { path, enabled?: boolean } 单本开关（默认 enabled=true 切换为挂上；enabled=false 卸下）
+			 * - { path: null } 清空全部挂载
+			 * 角色卡与世界书无关：本接口不碰 card。
+			 */
+			case "POST /api/lorebooks/select": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as {
+					path?: string | null;
+					paths?: string[];
+					enabled?: boolean;
+				};
+				const config = loadConfig(host.cwd);
+				const ensureBook = (p: string) => {
+					const abs = resolvePath(host.cwd, p);
+					if (!existsSync(abs) || loadLorebookFile(abs).length === 0) {
+						throw new Error(`不是有效的世界书文件：${p}`);
+					}
+				};
+				let nextPaths: string[];
+				if (Array.isArray(body.paths)) {
+					nextPaths = body.paths.map((p) => p.replace(/\\/g, "/")).filter(Boolean);
+					for (const p of nextPaths) ensureBook(p);
+				} else if (body.path === null || body.path === "") {
+					nextPaths = [];
+				} else if (typeof body.path === "string" && body.path.trim()) {
+					const p = body.path.replace(/\\/g, "/");
+					ensureBook(p);
+					const cur = new Set(mountedLorebookPaths(config));
+					const on = body.enabled !== false; // 默认挂上；传 false 卸下
+					// 若未显式传 enabled 且已在列表中 → 视为切换（toggle）
+					if (body.enabled === undefined) {
+						if (cur.has(p)) cur.delete(p);
+						else cur.add(p);
+					} else if (on) cur.add(p);
+					else cur.delete(p);
+					nextPaths = [...cur];
+				} else {
+					throw new Error("缺少 path 或 paths");
+				}
+				const next = setMountedLorebooks(config, nextPaths);
+				writeJsonWithBackup(configPath(host.cwd), next);
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, active: nextPaths });
+				return true;
+			}
+
+			case "GET /api/stage-skills": {
+				sendJson(res, 200, {
+					skills: scanSkillFiles(host.cwd).map((skill) => ({
+						...skill,
+						dir: skill.dir,
+						name: skill.name,
+						description: skill.description,
+						workflow: skill.workflow,
+						resident: skill.resident,
+						everyBeat: skill.everyBeat,
+						worldModule: skill.worldModule,
+						chars: skill.body.length,
+						body: skill.body,
+						source: skill.source,
+						updateStatus: skill.updateStatus,
+						baseBuiltinFingerprint: skill.baseBuiltinFingerprint,
+						baseBuiltinVersion: skill.baseBuiltinVersion,
+						builtin: skill.builtin,
+					})),
+				});
+				return true;
+			}
+			case "POST /api/stage-skills": {
+				const body = JSON.parse(await readBody(req)) as {
+					dir?: string; name?: string; description?: string; workflow?: WorkflowSkillStage;
+					resident?: boolean; everyBeat?: boolean; body?: string;
+					worldModule?: string; baseBuiltinFingerprint?: string; baseBuiltinVersion?: string;
+				};
+				const saved = saveStageSkill(host.cwd, {
+					dir: body.dir,
+					name: body.name ?? "",
+					description: body.description ?? "",
+					workflow: body.workflow,
+					resident: body.resident === true,
+					everyBeat: body.everyBeat === true,
+					body: body.body ?? "",
+					worldModule: body.worldModule,
+					baseBuiltinFingerprint: body.baseBuiltinFingerprint,
+					baseBuiltinVersion: body.baseBuiltinVersion,
+				});
+				sendJson(res, 200, { ok: true, dir: saved.dir, note: "已保存到 .liyuan-stage-skills，GitHub 更新不会覆盖" });
+				return true;
+			}
+			case "POST /api/stage-skills/acknowledge": {
+				const body = JSON.parse(await readBody(req)) as { dir?: string; builtinFingerprint?: string };
+				const acknowledged = acknowledgeStageSkillBuiltin(host.cwd, body.dir ?? "", body.builtinFingerprint ?? "");
+				sendJson(res, 200, { ok: true, dir: acknowledged.dir });
+				return true;
+			}
+			case "DELETE /api/stage-skills": {
+				deleteStageSkill(host.cwd, query.get("dir") ?? "");
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "GET /api/world-profile": {
+				const materials = loadStageMaterials(host.cwd);
+				const fingerprint = worldProfileFingerprint({ card: materials.card, entries: materials.entries, preset: materials.preset, greetingIndex: materials.config.greetingIndex });
+				const profile = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card);
+				sendJson(res, 200, {
+					profile,
+					card: { key: profile?.cardKey ?? defaultCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card).cardKey, name: materials.card.name },
+					materialsChanged: !!profile && profile.sourceFingerprint !== fingerprint,
+				});
+				return true;
+			}
+			case "POST /api/world-profile/analyze": {
+				if (host.isStreaming()) { sendJson(res, 409, { error: "演出进行中，不能重建角色卡世界画像" }); return true; }
+				const sourceContext = host.worldProfileContext();
+				const materials = loadStageMaterials(host.cwd);
+				const skill = scanSkillFiles(host.cwd).find((item) => item.workflow === "world-profile");
+				if (!skill) throw new Error("缺少 workflow: world-profile 的角色卡世界画像 Skill");
+				const fingerprint = worldProfileFingerprint({ card: materials.card, entries: materials.entries, preset: materials.preset, greetingIndex: materials.config.greetingIndex });
+				const previous = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card);
+				const prompt = buildWorldProfilePrompt({ skillBody: skill.body, card: materials.card, entries: materials.entries, preset: materials.preset, greetingIndex: materials.config.greetingIndex, previous });
+				let result = await host.runSideText("worldProfile", prompt.systemPrompt, prompt.userText, { maxTokens: 12288 });
+				if (typeof result !== "string") throw new Error(`画像分析失败：${result.error}`);
+				const targetContext = host.worldProfileContext();
+				if (sourceContext.leafId !== targetContext.leafId || sourceContext.card !== targetContext.card) throw new Error("画像分析期间切换了分支或角色卡，结果已丢弃");
+				const base = previous ?? defaultCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card);
+				let profile = normalizeCardWorldProfile(result, base, { preserveStatus: !!previous, sourceFingerprint: fingerprint });
+				if (!profile) {
+					const retry = await host.runSideText("worldProfile", prompt.systemPrompt, prompt.userText, { maxTokens: 12288, forceNonStreaming: true });
+					if (typeof retry === "string") { result = retry; profile = normalizeCardWorldProfile(retry, base, { preserveStatus: !!previous, sourceFingerprint: fingerprint }); }
+				}
+				if (!profile) {
+					const rawPath = join(host.cwd, ".liyuan", "world", "profile-last-invalid.txt");
+					mkdirSync(dirname(rawPath), { recursive: true });
+					writeFileSync(rawPath, result, "utf8");
+					throw new Error(`画像输出不可解析；原始输出已保存到 ${rawPath}`);
+				}
+				saveCardWorldProfile(host.cwd, materials.config.card, profile, materials.card);
+				const manifestApplied = targetContext.card === materials.config.card;
+				if (manifestApplied) host.appendWorldManifest(manifestFromProfile(profile));
+				sendJson(res, 200, { ok: true, profile, manifestApplied, ...(manifestApplied ? {} : { note: "卡级画像已保存；当前会话绑定另一张卡，未向该会话写入 Manifest" }) });
+				return true;
+			}
+			case "PUT /api/world-profile": {
+				if (host.isStreaming()) { sendJson(res, 409, { error: "演出进行中，不能修改角色卡世界画像" }); return true; }
+				const sourceContext = host.worldProfileContext();
+				const materials = loadStageMaterials(host.cwd);
+				const fingerprint = worldProfileFingerprint({ card: materials.card, entries: materials.entries, preset: materials.preset, greetingIndex: materials.config.greetingIndex });
+				const previous = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card)
+					?? defaultCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card);
+				const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+				const candidate = {
+					...previous,
+					...(body.status === "stable" || body.status === "draft" ? { status: body.status } : {}),
+					...(body.worldActivity ? { worldActivity: body.worldActivity } : {}),
+					...(Array.isArray(body.modules) ? { modules: body.modules } : {}),
+					...(Array.isArray(body.disabledModules) ? { disabledModules: body.disabledModules } : {}),
+					...(Array.isArray(body.userRequirements) ? { userRequirements: body.userRequirements } : {}),
+					...(Array.isArray(body.optimizationNotes) ? { optimizationNotes: body.optimizationNotes } : {}),
+				};
+				const profile = normalizeCardWorldProfile(candidate, previous, { sourceFingerprint: fingerprint });
+				if (!profile) throw new Error("画像修改不可解析");
+				const targetContext = host.worldProfileContext();
+				if (sourceContext.leafId !== targetContext.leafId || sourceContext.card !== targetContext.card) throw new Error("画像修改期间切换了分支或角色卡，结果已丢弃");
+				saveCardWorldProfile(host.cwd, materials.config.card, profile, materials.card);
+				host.appendWorldManifest(manifestFromProfile(profile));
+				sendJson(res, 200, { ok: true, profile });
+				return true;
+			}
+			case "GET /api/world-state": {
+				sendJson(res, 200, host.worldStateView());
+				return true;
+			}
+			case "DELETE /api/world-state/module": {
+				if (host.isStreaming()) { sendJson(res, 409, { error: "演出进行中，不能清空世界模块" }); return true; }
+				const moduleId = query.get("moduleId")?.trim() ?? "";
+				if (!moduleId) throw new Error("缺少 moduleId");
+				host.clearWorldModule(moduleId);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "POST /api/memory/retry-latest": {
+				const text = host.latestNarrativeText().trim();
+				if (!text) throw new Error("当前分支没有可重试的角色正文");
+				const r = await retryNarrativeMemory(host.cwd, host.memoryScope(), text);
+				host.notify("info", r.noop ? "向量记忆：最近一轮已在剧情库中" : "向量记忆：最近一轮已重新入库");
+				sendJson(res, 200, { ok: true, ...r, ...getMemoryStatus(host.cwd, host.memoryScope()) });
+				return true;
+			}
+			/**
+			 * 程序卡世界书兼容面：对齐酒馆助手 getWorldbook / replaceWorldbook 的必要子集。
+			 *
+			 * 只允许访问当前挂载书；写侧只接受 uid+enabled，并落到 disabledLore 覆盖层，
+			 * 不改用户世界书源文件。这样程序卡能管理模块启停，同时保持梨园现有主权与回滚语义。
+			 */
+			case "GET /api/tavern/worldbook": {
+				const config = loadConfig(host.cwd);
+				const mounted = mountedLorebookPaths(config);
+				const requested = (query.get("name") ?? "").replace(/\\/g, "/").trim();
+				const path = requested
+					? mounted.find(
+							(p) =>
+								p === requested ||
+								basename(p).replace(/\.json$/i, "") === requested ||
+								basename(p) === requested,
+						)
+					: mounted[0];
+				if (!path) throw new Error(requested ? `世界书未挂载：${requested}` : "当前角色没有挂载世界书");
+				const abs = resolvePath(host.cwd, path);
+				if (!existsSync(abs)) throw new Error(`世界书文件不存在：${path}`);
+				const entries = applyDisabledLore(loadLorebookFile(abs), config.disabledLore);
+				sendJson(res, 200, {
+					name: basename(path).replace(/\.json$/i, ""),
+					path,
+					entries: entries.map((e) => ({
+						uid: e.uid,
+						name: e.comment,
+						comment: e.comment,
+						key: e.keys,
+						keysecondary: e.secondaryKeys,
+						content: e.content,
+						constant: e.constant,
+						selective: e.selective,
+						order: e.order,
+						enabled: e.enabled,
+					})),
+				});
+				return true;
+			}
+			case "PUT /api/tavern/worldbook": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as {
+					name?: string;
+					entries?: Array<{ uid?: number; enabled?: boolean }>;
+				};
+				if (!Array.isArray(body.entries)) throw new Error("缺少 entries");
+				const config = loadConfig(host.cwd);
+				const mounted = mountedLorebookPaths(config);
+				const requested = (body.name ?? "").replace(/\\/g, "/").trim();
+				const path = requested
+					? mounted.find(
+							(p) =>
+								p === requested ||
+								basename(p).replace(/\.json$/i, "") === requested ||
+								basename(p) === requested,
+						)
+					: mounted[0];
+				if (!path) throw new Error(requested ? `世界书未挂载：${requested}` : "当前角色没有挂载世界书");
+				const abs = resolvePath(host.cwd, path);
+				if (!existsSync(abs)) throw new Error(`世界书文件不存在：${path}`);
+				const desired = new Map<number, boolean>();
+				for (const item of body.entries) {
+					if (Number.isInteger(item?.uid) && typeof item.enabled === "boolean") desired.set(item.uid!, item.enabled);
+				}
+				const result = setLorebookEntriesEnabledByUid(abs, desired);
+				// 程序卡接管过的条目以源书 enabled/disable 为真源，清掉梨园用户覆盖避免双重状态。
+				const touched = new Set(result.touchedFingerprints);
+				const disabled = (config.disabledLore ?? []).filter((fp) => !touched.has(fp));
+				const next = { ...config, disabledLore: [...disabled] } as Record<string, unknown>;
+				if ((next.disabledLore as string[]).length === 0) delete next.disabledLore;
+				writeJsonWithBackup(configPath(host.cwd), next);
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, path, changed: result.changed });
+				return true;
+			}
+			case "POST /api/lorebooks/import": {
+				const rawName = (query.get("name") ?? "").trim().replace(/\.json$/i, "");
+				if (!rawName) throw new Error("缺少 name");
+				const safe = `${rawName.replace(/[\\/:*?"<>|]/g, "-")}.json`;
+				mkdirSync(join(host.cwd, LOREBOOKS_DIR), { recursive: true });
+				const dest = join(host.cwd, LOREBOOKS_DIR, safe);
+				if (existsSync(dest)) throw new Error(`同名世界书已存在：${safe}`);
+				const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+				const entries = normalizeEntries(body.entries);
+				if (entries.length === 0) throw new Error("不是有效的世界书（entries 为空）");
+				writeFileSync(dest, `${JSON.stringify(body, null, "\t")}\n`, "utf8");
+				host.notify("info", `世界书「${rawName}」已导入（${entries.length} 条）`);
+				sendJson(res, 200, { ok: true, path: `${LOREBOOKS_DIR}/${safe}`, entryCount: entries.length });
+				return true;
+			}
+			case "DELETE /api/lorebooks": {
+				if (refuseWhileStreaming()) return true;
+				const p = (query.get("path") ?? "").replace(/\\/g, "/");
+				const base = p.startsWith(`${LOREBOOKS_DIR}/`) ? p.slice(LOREBOOKS_DIR.length + 1) : "";
+				if (!base || base.includes("/") || base.includes("..") || !base.endsWith(".json")) {
+					throw new Error("只能删除 assets/lorebooks/ 下的世界书（项目外的素材文件不动）");
+				}
+				const abs = join(host.cwd, LOREBOOKS_DIR, base);
+				if (!existsSync(abs)) throw new Error("文件不存在");
+				unlinkSync(abs);
+				const config = loadConfig(host.cwd);
+				const active = mountedLorebookPaths(config);
+				if (active.includes(p)) {
+					const next = setMountedLorebooks(
+						config,
+						active.filter((x) => x !== p),
+					);
+					writeJsonWithBackup(configPath(host.cwd), next);
+					await host.softRefreshConfig();
+				}
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+
+			// ---- 知识库管理（PLAN-PANELS-V2 §2.4：建库/改名/删除/挂载按钮，用户主权） ----
+			case "POST /api/codex": {
+				const body = JSON.parse(await readBody(req)) as { name?: string; description?: string };
+				const r = createCodex(host.cwd, body.name ?? "", body.description ?? "");
+				if (!r.ok) throw new Error(r.error);
+				host.notify("info", `知识库「${r.meta.name}」已创建`);
+				sendJson(res, 200, { ok: true, name: r.meta.name });
+				return true;
+			}
+			case "POST /api/codex/rename": {
+				const body = JSON.parse(await readBody(req)) as { name?: string; newName?: string };
+				const meta = findCodex(host.cwd, body.name ?? "");
+				if (!meta) throw new Error(`知识库不存在：${body.name}`);
+				const newName = (body.newName ?? "").trim();
+				if (!newName) throw new Error("缺少新名字");
+				if (host.mountedCodexes().some((n) => n.toLowerCase() === meta.name.toLowerCase())) {
+					throw new Error("该库已挂载到当前对话，先卸载再改名");
+				}
+				if (findCodex(host.cwd, newName)) throw new Error(`已存在同名知识库：${newName}`);
+				const r = createCodex(host.cwd, newName, meta.description);
+				if (!r.ok) throw new Error(r.error);
+				// 搬条目：读旧文件原始 entries 写入新文件（保 uid 与灯法字段）
+				const oldRaw = JSON.parse(readFileSync(meta.file, "utf8")) as Record<string, unknown>;
+				const newRaw = JSON.parse(readFileSync(r.meta.file, "utf8")) as Record<string, unknown>;
+				writeFileSync(r.meta.file, `${JSON.stringify({ ...newRaw, entries: oldRaw.entries ?? [] }, null, "\t")}\n`, "utf8");
+				unlinkSync(meta.file);
+				sendJson(res, 200, { ok: true, name: newName });
+				return true;
+			}
+			case "DELETE /api/codex": {
+				const name = query.get("name") ?? "";
+				const meta = findCodex(host.cwd, name);
+				if (!meta) throw new Error(`知识库不存在：${name}`);
+				if (host.mountedCodexes().some((n) => n.toLowerCase() === meta.name.toLowerCase())) {
+					throw new Error("该库已挂载到当前对话，先卸载再删除");
+				}
+				unlinkSync(meta.file);
+				host.notify("info", `知识库「${meta.name}」已删除`);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			// 挂载/卸载：经命令桥走扩展 /codexmount（与 codex_mount 工具同一内存+树快照路径）
+			case "POST /api/codex/mount": {
+				const body = JSON.parse(await readBody(req)) as { name?: string; mounted?: boolean };
+				const meta = findCodex(host.cwd, body.name ?? "");
+				if (!meta) throw new Error(`知识库不存在：${body.name}`);
+				const queued = host.queueCommand(`/codexmount ${body.mounted ? "mount" : "unmount"} ${meta.name}`);
+				sendJson(res, 200, { ok: true, queued });
+				return true;
+			}
+
+			// ---- 角色卡字段编辑（JSON + PNG tEXt 回写） ----
+			case "PUT /api/card": {
+				if (refuseWhileStreaming()) return true;
+				const patch = JSON.parse(await readBody(req)) as CardFieldPatch;
+				const config = loadConfig(host.cwd);
+				updateCardFields(resolvePath(host.cwd, config.card), patch);
+				await host.softRefreshConfig(); // 卡字段进 system prompt，必须重装
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			/**
+			 * 导出当前角色卡（含可选世界书合并）。
+			 * query: format=json|png，lore=active|embedded|none
+			 * - active（默认）：挂载世界书 + 本卡补充设定 + 原内嵌书（指纹去重），即「改过之后」的创作态
+			 * - embedded：仅卡内原 character_book
+			 * - none：不带世界书
+			 */
+			case "GET /api/card/export": {
+				const config = loadConfig(host.cwd);
+				const format = (query.get("format") ?? "json").toLowerCase() === "png" ? "png" : "json";
+				const loreRaw = (query.get("lore") ?? "active").toLowerCase();
+				const loreMode: CardExportLoreMode =
+					loreRaw === "none" || loreRaw === "embedded" ? loreRaw : "active";
+				const abs = resolvePath(host.cwd, config.card);
+				const bookEntries =
+					loreMode === "active" ? collectActiveLoreForExport(host.cwd, config) : undefined;
+				const exp = exportCardFile(abs, { format, loreMode, bookEntries });
+				res.writeHead(200, {
+					"content-type": exp.mime,
+					"content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(exp.filename)}`,
+					"cache-control": "no-store",
+					"x-liyuan-lore-mode": exp.loreMode,
+					"x-liyuan-lore-count": String(exp.loreCount),
+				});
+				res.end(exp.body);
+				return true;
+			}
+			/** 开场白 CRUD：index 0=first_mes，1..=alternate_greetings */
+			case "PUT /api/card/greetings": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as {
+					index?: number;
+					text?: string;
+					greetings?: string[];
+				};
+				const config = loadConfig(host.cwd);
+				const abs = resolvePath(host.cwd, config.card);
+				if (Array.isArray(body.greetings)) {
+					setCardGreetings(
+						abs,
+						body.greetings.map((t) => String(t ?? "")),
+					);
+				} else if (typeof body.index === "number" && typeof body.text === "string") {
+					updateCardGreeting(abs, body.index, body.text);
+				} else {
+					throw new Error("需要 greetings[] 或 index+text");
+				}
+				// 若当前选中序号越界，钳回
+				const card = loadCardFile(abs);
+				const max = card.alternateGreetings.length;
+				const gi = config.greetingIndex ?? 0;
+				if (gi > max) {
+					writeJsonWithBackup(configPath(host.cwd), { ...config, greetingIndex: 0 });
+				}
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "POST /api/card/greetings": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { text?: string };
+				const config = loadConfig(host.cwd);
+				const abs = resolvePath(host.cwd, config.card);
+				const index = addCardGreeting(abs, body.text ?? "");
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, index });
+				return true;
+			}
+			case "DELETE /api/card/greetings": {
+				if (refuseWhileStreaming()) return true;
+				const index = Number.parseInt(query.get("index") ?? "", 10);
+				if (!Number.isFinite(index)) throw new Error("缺少 index");
+				const config = loadConfig(host.cwd);
+				const abs = resolvePath(host.cwd, config.card);
+				deleteCardGreeting(abs, index);
+				const card = loadCardFile(abs);
+				const max = card.alternateGreetings.length;
+				let gi = config.greetingIndex ?? 0;
+				if (gi > max) gi = 0;
+				else if (gi === index) gi = Math.max(0, index - 1);
+				else if (gi > index) gi = gi - 1;
+				writeJsonWithBackup(configPath(host.cwd), { ...config, greetingIndex: gi });
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, greetingIndex: gi });
+				return true;
+			}
+			/** 开场白上移/下移：{ index, delta: -1|1 } */
+			case "POST /api/card/greetings/move": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { index?: number; delta?: number };
+				const index = typeof body.index === "number" ? body.index : Number.NaN;
+				const delta = body.delta === -1 || body.delta === 1 ? body.delta : Number.NaN;
+				if (!Number.isFinite(index) || !Number.isFinite(delta)) throw new Error("需要 index 与 delta（-1 上移 / 1 下移）");
+				const config = loadConfig(host.cwd);
+				const abs = resolvePath(host.cwd, config.card);
+				const to = moveCardGreeting(abs, index, delta);
+				const gi0 = config.greetingIndex ?? 0;
+				const gi = remapGreetingIndexAfterMove(gi0, index, to);
+				if (gi !== gi0) {
+					writeJsonWithBackup(configPath(host.cwd), { ...config, greetingIndex: gi });
+				}
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, index: to, greetingIndex: gi });
+				return true;
+			}
+
+			// ---- 模型 ----
+			case "GET /api/models": {
+				// 打开连接面板时：agent.json → models.json，并重绑当前模型（手改 maxTokens 等无需整进程重启）
+				loadOrSeedAgentConfig(host);
+				await rebindCurrentModel(host);
+				sendJson(res, 200, host.listModels());
+				return true;
+			}
+			case "GET /api/models/catalog": {
+				// 设置页只读模型目录：不得刷新 registry、重绑会话或写 model-change。
+				sendJson(res, 200, host.listModels());
+				return true;
+			}
+			case "POST /api/models/select": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { provider?: string; id?: string };
+				if (!body.provider || !body.id) throw new Error("缺少 provider / id");
+				const current = await host.selectModel(body.provider, body.id);
+				// “连接”面板切换的是用户理解中的剧情模型。若主演另有旧覆盖，
+				// 只切 session 会造成界面显示已切换、正文却仍走旧模型。同步更新
+				// writer 插头，使下一拍立即使用本次选择，不要求重启。
+				const config = loadConfig(host.cwd);
+				const writer = config.stepModels?.writer;
+				if (writer?.provider !== body.provider || writer?.id !== body.id) {
+					writeJsonWithBackup(configPath(host.cwd), {
+						...config,
+						stepModels: { ...(config.stepModels ?? {}), writer: { provider: body.provider, id: body.id } },
+					});
+					await host.softRefreshConfig();
+				}
+				host.notify("info", `模型已切换：${current.name}`);
+				sendJson(res, 200, { current });
+				return true;
+			}
+			case "POST /api/models/thinking": {
+				const body = JSON.parse(await readBody(req)) as { level?: string };
+				if (!body.level) throw new Error("缺少 level");
+				sendJson(res, 200, { current: host.setThinkingLevel(body.level) });
+				return true;
+			}
+
+			// ---- API 连接 ----
+			case "GET /api/auth": {
+				sendJson(res, 200, { providers: host.authProviders() });
+				return true;
+			}
+			case "POST /api/auth": {
+				const body = JSON.parse(await readBody(req)) as { provider?: string; key?: string };
+				if (!body.provider || !body.key) throw new Error("缺少 provider / key");
+				host.setAuthKey(body.provider, body.key.trim());
+				host.refreshModels();
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "DELETE /api/auth": {
+				const provider = query.get("provider");
+				if (!provider) throw new Error("缺少 provider");
+				host.removeAuth(provider);
+				host.refreshModels();
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			// ---- 配置仓库 liyuan-profiles/ + 当前启用 liyuan.agent.json ----
+			case "GET /api/agent-profiles": {
+				loadOrSeedAgentConfig(host); // 触发迁移
+				sendJson(res, 200, { profiles: listProfiles(host.cwd) });
+				return true;
+			}
+			case "GET /api/agent-profiles/one": {
+				const id = (query.get("id") ?? "").trim();
+				if (!id) throw new Error("缺少 id");
+				const rec = loadProfile(host.cwd, id);
+				if (!rec) throw new Error(`配置不存在：${id}`);
+				sendJson(res, 200, {
+					id: rec.id,
+					name: rec.name,
+					updatedAt: rec.updatedAt,
+					config: rec.config,
+					text: `${JSON.stringify(rec.config, null, "\t")}\n`,
+				});
+				return true;
+			}
+			/** 生成器：只写入仓库，不启用 */
+			case "POST /api/agent-profiles": {
+				const body = JSON.parse(await readBody(req)) as {
+					id?: string;
+					name?: string;
+					config?: unknown;
+					text?: string;
+				};
+				let parsed: unknown = body.config;
+				if (typeof body.text === "string") {
+					try {
+						parsed = JSON.parse(body.text);
+					} catch (e) {
+						throw new Error(`JSON 无法解析：${e instanceof Error ? e.message : String(e)}`);
+					}
+				}
+				if (!parsed) throw new Error("缺少 config 或 text");
+				const config = normalizeAgentConfig(parsed);
+				materializeEnvKeysInConfig(config);
+				const idRaw = (body.id ?? body.name ?? Object.keys(config.providers)[0] ?? "").trim();
+				if (!idRaw) throw new Error("请填写配置名");
+				const name = (body.name ?? idRaw).trim();
+				// 生成器只写入仓库，不启用；同名则覆盖仓库副本
+				const rec = saveProfile(host.cwd, idRaw, name, config);
+				host.notify("info", `配置「${rec.name}」已存入仓库（未启用）`);
+				sendJson(res, 200, { ok: true, profile: { id: rec.id, name: rec.name, updatedAt: rec.updatedAt }, profiles: listProfiles(host.cwd) });
+				return true;
+			}
+			/** 修改仓库中的配置（不自动启用，除非已是启用中的那份） */
+			case "PUT /api/agent-profiles": {
+				const body = JSON.parse(await readBody(req)) as {
+					id?: string;
+					name?: string;
+					config?: unknown;
+					text?: string;
+				};
+				const id = (body.id ?? "").trim();
+				if (!id) throw new Error("缺少 id");
+				const prev = loadProfile(host.cwd, id);
+				if (!prev) throw new Error(`配置不存在：${id}`);
+				let parsed: unknown = body.config ?? prev.config;
+				if (typeof body.text === "string") {
+					try {
+						parsed = JSON.parse(body.text);
+					} catch (e) {
+						throw new Error(`JSON 无法解析：${e instanceof Error ? e.message : String(e)}`);
+					}
+				}
+				const config = normalizeAgentConfig(parsed);
+				materializeEnvKeysInConfig(config);
+				const name = (body.name ?? prev.name).trim();
+				const rec = saveProfile(host.cwd, id, name, config);
+				// 若正在启用这份，同步到 runtime 并重绑当前模型（contextWindow 等）
+				const active = listProfiles(host.cwd).find((p) => p.active);
+				if (active?.id === id) {
+					persistAgentConfig(host, config);
+					await rebindCurrentModel(host);
+				}
+				host.notify("info", `配置「${rec.name}」已更新`);
+				sendJson(res, 200, {
+					ok: true,
+					profile: { id: rec.id, name: rec.name, updatedAt: rec.updatedAt },
+					profiles: listProfiles(host.cwd),
+					current: host.listModels().current,
+				});
+				return true;
+			}
+			case "POST /api/agent-profiles/enable":
+			case "POST /api/agent-profiles/refresh": {
+				// enable：启用仓库配置；refresh：已启用时从仓库/磁盘重读并重传到 models.json（不必先关再开）
+				const isRefresh = route === "POST /api/agent-profiles/refresh";
+				const body = JSON.parse(await readBody(req)) as { id?: string };
+				const id = (body.id ?? "").trim();
+				if (!id) throw new Error("缺少 id");
+				if (isRefresh) {
+					const active = listProfiles(host.cwd).find((p) => p.active);
+					if (active?.id !== id) {
+						throw new Error("只能刷新「启用中」的配置；其它配置请先点启用");
+					}
+				}
+				const config = enableProfile(host.cwd, host.agentDir(), id);
+				host.refreshModels();
+				// 切换到配置里的默认模型
+				if (config.defaultProvider && config.defaultModel) {
+					try {
+						await host.selectModel(config.defaultProvider, config.defaultModel);
+					} catch {
+						/* 模型可能暂不可用 */
+					}
+				}
+				// 模型条目 thinkingLevel > defaultThinkingLevel → 会话当前生效
+				await rebindCurrentModel(host, config);
+				host.notify("info", isRefresh ? `已刷新配置「${id}」并重传到运行时` : `已启用配置「${id}」`);
+				sendJson(res, 200, {
+					ok: true,
+					refreshed: isRefresh,
+					config,
+					profiles: listProfiles(host.cwd),
+					current: host.listModels().current,
+				});
+				return true;
+			}
+			case "DELETE /api/agent-profiles": {
+				const id = (query.get("id") ?? "").trim();
+				if (!id) throw new Error("缺少 id");
+				deleteProfile(host.cwd, id);
+				host.notify("info", `已删除配置「${id}」`);
+				sendJson(res, 200, { ok: true, profiles: listProfiles(host.cwd) });
+				return true;
+			}
+
+			// ---- 当前启用的 Agent 配置（liyuan.agent.json）----
+			case "GET /api/agent-config": {
+				const { path, exists, config, seeded } = loadOrSeedAgentConfig(host);
+				await rebindCurrentModel(host);
+				if (seeded) host.notify("info", "已将当前使用中的渠道收编进梨园 Agent 配置");
+				sendJson(res, 200, {
+					path,
+					exists: exists || seeded,
+					config,
+					text: `${JSON.stringify(config, null, "\t")}\n`,
+					seeded,
+					profiles: listProfiles(host.cwd),
+				});
+				return true;
+			}
+			case "PUT /api/agent-config": {
+				const body = JSON.parse(await readBody(req)) as { text?: string; config?: unknown };
+				let parsed: unknown;
+				if (typeof body.text === "string") {
+					try {
+						parsed = JSON.parse(body.text);
+					} catch (e) {
+						throw new Error(`JSON 无法解析：${e instanceof Error ? e.message : String(e)}`);
+					}
+				} else if (body.config !== undefined) {
+					parsed = body.config;
+				} else {
+					throw new Error("缺少 text 或 config");
+				}
+				const config = persistAgentConfig(host, normalizeAgentConfig(parsed));
+				await rebindCurrentModel(host);
+				host.notify("info", "当前 Agent 配置已保存");
+				sendJson(res, 200, {
+					ok: true,
+					path: loadAgentConfig(host.cwd).path,
+					config,
+					text: `${JSON.stringify(config, null, "\t")}\n`,
+					current: host.listModels().current,
+				});
+				return true;
+			}
+			// 兼容旧路径：转发到 agent-config
+			case "GET /api/models-json": {
+				const { path, exists, config, seeded } = loadOrSeedAgentConfig(host);
+				sendJson(res, 200, {
+					path,
+					exists: exists || seeded,
+					content: config,
+					text: `${JSON.stringify(config, null, "\t")}\n`,
+				});
+				return true;
+			}
+			case "PUT /api/models-json": {
+				const body = JSON.parse(await readBody(req)) as { text?: string; content?: unknown };
+				const parsed =
+					typeof body.text === "string"
+						? JSON.parse(body.text)
+						: body.content !== undefined
+							? body.content
+							: null;
+				if (!parsed) throw new Error("缺少 text 或 content");
+				const config = persistAgentConfig(host, normalizeAgentConfig(parsed));
+				sendJson(res, 200, {
+					ok: true,
+					path: loadAgentConfig(host.cwd).path,
+					text: `${JSON.stringify(config, null, "\t")}\n`,
+				});
+				return true;
+			}
+			case "POST /api/channels": {
+				const body = JSON.parse(await readBody(req)) as {
+					name?: string;
+					baseUrl?: string;
+					api?: string;
+					apiKey?: string;
+					models?: unknown;
+					provider?: Record<string, unknown>;
+					setDefault?: boolean;
+				};
+				const name = (body.name ?? "").trim();
+				const baseUrl = (body.baseUrl ?? (body.provider?.baseUrl as string | undefined) ?? "").toString().trim();
+				const api = (body.api ?? (body.provider?.api as string | undefined) ?? "").toString().trim();
+				if (!name || !baseUrl || !api) throw new Error("渠道名、Base URL、API 类型均必填（模型清单可后补）");
+				if (!/^[\w.-]+$/.test(name)) throw new Error("渠道名只允许字母数字与 . - _");
+				const { config } = loadOrSeedAgentConfig(host);
+				if (config.providers[name]) throw new Error(`渠道已存在：${name}`);
+				const models = normalizeModels(body.models ?? body.provider?.models ?? []);
+				const fromProvider = body.provider && typeof body.provider === "object" ? { ...body.provider } : {};
+				delete fromProvider.name;
+				const entry: AgentProvider = {
+					...fromProvider,
+					baseUrl,
+					api,
+					apiKey: (body.apiKey ?? (fromProvider.apiKey as string | undefined) ?? "").toString().trim() || "placeholder",
+					models,
+				};
+				config.providers[name] = entry;
+				if (body.setDefault || !config.defaultProvider) {
+					config.defaultProvider = name;
+					if (models[0]) config.defaultModel = models[0].id;
+				}
+				persistAgentConfig(host, config);
+				host.notify("info", `渠道「${name}」已保存（${models.length} 个模型）`);
+				sendJson(res, 200, { ok: true, channel: publicProvider(name, entry), config });
+				return true;
+			}
+			case "GET /api/channels": {
+				const { path, config, seeded } = loadOrSeedAgentConfig(host);
+				if (seeded) host.notify("info", "已将当前使用中的渠道收编进梨园 Agent 配置");
+				sendJson(res, 200, {
+					path,
+					configPath: path,
+					channels: Object.entries(config.providers).map(([name, p]) => publicProvider(name, p)),
+					defaultProvider: config.defaultProvider ?? null,
+					defaultModel: config.defaultModel ?? null,
+				});
+				return true;
+			}
+			case "PUT /api/channels": {
+				const body = JSON.parse(await readBody(req)) as {
+					name?: string;
+					baseUrl?: string;
+					api?: string;
+					apiKey?: string;
+					models?: unknown;
+					mergeModels?: boolean;
+					patch?: Record<string, unknown>;
+					setDefault?: boolean;
+				};
+				const name = (body.name ?? "").trim();
+				const { config } = loadOrSeedAgentConfig(host);
+				const ch = config.providers[name];
+				if (!ch) throw new Error(`渠道不存在：${name}`);
+				if (body.patch && typeof body.patch === "object") {
+					for (const [k, v] of Object.entries(body.patch)) {
+						if (k === "name") continue;
+						if (v === null) delete ch[k];
+						else ch[k] = v;
+					}
+				}
+				if (typeof body.baseUrl === "string" && body.baseUrl.trim()) ch.baseUrl = body.baseUrl.trim();
+				if (typeof body.api === "string" && body.api.trim()) ch.api = body.api.trim();
+				if (typeof body.apiKey === "string" && body.apiKey.trim()) ch.apiKey = body.apiKey.trim();
+				if (body.models !== undefined) {
+					const incoming = normalizeModels(body.models);
+					ch.models = body.mergeModels ? mergeModelsById(normalizeModels(ch.models), incoming) : incoming;
+				}
+				config.providers[name] = ch;
+				if (body.setDefault) {
+					config.defaultProvider = name;
+					const mid = normalizeModels(ch.models)[0]?.id;
+					if (mid) config.defaultModel = mid;
+				}
+				persistAgentConfig(host, config);
+				sendJson(res, 200, { ok: true, channel: publicProvider(name, ch), config });
+				return true;
+			}
+			case "DELETE /api/channels": {
+				const name = (query.get("name") ?? "").trim();
+				const { config } = loadOrSeedAgentConfig(host);
+				if (!config.providers[name]) throw new Error(`渠道不存在：${name}`);
+				delete config.providers[name];
+				if (config.defaultProvider === name) {
+					const first = Object.keys(config.providers)[0];
+					config.defaultProvider = first;
+					config.defaultModel = first ? normalizeModels(config.providers[first].models)[0]?.id : undefined;
+				}
+				persistAgentConfig(host, config);
+				host.notify("info", `渠道「${name}」已删除`);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "POST /api/channels/test": {
+				const body = JSON.parse(await readBody(req)) as { name?: string; profileId?: string; baseUrl?: string; apiKey?: string };
+				let baseUrl = (body.baseUrl ?? "").trim();
+				let apiKey = (body.apiKey ?? "").trim() || undefined;
+				const name = (body.name ?? "").trim();
+				if (name) {
+					const ch = loadOrSeedAgentConfig(host).config.providers[name];
+					if (!ch?.baseUrl) throw new Error(`渠道不存在或缺 Base URL：${name}`);
+					baseUrl = String(ch.baseUrl);
+					if (!apiKey) {
+						const k = typeof ch.apiKey === "string" ? ch.apiKey : "";
+						if (k && k !== "placeholder") apiKey = k; // $ENV 由 probe 解析
+					}
+				}
+				const profileId = (body.profileId ?? "").trim();
+				if (profileId && !apiKey) {
+					const profile = loadProfile(host.cwd, profileId);
+					if (!profile) throw new Error(`配置不存在：${profileId}`);
+					const provider = profile.config.providers[name] ?? Object.values(profile.config.providers)[0];
+					const k = typeof provider?.apiKey === "string" ? provider.apiKey : "";
+					if (k && k !== "placeholder") apiKey = k;
+				}
+				if (!baseUrl) throw new Error("缺少 name 或 baseUrl");
+				const result = await probeModelsEndpoint(baseUrl, apiKey);
+				sendJson(res, 200, { ok: result.ok, status: result.status, detail: result.detail });
+				return true;
+			}
+			case "POST /api/channels/fetch-models": {
+				const body = JSON.parse(await readBody(req)) as {
+					name?: string;
+					profileId?: string;
+					baseUrl?: string;
+					apiKey?: string;
+					apply?: boolean;
+				};
+				let baseUrl = (body.baseUrl ?? "").trim();
+				let apiKey = (body.apiKey ?? "").trim() || undefined;
+				const name = (body.name ?? "").trim();
+				const loaded = name ? loadOrSeedAgentConfig(host) : null;
+				const ch = name && loaded ? loaded.config.providers[name] : undefined;
+				if (name) {
+					if (!ch?.baseUrl) throw new Error(`渠道不存在或缺 Base URL：${name}`);
+					baseUrl = String(ch.baseUrl);
+					if (!apiKey) {
+						const k = typeof ch.apiKey === "string" ? ch.apiKey : "";
+						if (k && k !== "placeholder") apiKey = k;
+					}
+				}
+				const profileId = (body.profileId ?? "").trim();
+				if (profileId && !apiKey) {
+					const profile = loadProfile(host.cwd, profileId);
+					if (!profile) throw new Error(`配置不存在：${profileId}`);
+					const provider = profile.config.providers[name] ?? Object.values(profile.config.providers)[0];
+					const k = typeof provider?.apiKey === "string" ? provider.apiKey : "";
+					if (k && k !== "placeholder") apiKey = k;
+				}
+				if (!baseUrl) throw new Error("缺少 name 或 baseUrl");
+				const result = await probeModelsEndpoint(baseUrl, apiKey);
+				if (!result.ok) throw new Error(`拉取失败：${result.detail}`);
+				if (result.ids.length === 0) throw new Error("渠道返回了空模型清单");
+				const models = result.ids.map((id) => ({ id })) as AgentModelEntry[];
+				if (body.apply && name && loaded && ch) {
+					ch.models = mergeModelsById(normalizeModels(ch.models), models);
+					loaded.config.providers[name] = ch;
+					persistAgentConfig(host, loaded.config);
+					host.notify("info", `「${name}」已合并 ${result.ids.length} 个模型`);
+					sendJson(res, 200, { ok: true, models: result.ids, channel: publicProvider(name, ch) });
+					return true;
+				}
+				sendJson(res, 200, { ok: true, models: result.ids });
+				return true;
+			}
+
+			// ---- 配置（用户角色 / 设置） ----
+			case "GET /api/config": {
+				sendJson(res, 200, { config: loadConfig(host.cwd) });
+				return true;
+			}
+			case "PUT /api/config": {
+				if (refuseWhileStreaming()) return true;
+				const patch = JSON.parse(await readBody(req)) as Record<string, unknown>;
+				const previous = loadConfig(host.cwd);
+				const next = applyConfigPatch(previous, patch);
+				(persistence.writeConfig ?? writeJsonWithBackup)(configPath(host.cwd), next);
+				const previousWriter = previous.stepModels?.writer;
+				const nextWriter = next.stepModels?.writer;
+				if (nextWriter && (previousWriter?.provider !== nextWriter.provider || previousWriter?.id !== nextWriter.id)) {
+					// 设置齿轮里的“主演正文”保存后同步当前会话模型。StageEngine 本来
+					// 就每拍现读 config；这里再对齐会话显示与后续新会话默认，无需重启。
+					await host.selectModel(nextWriter.provider, nextWriter.id);
+				}
+				await host.softRefreshConfig();
+				sendJson(res, 200, { config: next });
+				return true;
+			}
+			case "GET /api/historical-images": {
+				const prompt = (query.get("prompt") ?? "").trim();
+				if (!prompt || prompt.length > 100_000) throw new Error("图片提示词为空或过长");
+				const result = findHistoricalImage(host.cwd, prompt);
+				sendJson(res, 200, result ?? { src: null });
+				return true;
+			}
+
+			// ---- 角色卡 ----
+			case "GET /api/card": {
+				const config = loadConfig(host.cwd);
+				const card = loadCardFile(resolvePath(host.cwd, config.card));
+				sendJson(res, 200, {
+					path: config.card,
+					displayName: config.displayName ?? null,
+					greetingIndex: config.greetingIndex ?? 0,
+					name: card.name,
+					description: card.description,
+					personality: card.personality,
+					scenario: card.scenario,
+					creatorNotes: card.creatorNotes,
+					tags: card.tags,
+					/** 卡内嵌 character_book 条数（>0 时前端可提示导入配套世界书） */
+					embeddedLoreCount: card.book.length,
+					greetings: [card.firstMes, ...card.alternateGreetings].map((text, index) => ({
+						index,
+						label: index === 0 ? "默认开场白" : `备选 ${index}`,
+						text,
+					})),
+				});
+				return true;
+			}
+			case "POST /api/greeting": {
+				const body = JSON.parse(await readBody(req)) as { index?: number; apply?: boolean };
+				const config = loadConfig(host.cwd);
+				const card = loadCardFile(resolvePath(host.cwd, config.card));
+				const max = card.alternateGreetings.length; // 合法范围 0..max
+				const index = clampInt(body.index, 0, max, 0);
+				writeJsonWithBackup(configPath(host.cwd), { ...config, greetingIndex: index });
+				// apply=true：走扩展 /greeting，未开聊时可即时替换对话里的开场白
+				if (body.apply) {
+					if (refuseWhileStreaming()) return true;
+					await host.promptCommand(`/greeting ${index}`);
+					sendJson(res, 200, { greetingIndex: index, applied: true });
+					return true;
+				}
+				host.notify("info", "开场白已选定，对下一个新会话生效");
+				sendJson(res, 200, { greetingIndex: index, applied: false });
+				return true;
+			}
+			case "POST /api/card/switch": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { card?: string };
+				const cardPath = (body.card ?? "").trim();
+				if (!cardPath) throw new Error("缺少 card 路径");
+				const card = loadCardFile(resolvePath(host.cwd, cardPath)); // 先验卡，坏卡不落盘
+				const config = loadConfig(host.cwd) as unknown as Record<string, unknown>;
+				// 卡专属字段随卡走：显示名/开场白选择清掉。
+				// 世界书与角色卡解耦：换卡不碰 lorebooks / disabledLore（条目启停跨卡保留）。
+				delete config.displayName;
+				delete config.greetingIndex;
+				config.card = cardPath;
+				writeJsonWithBackup(configPath(host.cwd), config);
+				// persona 按卡自动选用（卡锁定→全局默认）：投影进 config 一并生效
+				const pstore = loadPersonas(host.cwd);
+				const persona = personaForCard(pstore, cardPath);
+				if (persona) projectPersonaToConfig(host.cwd, persona);
+				const result = await host.switchToCard();
+				host.notify(
+					"info",
+					`${result === "switched" ? `已切换到「${card.name}」的最近会话` : `已为「${card.name}」新建会话`}${persona ? `（身份：${persona.name}）` : ""}`,
+				);
+				sendJson(res, 200, {
+					result,
+					name: card.name,
+					path: cardPath,
+					embeddedLoreCount: card.book.length,
+				});
+				return true;
+			}
+			/**
+			 * 把当前卡（或指定卡）的内嵌 character_book 另存为独立世界书并挂到配置。
+			 * 卡内嵌书仍会随卡加载；另存后可在世界书面板管理、跨卡复用。
+			 */
+			case "POST /api/card/import-embedded-lore": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { card?: string };
+				const config = loadConfig(host.cwd);
+				const cardPath = (body.card ?? config.card).trim();
+				if (!cardPath) throw new Error("缺少角色卡");
+				const card = loadCardFile(resolvePath(host.cwd, cardPath));
+				if (card.book.length === 0) throw new Error(`「${card.name}」没有内嵌世界书`);
+				const safeBase = card.name.replace(/[\\/:*?"<>|]/g, "-").trim() || "card-lore";
+				mkdirSync(join(host.cwd, LOREBOOKS_DIR), { recursive: true });
+				let file = `${safeBase}.json`;
+				let dest = join(host.cwd, LOREBOOKS_DIR, file);
+				let n = 2;
+				while (existsSync(dest)) {
+					file = `${safeBase}-${n}.json`;
+					dest = join(host.cwd, LOREBOOKS_DIR, file);
+					n += 1;
+				}
+				const stJson = exportStLorebook(card.name, card.book);
+				writeFileSync(dest, `${JSON.stringify(stJson, null, "\t")}\n`, "utf8");
+				const rel = `${LOREBOOKS_DIR}/${file}`;
+				// 追加挂载，不顶掉其它已启用的书
+				const next = setMountedLorebooks(config, [...mountedLorebookPaths(config), rel]);
+				writeJsonWithBackup(configPath(host.cwd), next);
+				await host.softRefreshConfig();
+				host.notify("info", `已导入配套世界书「${card.name}」（${card.book.length} 条）并加入挂载`);
+				sendJson(res, 200, { ok: true, path: rel, entryCount: card.book.length, name: card.name });
+				return true;
+			}
+
+			// ---- 世界书：来源是寻址的一部分，卡内书不另存或挂载 ----
+			case "GET /api/lorebook": {
+				const config = loadConfig(host.cwd);
+				const input = loreTargetQuery(query);
+				if (!input.source && !input.path) {
+					sendJson(res, 200, { lorebookPath: null, lorebookPaths: mountedLorebookPaths(config),
+						viewPath: null, viewSource: null, viewName: null, total: 0, entries: [] });
+					return true;
+				}
+				const target = loreTarget(host.cwd, config, input, false);
+				const entries = applyLoreSourceState(target.entries, config, target.source, target.path);
+				sendJson(res, 200, { lorebookPath: target.source === "file" ? target.path : null,
+					lorebookPaths: mountedLorebookPaths(config), viewPath: target.path, viewSource: target.source,
+					viewName: target.name, cardIdentity: target.cardIdentity, total: entries.length,
+					entries: entries.map((e) => ({ ...e, fingerprint: loreFingerprint(e.content), source: target.source,
+						chars: e.content.length, preview: previewText(e.content, 160) })) });
+				return true;
+			}
+			case "GET /api/lorebook/entry": {
+				const config = loadConfig(host.cwd);
+				const target = loreTarget(host.cwd, config, loreTargetQuery(query));
+				const fp = query.get("fp") ?? "";
+				const found = requireLoreEntry(target, fp, query.get("entryKey") ?? undefined);
+				const entry = applyLoreSourceState([found], config, target.source, target.path)[0];
+				sendJson(res, 200, { ...entry, source: target.source, fingerprint: fp, cardIdentity: target.cardIdentity });
+				return true;
+			}
+			/**
+			 * 新增条目：写进指定世界书文件（body.path=书路径，或 "agent"=本卡补充设定）。
+			 * 面板只必填标题 + 正文；关键词留空则从标题派生——蓝灯条目没有 key 永远不会触发。
+			 */
+			case "POST /api/lorebook/entry": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as {
+					source?: string;
+					cardIdentity?: string;
+					path?: string;
+					comment?: string;
+					name?: string;
+					content?: string;
+					info?: string;
+					keys?: string[];
+					secondaryKeys?: string[];
+					constant?: boolean;
+					selective?: boolean;
+					order?: number;
+				};
+				const comment = (body.comment ?? body.name ?? "").trim();
+				const content = (body.content ?? body.info ?? "").trim();
+				if (!comment) throw new Error("标题不能为空");
+				if (!content) throw new Error("正文不能为空");
+				if (refuseWhileStreaming()) return true;
+				const config = loadConfig(host.cwd);
+				const selected = loreTarget(host.cwd, config, body);
+				if (selected.source === "card") throw new Error("卡内书暂不支持新增；可编辑现有条目，或向补充设定新增");
+				const abs = selected.abs;
+				const targetLabel = selected.name;
+				const rawKeys = Array.isArray(body.keys)
+					? body.keys.filter((k): k is string => typeof k === "string").map((k) => k.trim()).filter(Boolean)
+					: [];
+				const entry = appendLorebookFileEntry(abs, {
+					comment,
+					keys: rawKeys.length > 0 ? rawKeys : keysFromTitle(comment),
+					content,
+					secondaryKeys: Array.isArray(body.secondaryKeys)
+						? body.secondaryKeys.filter((k): k is string => typeof k === "string")
+						: [],
+					constant: body.constant === true,
+					selective: body.selective === true,
+					order: typeof body.order === "number" ? body.order : undefined,
+				});
+				if (!entry) {
+					sendJson(res, 200, { ok: true, duplicate: true, fingerprint: loreFingerprint(content) });
+					return true;
+				}
+				await host.softRefreshConfig();
+				host.notify("info", `已向「${targetLabel}」新增条目：${entry.comment}`);
+				sendJson(res, 200, {
+					ok: true,
+					duplicate: false,
+					fingerprint: loreFingerprint(entry.content),
+					comment: entry.comment,
+					keys: entry.keys,
+				});
+				return true;
+			}
+			case "PUT /api/lorebook/entry": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as LoreTargetInput & LoreEntryPatch & { fingerprint?: string; entryKey?: string };
+				// readBody 后重读配置/身份，防慢请求在切卡后误写新的当前卡。
+				if (refuseWhileStreaming()) return true;
+				const config = loadConfig(host.cwd);
+				const target = loreTarget(host.cwd, config, body);
+				const fp = (body.fingerprint ?? "").trim();
+				const original = requireLoreEntry(target, fp, body.entryKey);
+				const effective = applyLoreSourceState([original], config, target.source, target.path)[0];
+				const patch: LoreEntryPatch = {};
+				for (const key of ["constant", "selective", "enabled"] as const) if (typeof body[key] === "boolean") patch[key] = body[key];
+				if (typeof body.order === "number" && Number.isFinite(body.order)) patch.order = Math.max(0, Math.min(9999, Math.round(body.order)));
+				for (const key of ["keys", "secondaryKeys"] as const) if (Array.isArray(body[key])) patch[key] = body[key]!.filter((k): k is string => typeof k === "string");
+				for (const key of ["comment", "content"] as const) if (typeof body[key] === "string") patch[key] = body[key];
+				if (!Object.keys(patch).length) throw new Error("没有可更新的字段");
+				if (patch.content !== undefined && loreFingerprint(patch.content.replace(/\r\n/g, "\n")) !== fp && patch.enabled === undefined && !effective.enabled) patch.enabled = false;
+				const result = withLoreRollback(host.cwd, target, () => {
+					const result = writeLoreTarget(target, (book) => {
+						const hit = patchLorebookRawEntry(book, fp, patch, body.entryKey);
+						if (!hit) throw new Error("条目不存在（世界书可能已更换）");
+						return hit;
+					});
+					if (result.newFingerprint !== fp) {
+						const overrides = { ...config.loreEntryOverrides };
+						delete overrides[loreSourceKey(target.source, target.path, fp, original.entryKey)];
+						delete overrides[loreSourceKey(target.source, target.path, result.newFingerprint, original.entryKey)];
+						const next = { ...config };
+						if (Object.keys(overrides).length) next.loreEntryOverrides = overrides; else delete next.loreEntryOverrides;
+						if (JSON.stringify(config.loreEntryOverrides) !== JSON.stringify(next.loreEntryOverrides)) writeJsonWithBackup(configPath(host.cwd), next);
+						config.loreEntryOverrides = next.loreEntryOverrides;
+					}
+					if (patch.enabled !== undefined) updateLoreOverride(host.cwd, config, target, [{ fingerprint: result.newFingerprint, entryKey: original.entryKey }], patch.enabled);
+					return result;
+				});
+				await host.softRefreshConfig();
+				host.notify("info", "世界书条目已保存");
+				sendJson(res, 200, { ok: true, fingerprint: result.newFingerprint, constant: result.entry.constant,
+					order: result.entry.order, path: target.path, source: target.source });
+				return true;
+			}
+			case "DELETE /api/lorebook/entry": {
+				if (refuseWhileStreaming()) return true;
+				const config = loadConfig(host.cwd);
+				const target = loreTarget(host.cwd, config, loreTargetQuery(query));
+				const fp = query.get("fp") ?? query.get("fingerprint") ?? "";
+				const original = requireLoreEntry(target, fp, query.get("entryKey") ?? undefined);
+				const removed = withLoreRollback(host.cwd, target, () => {
+					let arrayEntries = false;
+					const removed = writeLoreTarget(target, (book) => {
+						arrayEntries = Array.isArray(book.entries);
+						const hit = deleteLorebookRawEntry(book, fp, query.get("entryKey") ?? undefined);
+						if (!hit) throw new Error("条目不存在（世界书可能已更换）");
+						return hit;
+					});
+					const overrides: Record<string, boolean> = {};
+					for (const [key, value] of Object.entries(config.loreEntryOverrides ?? {})) {
+						let nextKey = key;
+						try {
+							const [source, path, fingerprint, entryKey] = JSON.parse(key);
+							if (source === target.source && path === target.path.replace(/\\/g, "/")) {
+								if (fingerprint === fp && entryKey === original.entryKey) continue;
+								if (arrayEntries && /^\d+$/.test(entryKey) && Number(entryKey) > Number(original.entryKey)) nextKey = loreSourceKey(source, path, fingerprint, String(Number(entryKey) - 1));
+							}
+						} catch { /* 未知旧键保留 */ }
+						overrides[nextKey] = value;
+					}
+					if (JSON.stringify(config.loreEntryOverrides ?? {}) !== JSON.stringify(overrides)) {
+						if (Object.keys(overrides).length) config.loreEntryOverrides = overrides; else delete config.loreEntryOverrides;
+						writeJsonWithBackup(configPath(host.cwd), config);
+					}
+					return removed;
+				});
+				await host.softRefreshConfig();
+				host.notify("info", `已删除条目「${removed.comment || removed.keys[0] || fp}」`);
+				sendJson(res, 200, { ok: true, comment: removed.comment, path: target.path, source: target.source });
+				return true;
+			}
+			case "GET /api/lorebook/search": {
+				const q = query.get("q") ?? "";
+				const entries = loadMergedLore(host.cwd, loadConfig(host.cwd));
+				const hits = searchEntries(entries, q, 5);
+				sendJson(res, 200, { hits: hits.map((h) => ({ comment: h.entry.comment, keys: h.entry.keys,
+					score: h.score, preview: previewText(h.entry.content, 400) })) });
+				return true;
+			}
+			case "POST /api/lorebook/toggle": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as LoreTargetInput & { fingerprint?: string; entryKey?: string; fingerprints?: string[]; entries?: Array<{ fingerprint: string; entryKey?: string }>; enabled?: boolean };
+				if (typeof body.enabled !== "boolean") throw new Error("缺少 enabled 开关");
+				const selectors: Array<{ fingerprint: string; entryKey?: string }> = [
+					...(typeof body.fingerprint === "string" ? [{ fingerprint: body.fingerprint, entryKey: body.entryKey }] : []),
+					...(Array.isArray(body.fingerprints) ? body.fingerprints.filter((fp): fp is string => typeof fp === "string").map((fingerprint) => ({ fingerprint })) : []),
+					...(Array.isArray(body.entries) ? body.entries : []),
+				];
+				if (!selectors.length) throw new Error("缺少 fingerprint(s)");
+				if (refuseWhileStreaming()) return true;
+				const config = loadConfig(host.cwd);
+				const target = loreTarget(host.cwd, config, body);
+				// 所有选择器先校验；混入失效行时整批不落盘。
+				for (const selector of selectors) {
+					if (!selector || typeof selector.fingerprint !== "string" || (selector.entryKey !== undefined && typeof selector.entryKey !== "string")) throw new Error("条目选择器无效");
+					requireLoreEntry(target, selector.fingerprint, selector.entryKey);
+				}
+				withLoreRollback(host.cwd, target, () => {
+					writeLoreTarget(target, (book) => {
+						for (const selector of selectors) if (!patchLorebookRawEntry(book, selector.fingerprint, { enabled: body.enabled }, selector.entryKey)) throw new Error("条目不存在");
+					});
+					updateLoreOverride(host.cwd, config, target, selectors.map((row) => ({ fingerprint: row.fingerprint, entryKey: requireLoreEntry(target, row.fingerprint, row.entryKey).entryKey })), body.enabled === true);
+				});
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, count: new Set(selectors.map((row) => JSON.stringify(row))).size });
+				return true;
+			}
+			case "GET /api/lorebook/export": {
+				const config = loadConfig(host.cwd);
+				const input = loreTargetQuery(query);
+				if (input.source || input.path) {
+					const target = loreTarget(host.cwd, config, input);
+					const entries = applyLoreSourceState(target.entries, config, target.source, target.path);
+					sendJson(res, 200, { name: target.name, json: exportStLorebook(target.name, entries) });
+				} else {
+					const { entries, cardName } = loadMergedLoreWithSource(host.cwd, config);
+					const name = `${cardName}-梨园世界书`;
+					sendJson(res, 200, { name, json: exportStLorebook(name, entries) });
+				}
+				return true;
+			}
+
+			// ---- 预设 ----
+			/**
+			 * GET：默认读**磁盘已保存**版（切换回来应看到原样）。
+			 * ?full=1 附带每块 content；?working=1 则返回当前运行时草稿（若有）。
+			 */
+			case "GET /api/preset": {
+				const config = loadConfig(host.cwd);
+				if (!config.preset) {
+					sendJson(res, 200, { preset: null, dirty: false });
+					return true;
+				}
+				const wantWorking = query.get("working") === "1";
+				const full = query.get("full") === "1";
+				const loaded = wantWorking ? loadEffectivePreset(host.cwd) : loadDiskPreset(host.cwd);
+				const doc = loaded?.doc ?? null;
+				if (!doc) {
+					sendJson(res, 200, { preset: null, missing: config.preset, dirty: existsSync(presetOverridePath(host.cwd)) });
+					return true;
+				}
+				sendJson(res, 200, {
+					path: loaded?.path ?? config.preset,
+					dirty: existsSync(presetOverridePath(host.cwd)),
+					preset: {
+						name: doc.name,
+						kind: doc.kind,
+						samplers: doc.samplers,
+						blocks: presetDocView(doc, { full }),
+					},
+				});
+				return true;
+			}
+			/** 单块全文：优先草稿，否则磁盘 */
+			case "GET /api/preset/block": {
+				const id = (query.get("id") ?? "").trim();
+				if (!id) throw new Error("缺少 id");
+				const { doc, path } = loadEffectivePreset(host.cwd);
+				if (!doc) throw new Error(path ? `预设文件不存在：${path}` : "当前未配置预设文件");
+				const block = presetDocBlock(doc, id);
+				if (!block) throw new Error(`找不到提示词块：${id}`);
+				sendJson(res, 200, block);
+				return true;
+			}
+			/**
+			 * PUT：只写入运行时草稿并热更新（**不落盘**）。
+			 * 开关/改字立刻影响下一轮生成；点「保存」才写预设文件。
+			 * 草稿与磁盘同格式（原文）：补丁打进原文，梨园不认识的键原样透传。
+			 */
+			case "PUT /api/preset": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as {
+					samplers?: Record<string, number>;
+					blocks?: PresetBlockPatch[];
+				};
+				const config = loadConfig(host.cwd);
+				if (!config.preset) throw new Error("当前未配置预设文件");
+				const base = loadEffectivePreset(host.cwd).doc ?? loadDiskPreset(host.cwd)?.doc;
+				if (!base) throw new Error(`预设文件不存在：${config.preset}`);
+				const next = patchPresetRaw(base, body);
+				const ovr = presetOverridePath(host.cwd);
+				mkdirSync(join(host.cwd, ".liyuan"), { recursive: true });
+				writeFileSync(ovr, `${JSON.stringify(next, null, "\t")}\n`, "utf8");
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, dirty: true, saved: false });
+				return true;
+			}
+			/** 把当前草稿（或请求体补丁）写入磁盘预设文件，并清除草稿标记 */
+			case "POST /api/preset/save": {
+				if (refuseWhileStreaming()) return true;
+				const rawBody = await readBody(req).catch(() => "");
+				const body = JSON.parse(rawBody.trim() || "{}") as {
+					samplers?: Record<string, number>;
+					blocks?: PresetBlockPatch[];
+				};
+				const config = loadConfig(host.cwd);
+				if (!config.preset) throw new Error("当前未配置预设文件");
+				const filePath = resolvePath(host.cwd, config.preset);
+				const base = loadEffectivePreset(host.cwd).doc ?? loadDiskPreset(host.cwd)?.doc;
+				if (!base) throw new Error(`预设文件不存在：${config.preset}`);
+				const next = body.blocks || body.samplers ? patchPresetRaw(base, body) : base.raw;
+				writeJsonWithBackup(filePath, next);
+				clearPresetOverride(host.cwd);
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, dirty: false, saved: true, path: config.preset });
+				return true;
+			}
+			/** 丢弃未保存草稿，从磁盘重载 */
+			case "POST /api/preset/revert": {
+				if (refuseWhileStreaming()) return true;
+				clearPresetOverride(host.cwd);
+				await host.softRefreshConfig();
+				sendJson(res, 200, { ok: true, dirty: false });
+				return true;
+			}
+
+			// ---- 在线更新 ----
+			case "POST /api/update/check": {
+				await host.updateCheckNow();
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "POST /api/update/download": {
+				const body = JSON.parse((await readBody(req)) || "{}") as { mirror?: string };
+				// 不 await 完成：进度经 WS 推送，失败也经 WS 回 available+error
+				void host.updateDownload(typeof body.mirror === "string" ? body.mirror : undefined).catch(() => {});
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "POST /api/update/discard": {
+				host.updateDiscard();
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+			case "POST /api/update/restart": {
+				if (refuseWhileStreaming()) return true;
+				sendJson(res, 200, { ok: true });
+				// 先回包再退：前端收到 ok 后展示「重启中」并等重连
+				host.updateRestart();
+				return true;
+			}
+
+			// ---- 导入 ST 聊天记录 ----
+			case "POST /api/import": {
+				if (refuseWhileStreaming()) return true;
+				const body = JSON.parse(await readBody(req)) as { content?: string; tag?: string };
+				if (!body.content?.trim()) throw new Error("聊天记录内容为空");
+				const dir = join(host.cwd, ".liyuan-cache", "imports");
+				mkdirSync(dir, { recursive: true });
+				const rel = join(".liyuan-cache", "imports", `import-${Date.now()}.jsonl`);
+				writeFileSync(join(host.cwd, rel), body.content, "utf8");
+				const tag = (body.tag ?? "").trim();
+				// /import 全流程（解析→清洗→摘要→建账→注入）由扩展命令完成，进度经 notify 推送
+				await host.promptCommand(`/import ${rel}${tag ? ` ${tag}` : ""}`);
+				sendJson(res, 200, { ok: true });
+				return true;
+			}
+
+			default:
+				sendJson(res, 404, { error: `未知接口：${route}` });
+				return true;
+		}
+	} catch (err) {
+		const storageCode = (err as { code?: unknown })?.code;
+		if (storageCode === "ENOSPC" || storageCode === "EDQUOT") {
+			sendJson(res, 507, { code: storageCode, error: `服务器可用存储空间不足（${storageCode}），本次操作未完成。请释放磁盘空间后重试；不要反复切换或覆盖配置。` });
+			return true;
+		}
+		const status = typeof (err as { statusCode?: unknown })?.statusCode === "number" ? (err as { statusCode: number }).statusCode : 400;
+		sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
+		return true;
+	}
+}
+
+function sanitizeSamplers(input: Record<string, number> | undefined): Record<string, number> | undefined {
+	if (!input || typeof input !== "object") return undefined;
+	const out: Record<string, number> = {};
+	for (const [k, v] of Object.entries(input)) {
+		if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+	}
+	return out;
+}

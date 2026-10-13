@@ -1,0 +1,97 @@
+/* Shared navigation: keep the porcelain/cinnabar theme, not a separate plugin skin. */
+.database-navigation { justify-content: flex-end; gap: 8px; flex-wrap: wrap; padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right)); }
+.database-entry, .tavern-plugin-entry { min-height: 36px; }
+.tavern-plugin-entry { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 6px 14px; border: 1px solid color-mix(in srgb, var(--accent, #bc4123) 45%, var(--hairline-strong, #d9d2c8)); border-radius: 8px; background: var(--accent-wash, #faeee7); color: var(--accent-strong, #9d3319); font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; }
+.tavern-plugin-entry:hover { border-color: var(--accent, #bc4123); }
+.tavern-plugins-manager-open { overflow: hidden; }
+.tavern-plugins-panel { min-width: 0; color: var(--text, #3d3833); }
+.tavern-plugins-panel.is-manager { padding: 28px 32px 24px; }
+.tavern-plugins-intro { margin: 0 0 22px; font-size: 13px; line-height: 1.7; color: var(--text-soft, #73695f); }
+.tavern-plugin-grid { display: grid; gap: 20px; }
+.tavern-plugins-panel.is-manager .tavern-plugin-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.tavern-plugins-loading, .tavern-plugin-empty-state { padding: 32px 16px; text-align: center; line-height: 1.7; }
+.tavern-plugin-empty-state p { margin: 0 0 16px; color: var(--danger, #a33); }
+.tavern-plugin-card { min-width: 0; display: flex; flex-direction: column; padding: 24px; border: 1px solid var(--hairline-strong, #d9d2c8); border-radius: 16px; background: var(--surface, #fffcfa); }
+.tavern-plugin-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.tavern-plugin-symbol { display: grid; place-items: center; width: 46px; height: 46px; flex: 0 0 46px; border-radius: 12px; color: var(--accent, #bc4123); background: var(--accent-wash, #faeee7); }
+.tavern-plugin-title { min-width: 0; }
+.tavern-plugin-title strong { font-size: 18px; font-weight: 650; }
+.tavern-plugin-title p { margin: 5px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-soft, #73695f); }
+.tavern-plugin-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 20px; }
+.tavern-plugin-badges > span { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 5px; font-size: 11px; line-height: 1.6; background: var(--surface-dim, #f3efe9); color: var(--text-soft, #73695f); }
+.tavern-plugin-badges > .is-verified { color: var(--accent-strong, #9d3319); background: var(--accent-wash, #faeee7); }
+.tavern-plugin-badges > .is-enabled { color: var(--text, #3d3833); font-weight: 650; }
+.tavern-plugin-preferences { border-top: 1px solid var(--hairline, #ebe6df); border-bottom: 1px solid var(--hairline, #ebe6df); margin-bottom: 20px; }
+.tavern-plugin-card .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 0; margin: 0; }
+.tavern-plugin-card .toggle-row + .toggle-row { border-top: 1px solid var(--hairline, #ebe6df); }
+.tavern-plugin-card .toggle-row > span { min-width: 0; }
+.tavern-plugin-card .toggle-row strong { display: block; font-size: 13px; font-weight: 550; line-height: 1.6; }
+.tavern-plugin-card .toggle-row small { display: block; font-size: 11px; line-height: 1.6; color: var(--text-soft, #73695f); margin-top: 4px; }
+.tavern-plugins-panel .drawer-btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 9px 12px; border: 1px solid var(--hairline-strong, #d9d2c8); border-radius: 8px; background: var(--surface, #fffcfa); color: var(--text-soft, #73695f); font: inherit; font-size: 12px; cursor: pointer; }
+.tavern-plugins-panel .drawer-btn:hover:not(:disabled) { border-color: var(--accent, #bc4123); color: var(--accent-strong, #9d3319); background: var(--accent-wash, #faeee7); }
+.tavern-plugins-panel .drawer-btn:disabled { opacity: .45; cursor: not-allowed; }
+.tavern-plugins-panel .tavern-plugin-open-original { flex: 0 0 auto; width: 100%; min-height: 46px; justify-content: space-between; padding-inline: 16px; font-size: 13px; font-weight: 650; background: var(--accent, #bc4123); border-color: var(--accent, #bc4123); color: #fff; }
+.tavern-plugins-panel .tavern-plugin-open-original:hover:not(:disabled) { background: var(--accent-strong, #9d3319); color: #fff; }
+.tavern-plugin-integrity { margin: 18px 0; font-size: 11px; color: var(--text-soft, #73695f); }
+.tavern-plugin-integrity summary, .tavern-plugins-safety summary { cursor: pointer; padding: 5px 0; }
+.tavern-plugin-integrity dl { margin: 12px 0 0; padding: 12px; background: var(--surface-dim, #f3efe9); border-radius: 8px; }
+.tavern-plugin-integrity dt { opacity: .8; }
+.tavern-plugin-integrity dd { margin: 4px 0 12px; overflow-wrap: anywhere; font-family: ui-monospace, monospace; line-height: 1.7; }
+.tavern-plugin-integrity dd:last-child { margin-bottom: 0; }
+.tavern-plugin-buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: auto; margin-bottom: 0; padding-top: 8px; }
+.tavern-plugins-safety { margin-top: 22px; color: var(--text-soft, #73695f); font-size: 12px; line-height: 1.8; }
+.tavern-plugins-safety p { margin: 10px 0; max-width: 780px; }
+.tavern-plugin-status-error { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px; margin-bottom: 16px; }
+
+/* Dialog shell: less repeated chrome, more usable settings canvas. */
+.tavern-app-manager-backdrop, .tavern-plugins-backdrop { position: fixed; inset: 0; z-index: 1500; display: grid; place-items: center; padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); background: rgb(20 17 16 / .52); backdrop-filter: blur(5px); }
+.tavern-plugins-backdrop { z-index: 1000; }
+.tavern-app-manager, .tavern-plugins-manager { display: flex; flex-direction: column; width: min(1120px, 100%); height: min(880px, calc(100dvh - 40px)); min-width: 0; min-height: 0; overflow: hidden; border: 1px solid var(--hairline-strong, #d9d2c8); border-radius: 20px; background: var(--bg, #f7f4f0); color: var(--text, #3d3833); box-shadow: 0 24px 80px #14111040; }
+.tavern-app-manager__header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 20px; padding: 24px 32px; border-bottom: 1px solid var(--hairline, #ebe6df); background: var(--surface, #fffcfa); }
+.tavern-app-manager__eyebrow { display: block; margin-bottom: 7px; color: var(--accent, #bc4123); font-size: 11px; font-weight: 600; letter-spacing: .08em; }
+.tavern-app-manager__header h2 { margin: 0; font-size: 23px; font-weight: 650; line-height: 1.4; }
+.tavern-app-manager__header p { margin: 7px 0 0; color: var(--text-soft, #73695f); font-size: 12px; line-height: 1.6; }
+.tavern-app-manager.is-settings .tavern-app-manager__header { padding-block: 12px; }
+.tavern-app-manager.is-settings .tavern-app-manager__eyebrow, .tavern-app-manager.is-settings .tavern-app-manager__header p { display: none; }
+.tavern-app-manager.is-settings .tavern-app-manager__header h2 { font-size: 17px; }
+.tavern-plugins-manager-content, .tavern-app-manager-content { min-height: 0; flex: 1 1 auto; overflow: auto; overscroll-behavior: contain; }
+.tavern-plugin-original-inline { min-width: 0; min-height: 0; display: flex; flex: 1 1 auto; flex-direction: column; overflow: hidden; }
+.tavern-plugins-manager > header, .tavern-plugin-original-inline > header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--hairline, #ebe6df); background: var(--surface, #fffcfa); }
+.tavern-plugins-manager h3, .tavern-plugin-original-inline h3 { margin: 0 0 4px; font-size: 14px; font-weight: 550; }
+.tavern-plugins-manager small, .tavern-plugin-original-inline small { color: var(--text-soft, #73695f); font-size: 11px; overflow-wrap: anywhere; }
+.tavern-plugins-manager-actions { display: flex; gap: 8px; flex-shrink: 0; align-items: center; }
+.tavern-plugins-manager-actions .drawer-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 0 0 auto; min-height: 36px; padding: 7px 12px; border: 1px solid var(--hairline-strong, #d9d2c8); border-radius: 8px; background: var(--surface, #fffcfa); color: var(--text, #3d3833); font: inherit; font-size: 12px; cursor: pointer; }
+.tavern-app-manager .icon-btn, .tavern-plugins-manager .icon-btn { display: grid; place-items: center; width: 38px; height: 38px; flex: 0 0 auto; border: 1px solid var(--hairline-strong, #d9d2c8); border-radius: 9px; background: var(--surface, #fffcfa); color: var(--text, #3d3833); cursor: pointer; }
+.tavern-plugins-manager-note { flex: 0 0 auto; margin: 0; padding: 8px 24px; line-height: 1.6; font-size: 11px; color: var(--text-soft, #73695f); }
+.tavern-plugin-frame-wrap { position: relative; min-width: 0; min-height: 0; flex: 1 1 auto; overflow: hidden; background: var(--bg, #f7f4f0); }
+.tavern-plugin-frame-wrap > iframe { display: block; width: 100%; height: 100%; min-height: 300px; border: 0; background: var(--bg, #f7f4f0); }
+.tavern-plugin-frame-wrap.is-not-ready > iframe { visibility: hidden; }
+.tavern-plugin-frame-state { position: absolute; inset: 0; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 32px; overflow: auto; overflow-wrap: anywhere; background: var(--surface, #fffcfa); text-align: center; }
+.tavern-plugin-frame-state > span { max-width: 640px; line-height: 1.7; font-size: 13px; }
+.tavern-plugin-frame-state.is-error { color: var(--danger, #a33); }
+.tavern-app-manager :is(button, summary):focus-visible, .tavern-plugins-manager :is(button, summary):focus-visible { outline: 2px solid var(--accent, #bc4123); outline-offset: 3px; }
+@media (max-width: 760px) {
+ .tavern-plugins-panel.is-manager .tavern-plugin-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+ .database-navigation { gap: 6px; padding-top: 5px; padding-bottom: 5px; }
+ .tavern-plugin-entry, .database-entry { min-height: 36px; padding-inline: 10px; font-size: 12px; }
+ .tavern-app-manager-backdrop { padding: max(7px, env(safe-area-inset-top)) max(7px, env(safe-area-inset-right)) max(7px, env(safe-area-inset-bottom)) max(7px, env(safe-area-inset-left)); }
+ .tavern-plugins-backdrop { padding: max(10px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); }
+ .tavern-app-manager { height: calc(100dvh - 14px); border-radius: 14px; }
+ .tavern-plugins-manager { height: calc(100dvh - 20px); border-radius: 14px; }
+ .tavern-app-manager__header { padding: 18px; gap: 12px; }
+ .tavern-app-manager__header h2 { font-size: 19px; }
+ .tavern-app-manager__header p { font-size: 11px; }
+ .tavern-app-manager__eyebrow { font-size: 10px; margin-bottom: 5px; }
+ .tavern-plugins-panel.is-manager { padding: 20px 16px; }
+ .tavern-plugins-intro { margin-bottom: 16px; font-size: 12px; }
+ .tavern-plugin-card { padding: 20px; border-radius: 12px; }
+ .tavern-plugin-grid { gap: 16px; }
+ .tavern-plugins-manager > header, .tavern-plugin-original-inline > header { padding: 12px; flex-wrap: wrap; gap: 10px; }
+ .tavern-plugin-original-inline > header > div:first-child { flex: 1 1 150px; }
+ .tavern-plugins-manager-actions { margin-left: auto; gap: 6px; }
+ .tavern-plugins-manager-note { padding: 6px 12px 8px; font-size: 10px; }
+ .tavern-plugin-frame-wrap > iframe { min-height: 200px; }
+ .tavern-plugin-frame-state { padding: 20px; }
+}

@@ -1,0 +1,150 @@
+/* Native Tavern theme primitives: required by the original helper's variable-based CSS. */
+:root {
+ --mainFontSize: 16px;
+ --liyuan-bg: #f7f4f0; --liyuan-surface: #fffcfa; --liyuan-dim: #f3efe9;
+ --liyuan-text: #3d3833; --liyuan-muted: #73695f; --liyuan-border: #e3dcd3;
+ --liyuan-accent: #bc4123; --liyuan-wash: #faeee7;
+ --SmartThemeBodyColor: var(--liyuan-text); --SmartThemeQuoteColor: var(--liyuan-accent);
+ --SmartThemeBlurTintColor: var(--liyuan-surface); --SmartThemeBorderColor: var(--liyuan-border);
+ --SmartThemeTextColor: var(--liyuan-text); --SmartThemeBGColor: var(--liyuan-bg);
+ --SmartThemeChatTintColor: var(--liyuan-surface); --SmartThemeUnderlineColor: var(--liyuan-accent);
+ --SmartThemeEmColor: var(--liyuan-muted); --SmartThemeShadowColor: #0002;
+ --grey50: var(--liyuan-muted); --grey5050a: var(--liyuan-border); --grey30: #e3dcd3; --grey5020a: color-mix(in srgb, var(--liyuan-border) 35%, transparent);
+ --black50a: #0008; --white50a: #fff8;
+}
+:root[data-theme=dark] {
+ color-scheme: dark;
+ --liyuan-bg: #141110; --liyuan-surface: #1e1a18; --liyuan-dim: #272220;
+ --liyuan-text: #e6ddd4; --liyuan-muted: #b5a99d; --liyuan-border: #443a33;
+ --liyuan-accent: #e25a3c; --liyuan-wash: #3a221c;
+}
+.inline-drawer-content { display: none; }
+.hidden, .hidden\!, [hidden] { display: none !important; }
+.TH-render iframe { width: 100%; border: 0; min-height: 120px; }
+body[data-view=manager] {
+ margin: 0; background: var(--liyuan-bg); color: var(--liyuan-text);
+ font: 400 15px/1.65 -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+ overflow-wrap: anywhere;
+}
+body[data-view=manager] *, body[data-view=manager] *::before, body[data-view=manager] *::after { box-sizing: border-box; }
+body[data-view=manager][data-plugin] #chat, body[data-view=manager] #status { display: none; }
+body[data-view=manager] #extensions_settings, body[data-view=manager] #extensions_settings2 {
+ width: min(100%, 1020px); margin-inline: auto; padding: 24px 32px;
+}
+body[data-view=manager] #extensions_settings2:empty { display: none; }
+body[data-view=manager] .inline-drawer {
+ min-width: 0; background: var(--liyuan-surface); border: 1px solid var(--liyuan-border); border-radius: 16px;
+ box-shadow: 0 3px 18px #211e1b06;
+}
+body[data-view=manager] .inline-drawer-header {
+ display: flex; align-items: center; justify-content: space-between; gap: 16px;
+ padding: 18px 24px; min-height: 64px; font-size: 18px; cursor: pointer; user-select: none;
+}
+body[data-view=manager] .inline-drawer-header b { font-weight: 650; }
+body[data-view=manager] .inline-drawer-header[aria-expanded=true] { border-bottom: 1px solid var(--liyuan-border); }
+body[data-view=manager] .inline-drawer-icon { flex-shrink: 0; width: 9px; height: 9px; border: solid var(--liyuan-muted); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); margin-right: 4px; }
+body[data-view=manager] .inline-drawer-icon.up { transform: rotate(225deg); }
+body[data-view=manager] .inline-drawer-content { padding: 24px; }
+body[data-view=manager] :is(button, input, select, textarea) { font: inherit; }
+body[data-view=manager] :is(button, .menu_button, .text_pole, select, input[type=number]) {
+ border: 1px solid var(--liyuan-border); border-radius: 8px; color: var(--liyuan-text); background: var(--liyuan-surface);
+}
+body[data-view=manager] :is(button, .menu_button, select) { min-height: 38px; padding: 6px 12px; cursor: pointer; }
+body[data-view=manager] :is(button, .menu_button):hover { border-color: var(--liyuan-accent); background: var(--liyuan-wash); }
+body[data-view=manager] :is(input[type=number], input[type=text], textarea) { min-height: 36px; max-width: 100%; padding: 6px 10px; }
+body[data-view=manager] :is(input[type=checkbox], input[type=range]) { accent-color: var(--liyuan-accent); }
+body[data-view=manager] input[type=checkbox]:not(.sr-only) { width: 18px; height: 18px; margin: 0; flex-shrink: 0; }
+body[data-view=manager] :is([role=button], [role=tab], button, input, select, textarea, a):focus-visible { outline: 2px solid var(--liyuan-accent); outline-offset: 4px; }
+body[data-view=manager] a { color: var(--liyuan-accent); text-underline-offset: 3px; }
+
+/* Original helper: supply real spacing, room for descriptions, and comfortably sized navigation. */
+body[data-view=manager] #tavern_helper .TH-custom-tailwind > div { gap: 18px; }
+body[data-view=manager] .liyuan-helper-tabs { border: 0; padding: 5px; gap: 4px; border-radius: 10px; background: var(--liyuan-dim); }
+body[data-view=manager] .liyuan-helper-tabs > [role=tab] { min-height: 42px; border-radius: 7px; gap: 6px; font-weight: 550; }
+body[data-view=manager] .liyuan-helper-tabs > [aria-selected=true] { background: var(--liyuan-accent); color: #fff; }
+body[data-view=manager] #tavern_helper :is(.TH-fieldset, .rounded-md.border) { border-color: var(--liyuan-border); border-radius: 12px; }
+body[data-view=manager] #tavern_helper .TH-fieldset { margin-top: 20px; padding: 18px; }
+body[data-view=manager] #tavern_helper legend { font-size: 13px !important; padding-inline: 8px; color: var(--liyuan-muted); }
+body[data-view=manager] #tavern_helper .liyuan-helper-section-toggle { cursor: pointer; min-height: 28px; align-items: center; }
+body[data-view=manager] #tavern_helper .liyuan-helper-section-toggle::before { content: ''; display: inline-block; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); margin-right: 6px; margin-top: -3px; }
+body[data-view=manager] #tavern_helper .liyuan-helper-section-toggle[aria-expanded=false]::before { transform: rotate(-45deg); margin-top: 0; }
+body[data-view=manager] #tavern_helper .liyuan-section-collapsed > :not(legend) { display: none !important; }
+body[data-view=manager] #tavern_helper .TH-Item--title { font-weight: 550; line-height: 1.6; }
+body[data-view=manager] #tavern_helper .TH-Item--title + div { font-size: 13px; line-height: 1.7; opacity: .8; margin-top: 5px; }
+body[data-view=manager] #tavern_helper .TH-collapsible { padding: 16px; }
+body[data-view=manager] #tavern_helper .TH-collapsible--content { gap: 14px; }
+body[data-view=manager] .liyuan-helper-fold-toggle { min-height: 42px; }
+body[data-view=manager] #tavern_helper .text_pole[type=number] { width: 80px !important; }
+body[data-view=manager] #tavern_helper .sr-only + label { min-width: 32px; min-height: 16px; }
+
+/* Original template: section rhythm, full-row labels, no cramped three-word fragments. */
+body[data-view=manager] #prompt_template_settings .inline-drawer-content { display: none; }
+body[data-view=manager] #prompt_template_settings label {
+ display: flex; align-items: center; gap: 12px; min-height: 48px; margin: 0;
+ padding: 10px 12px; border-radius: 8px; line-height: 1.6; cursor: pointer;
+}
+body[data-view=manager] #prompt_template_settings label:hover { background: var(--liyuan-dim); }
+body[data-view=manager] #prompt_template_settings label > span[data-i18n] { flex: 1; min-width: 0; }
+body[data-view=manager] #prompt_template_settings label .flex-container { display: flex; align-items: center; gap: 12px; }
+body[data-view=manager] #prompt_template_settings input[type=range] { min-width: 0; width: min(240px, 100%); }
+body[data-view=manager] #prompt_template_settings input[type=number] { width: 76px; }
+body[data-view=manager] #prompt_template_settings .range-block-range { flex: 1; min-width: 70px; }
+body[data-view=manager] #prompt_template_settings .range-block-counter { flex: 0 0 auto; }
+body[data-view=manager] #prompt_template_settings hr {
+ height: 1px; border: 0; background: var(--liyuan-border); margin: 30px 0 38px; overflow: visible; position: relative;
+}
+body[data-view=manager] #prompt_template_settings hr::after {
+ content: attr(data-section); position: absolute; top: 12px; left: 12px;
+ font-size: 12px; font-weight: 650; color: var(--liyuan-muted); letter-spacing: .05em;
+}
+body[data-view=manager] #prompt_template_settings .inline-drawer-header .notes-link { display: inline-flex; align-items: center; margin-left: 12px; padding: 2px 8px; border: 1px solid var(--liyuan-border); border-radius: 6px; text-decoration: none; }
+body[data-view=manager] #prompt_template_settings .inline-drawer-header .notes-link::after { content: '重置'; font-size: 11px; font-weight: 400; }
+@media (max-width: 600px) {
+ body[data-view=manager] #extensions_settings, body[data-view=manager] #extensions_settings2 { padding: 12px; }
+ body[data-view=manager] .inline-drawer-header { padding: 14px 16px; min-height: 54px; font-size: 17px; }
+ body[data-view=manager] .inline-drawer-content { padding: 16px; }
+ body[data-view=manager] #tavern_helper .TH-fieldset { padding: 12px; }
+ body[data-view=manager] #tavern_helper .TH-collapsible { padding: 12px; }
+ body[data-view=manager] .liyuan-helper-tabs > [role=tab] { min-height: 42px; font-size: 14px; }
+ body[data-view=manager] #tavern_helper .TH-Item--title + div { font-size: 12px; }
+ body[data-view=manager] #tavern_helper .TH-Item--title + div ~ div { min-width: 0; }
+ body[data-view=manager] #tavern_helper .TH-Item--title { overflow-wrap: anywhere; }
+ body[data-view=manager] #prompt_template_settings label { padding-inline: 4px; }
+ body[data-view=manager] #prompt_template_settings label:not(.flex-container) { align-items: flex-start; flex-wrap: wrap; }
+ body[data-view=manager] #prompt_template_settings label:not(.flex-container) > .flex-container { width: 100%; }
+ body[data-view=manager] #prompt_template_settings select { max-width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) { body[data-view=manager] *, body[data-view=manager] *::before { transition-duration: 0s !important; } }
+
+/* Focused original MVU page: the real Vue controls and their handlers remain intact. */
+body[data-view=manager][data-focus=mvu] #extensions_settings,
+body[data-view=manager][data-focus=mvu] #extensions_settings2 > :not(.liyuan-mvu-mount) { display: none !important; }
+body[data-view=manager] .liyuan-mvu-settings .flexFlowColumn { flex-direction: column; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-section { gap: 12px; padding: 18px 0; border: 0; border-bottom: 1px solid var(--liyuan-border); border-radius: 0; background: transparent; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-section:first-child { padding-top: 0; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-section:last-child { border-bottom: 0; padding-bottom: 0; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-section__title { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-section__content { gap: 14px; min-width: 0; padding: 0; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-field { gap: 7px; min-width: 0; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-field__label { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 12px; color: var(--liyuan-muted); }
+body[data-view=manager] .liyuan-mvu-settings .mvu-details { border: 1px solid var(--liyuan-border); border-radius: 10px; background: var(--liyuan-dim); min-width: 0; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-details__summary { padding: 12px 14px; cursor: pointer; font-size: 13px; min-height: 44px; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-details__content { padding: 4px 14px 14px; font-size: 13px; }
+body[data-view=manager] .liyuan-mvu-settings .mvu-button-wrap { display: flex; flex-wrap: wrap; gap: 8px; }
+body[data-view=manager] .liyuan-mvu-settings :is(.text_pole, select, textarea) { max-width: 100%; min-width: 0; background: var(--liyuan-surface); }
+body[data-view=manager] .liyuan-mvu-settings :is(.mvu-details__summary, [tabindex]):focus-visible { outline: 2px solid var(--liyuan-accent); outline-offset: 3px; }
+@media (max-width: 600px) {
+ body[data-view=manager] .liyuan-mvu-settings .mvu-section { padding-block: 14px; }
+ body[data-view=manager] .liyuan-mvu-settings .mvu-details__summary { padding: 10px 12px; }
+ body[data-view=manager] .liyuan-mvu-settings .mvu-details__content { padding: 3px 12px 12px; }
+ body[data-view=manager] .liyuan-mvu-settings .flex-container > * { max-width: 100%; min-width: 0; }
+}
+
+body[data-view=manager] .liyuan-mvu-settings .checkbox_label { display: flex; align-items: flex-start; gap: 10px; min-height: 28px; font-size: 13px; line-height: 1.7; }
+body[data-view=manager] .liyuan-mvu-settings .checkbox_label input[type=checkbox] { margin-top: 2px; }
+/* Native plugin notifications belong above their own settings, not unstyled below the drawer. */
+body[data-view=manager] #toast-container { position: fixed; bottom: 16px; right: 16px; width: min(360px, calc(100vw - 32px)); max-height: 45vh; overflow: auto; z-index: 100; }
+body[data-view=manager] #toast-container > div { margin-top: 8px; padding: 12px 14px; border: 1px solid var(--liyuan-border); border-radius: 10px; background: var(--liyuan-surface); color: var(--liyuan-text); box-shadow: 0 3px 18px #0002; font-size: 12px; overflow-wrap: anywhere; }
+body[data-view=manager] #toast-container .toast-title { font-weight: 600; margin-bottom: 4px; }
+body[data-view=manager] #toast-container .toast-close-button { float: right; padding: 0 4px; min-height: 22px; }
+body[data-view=manager] #toast-container .toast-error { border-color: #b74732; }

@@ -1,0 +1,66 @@
+.global-options-card {
+	box-sizing: border-box;
+	width: 100%;
+	max-width: 100%;
+	margin: 14px 0;
+	overflow: hidden;
+	border: 1px solid var(--hairline-strong, #d9d2c8);
+	border-radius: 13px;
+	background: linear-gradient(145deg, var(--surface, #fffcfa), var(--surface-dim, #f3efe9));
+	color: var(--text, #3d3833);
+	box-shadow: var(--shadow-1, 0 1px 3px #0001);
+}
+.global-options-card__header {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 10px;
+	padding: 10px 13px;
+	border-bottom: 1px solid var(--hairline, #ebe6df);
+}
+.global-options-card__header > span { color: var(--accent-strong, #9d3319); font-size: 12px; font-weight: 650; }
+.global-options-card__header small { color: var(--text-soft, #6a635c); font-size: 10px; }
+.global-options-card__items { display: grid; gap: 7px; padding: 10px; }
+.global-options-card__item {
+	display: flex;
+	align-items: flex-start;
+	gap: 9px;
+	width: 100%;
+	min-width: 0;
+	padding: 9px 10px;
+	border: 1px solid var(--hairline, #ebe6df);
+	border-radius: 9px;
+	background: var(--surface, #fffcfa);
+	color: var(--text, #3d3833);
+	font: inherit;
+	font-size: 12px;
+	line-height: 1.6;
+	text-align: left;
+	white-space: normal;
+	overflow-wrap: anywhere;
+	cursor: pointer;
+	transition: border-color .15s ease, background .15s ease, transform .15s ease;
+}
+.global-options-card__item > span:first-child {
+	display: grid;
+	flex: 0 0 21px;
+	width: 21px;
+	height: 21px;
+	place-items: center;
+	border-radius: 7px;
+	background: var(--accent-wash, #faeee7);
+	color: var(--accent, #bc4123);
+	font-size: 10px;
+	font-weight: 650;
+}
+.global-options-card__item > span:last-child { min-width: 0; }
+.global-options-card__item:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--accent, #bc4123); background: var(--accent-wash, #faeee7); }
+.global-options-card__item:focus-visible { outline: 2px solid var(--accent, #bc4123); outline-offset: 2px; }
+.global-options-card__item:disabled { opacity: .55; cursor: default; }
+@media (max-width: 500px) {
+	.global-options-card { margin-block: 10px; border-radius: 11px; }
+	.global-options-card__header { padding: 9px 10px; }
+	.global-options-card__items { gap: 6px; padding: 8px; }
+	.global-options-card__item { padding: 8px; font-size: 11px; }
+}
+@media (prefers-reduced-motion: reduce) { .global-options-card__item { transition: none; } }

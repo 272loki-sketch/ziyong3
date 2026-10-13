@@ -1,0 +1,56 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,symlink,rm} from 'node:fs/promises';
+import {readFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createServer} from 'node:http';
+import {chromium} from 'playwright';
+import {TavernPluginHttp} from '../server/tavern-plugin-http.ts';
+import {syntheticTavernPluginContext} from '../server/tavern-plugin-runtime.ts';
+import {TAVERN_CDN_ASSETS} from '../server/tavern-plugin-cdn.ts';
+import {ensureTavernPluginVendors} from '../server/tavern-plugin-vendor.ts';
+const fixture=process.env.LIYUAN_TAVERN_PLUGIN_FIXTURES;
+test('unmodified helper + prompt-template initialize, execute templates and retain scoped variables',{skip:!fixture,timeout:120_000},async(t)=>{
+ const cwd=await mkdtemp(join(tmpdir(),'liyuan-native-tavern-'));let browser:any;let server:any;
+ t.signal.addEventListener("abort",()=>{void browser?.close();server?.closeAllConnections();},{once:true});
+ try{
+  await symlink(join(process.cwd(),'web'),join(cwd,'web'),'dir');await symlink(join(process.cwd(),'node_modules'),join(cwd,'node_modules'),'dir');
+  console.log('[native-stage] vendor');
+  await ensureTavernPluginVendors(cwd,{fixtureRoot:fixture});
+  const context=syntheticTavernPluginContext();context.chat.push({mes:'正文前 <%= 2 + 3 %> 正文后',name:'合成角色',is_user:false,is_system:false,variables:[{}],swipe_id:0,extra:{},__liyuanEntryId:'synthetic-assistant'});context.sourceEntryId='synthetic-assistant';context.visibleEntryIds.push('synthetic-assistant');
+  let syntheticCalls=0;const http=new TavernPluginHttp(cwd,{context:()=>context,isStreaming:()=>false,generate:async()=>{syntheticCalls++;return "原助手合成模型结果";}});
+  console.log('[native-stage] install');
+  await http.sources.install('helper',{fixtureRepo:join(fixture!,'helper')});await http.sources.install('template',{fixtureRepo:join(fixture!,'template')});http.sources.configure('helper',{enabled:true});http.sources.configure('template',{enabled:true});
+  server=createServer((req,res)=>{void(async()=>{if(req.url?.split('?')[0]==='/tavern-plugin-host.html'){res.writeHead(200,{'content-type':'text/html'});res.end(readFileSync(join(cwd,'web/public/tavern-plugin-host.html')));return;}if(!await http.handle(req,res)){res.writeHead(404);res.end();}})().catch(e=>{console.error(e);res.writeHead(500);res.end(String(e));});});
+  await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});const base=`http://127.0.0.1:${server.address().port}`;
+  console.log('[native-stage] launch');
+  browser=await chromium.launch({headless:true,...(process.env.LIYUAN_DATABASE_BROWSER_EXECUTABLE?{executablePath:process.env.LIYUAN_DATABASE_BROWSER_EXECUTABLE}:{}),env:{...process.env,LD_LIBRARY_PATH:process.env.LIYUAN_DATABASE_BROWSER_LIBS??process.env.LD_LIBRARY_PATH??''},args:process.getuid?.()===0?['--no-sandbox']:[]});
+  const page=await browser.newPage({serviceWorkers:'block'});const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));page.on('console',m=>{if(m.type()==='error')console.error('[original plugin]',m.text().slice(0,600));});
+  await page.route('**/*',route=>{const url=new URL(route.request().url()),mapped=TAVERN_CDN_ASSETS[url.href];if(mapped){const file=mapped.includes('/vendor/')?join(cwd,'.liyuan-tavern-plugins/vendor',mapped.split('/').at(-1)!):http.sources.resolveAsset('helper','src/iframe/node_modules/log.js');return file?route.fulfill({status:200,contentType:'text/javascript',body:readFileSync(file),headers:{'access-control-allow-origin':'*'}}):route.abort();}return url.origin===base?route.continue():route.abort();});await page.goto(base+'/tavern-plugin-host.html?view=manager&network=isolated');
+  console.log('[native-stage] ready');
+  try{await page.waitForFunction(()=>!!(window as any).LiyuanTavernPlugins?.ready()||document.getElementById('status')?.textContent?.startsWith('原插件加载失败'),{},{timeout:60_000});}catch(e){console.error(await page.evaluate(()=>({status:document.getElementById('status')?.textContent,helper:!!(window as any).TavernHelper,template:!!(window as any).EjsTemplate})),errors);throw e;}
+  assert.equal(await page.evaluate(()=>!!(window as any).LiyuanTavernPlugins?.ready()),true,errors.join('\n'));
+  console.log('[native-stage] ejs');
+  assert.equal(await page.evaluate(()=>(window as any).EjsTemplate.evalTemplate('合成 <%= 7 * 6 %>',{})),'合成 42');
+  assert.equal(await page.locator('#chat .mes[mesid="1"] .mes_text').innerText(),'正文前 5 正文后');
+  console.log('[native-stage] before');
+  const prepared=await page.evaluate(()=>(window as any).LiyuanTavernPlugins.before({systemPrompt:'设定 <%= 3 + 4 %>',messages:[{role:'user',content:[{type:'text',text:'输入 <%= 4 + 5 %>'}]}]}));assert.equal(prepared.systemPrompt,'设定 7');assert.equal(prepared.messages[0].content[0].text,'输入 9');
+  console.log('[native-stage] variables');
+  await page.evaluate(async()=>{(window as any).TavernHelper.replaceVariables({fixtureCounter:17},{type:'chat'});await (window as any).LiyuanTavernPlugins.host.flush();});assert.equal((http.store.read(context).state.chatMetadata as any).variables.fixtureCounter,17);
+  console.log('[native-stage] render');
+  await page.evaluate(()=>(window as any).LiyuanTavernPlugins.renderHtml('<html><head><meta charset="utf-8"></head><body><div id="native-widget">pending</div><script>document.getElementById("native-widget").textContent="原助手变量="+TavernHelper.getVariables({type:"chat"}).fixtureCounter;</script></body></html>',1));
+  await page.waitForTimeout(200);
+  await page.waitForFunction(()=>document.querySelectorAll('iframe[id^="TH-message--"]').length>0,{},{timeout:8000});
+  console.log('[native-stage] native-widget');
+  const nativeFrame=page.frameLocator('iframe[id^="TH-message--"]').first();await nativeFrame.locator('#native-widget').waitFor();assert.equal(await nativeFrame.locator('#native-widget').innerText(),'原助手变量=17');
+  console.log('[native-stage] world');
+  await page.evaluate(async()=>{const world=await import('/tavern-compat/scripts/world-info.js');const result=await world.getWorldInfoPrompt(['synthetic keyword']);if(!Array.isArray(result.worldInfoDepth)||!Array.isArray(result.worldInfoExamples)||!result.worldInfoBefore.includes('42'))throw new Error('native world info output schema');});
+  console.log('[native-stage] generate');
+  const helperGeneration=await page.evaluate(()=>(window as any).TavernHelper.generateRaw({user_input:'合成脚本请求',ordered_prompts:[{role:'user',content:'合成脚本请求'}],should_stream:false}));assert.equal(helperGeneration,'原助手合成模型结果');assert.equal(syntheticCalls,1);
+  assert.equal(context.chat[1].mes,'正文前 <%= 2 + 3 %> 正文后','display template must not overwrite authoritative story input');
+  await assert.rejects(()=>page.evaluate(()=>{(window as any).LiyuanTavern.chat[1].mes='forbidden story replacement';return (window as any).LiyuanTavern.save();}),/只保存派生变量/);
+  console.log('[native-stage] complete');
+  assert.deepEqual(errors,[]);http.sources.close();
+ }finally{await browser?.close();if(server?.listening){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}await rm(cwd,{recursive:true,force:true});}
+});
