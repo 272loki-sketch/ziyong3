@@ -6,6 +6,8 @@ import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { auditRepository } from '../scripts/check-repository-privacy.mjs';
 import { auditPublicationRange } from '../scripts/check-publication-range.mjs';
+// Keep the dedicated CI trust-boundary regressions in the existing privacy suite.
+import './privacy-ci.test.ts';
 
 const cli = resolve('scripts/check-publication-range.mjs');
 const zero = '0'.repeat(40);

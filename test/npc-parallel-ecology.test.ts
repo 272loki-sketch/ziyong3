@@ -80,7 +80,7 @@ test('participant mismatch reaches the single charged repair; illegal reports ne
    assert.equal(intake,2);assert.deepEqual(JSON.parse(prompt.repair.invalid_report),report);
    assert.equal(prompt.repair.errors.length,1);
    assert.match(prompt.repair.errors[0],/eventId="occ_zongmen_dabi_prep".*actorId="a".*participants=\["b","c","d","e"\]/);
-   assert.match(prompt.repair.errors[0],/不得.*凭空加入已有事件participants/);
+   assert.match(prompt.repair.errors[0],/该actor不在事件participants中/);
    assert.deepEqual(prompt.npc_parallel.candidates,sealed);
    const repaired=structuredClone(report);
    if(fix)repaired.npc_parallel_decisions[0].eventIds=['occ_jindi_collapse'];

@@ -179,6 +179,7 @@ export function TavernPluginsPanel({ toast, contextTick = 0, managerMode = false
 	const [managerId, setManagerId] = useState<TavernPluginId | null>(null);
 	const mounted = useRef(true);
 	const request = useRef(0);
+	const generation = useRef(0);
 	const actionRunning = useRef(false);
 	const refresh = useCallback(async (visible = false): Promise<TavernPluginsStatus> => {
 		const token = ++request.current;
@@ -190,47 +191,56 @@ export function TavernPluginsPanel({ toast, contextTick = 0, managerMode = false
 		} catch (cause) {
 			if (mounted.current && token === request.current) setError(messageOf(cause));
 			throw cause;
-		} finally { if (visible && mounted.current && token === request.current) setLoading(false); }
+		} finally { if (mounted.current && token === request.current) setLoading(false); }
 	}, []);
 	useEffect(() => {
 		mounted.current = true;
+		generation.current++;
+		actionRunning.current = false; setBusy(false); setManagerId(null);
 		void refresh(true).catch(() => {});
 		const poll = window.setInterval(() => { if (!actionRunning.current) void refresh().catch(() => {}); }, 10_000);
-		return () => { mounted.current = false; request.current++; window.clearInterval(poll); };
-	}, [contextTick, refresh]);
+		return () => { mounted.current = false; generation.current++; request.current++; window.clearInterval(poll); };
+	}, [contextTick, pluginId, refresh]);
 	const operate = async (id: TavernPluginId, fn: () => Promise<unknown>, text: string, activation = false) => {
 		if (actionRunning.current) return;
+		const navigation = generation.current;
 		actionRunning.current = true; setBusy(true);
 		try {
 			await fn();
+			if (!mounted.current || navigation !== generation.current) return;
 			window.dispatchEvent(new CustomEvent("liyuan:tavern-plugins-changed", { detail: { id } }));
 			try {
 				const next = await refresh(true);
+				if (!mounted.current || navigation !== generation.current) return;
 				const plugin = next.plugins.find((item) => item.id === id);
 				if (activation && plugin?.pendingActivation) toast("warning", "原文件候选已缓存，宿主忙碌时不会切换；等待空闲与原插件实测校验后激活。");
 				else toast("info", text);
 			} catch (cause) {
+				if (!mounted.current || navigation !== generation.current) return;
 				const message = messageOf(cause);
 				if (mounted.current) setError(`操作已提交，但插件状态刷新失败：${message}`);
 				toast("warning", `操作已提交；状态刷新失败，可点击“重新读取插件状态”重试：${message}`);
 			}
 		} catch (cause) {
+			if (!mounted.current || navigation !== generation.current) return;
 			const message = messageOf(cause);
 			if (mounted.current) setError(message);
 			toast("error", message);
-		} finally { actionRunning.current = false; if (mounted.current) setBusy(false); }
+		} finally { if (mounted.current && navigation === generation.current) { actionRunning.current = false; setBusy(false); } }
 	};
 	const closeManager = useCallback(() => setManagerId(null), []);
 	const openOriginal = async (plugin: TavernPluginInfo) => {
 		if (actionRunning.current) return;
+		const navigation = generation.current;
 		actionRunning.current = true; setBusy(true);
 		try {
 			const current = await refresh(true);
+			if (!mounted.current || navigation !== generation.current) return;
 			const verified = current.plugins.find(item => item.id === plugin.id);
 			if (!verified?.installed) throw new Error(`${plugin.name}当前未安装或完整性校验失败，未打开管理台。`);
 			if (onOpenOriginal) onOpenOriginal(verified); else setManagerId(verified.id);
-		} catch (cause) { toast("error", messageOf(cause)); }
-		finally { actionRunning.current = false; if (mounted.current) setBusy(false); }
+		} catch (cause) { if (mounted.current && navigation === generation.current) toast("error", messageOf(cause)); }
+		finally { if (mounted.current && navigation === generation.current) { actionRunning.current = false; setBusy(false); } }
 	};
 	const managerPlugin = status?.plugins.find((plugin) => plugin.id === managerId);
 	const disabled = busy || loading || !!error || storyBusy || !!status?.checking;

@@ -49,3 +49,27 @@ test('repaired JSONPatch projection receipt reuses before any realm or paid clai
  delete receipt.authorHistoryVersion;const legacyReceipt=structuredClone(receipt);
  await assert.rejects(()=>runtime.recoverMvu(),/NO_REALM/);assert.deepEqual(receipt,legacyReceipt);
 });
+
+test('historical MVU retry binds the target ancestor while guarding the captured branch head',async()=>{
+ const head:any={scopeKey:'scope',sourceEntryId:'reply',visibleEntryIds:['ancestor','reply'],chat:[
+  {__liyuanEntryId:'ancestor',is_user:false,__liyuanAuthorDelivery:'Synthetic complete ancestor'},
+  {__liyuanEntryId:'reply',is_user:false,__liyuanAuthorDelivery:'Synthetic complete current reply'},
+ ]};
+ const http:any={
+  host:{context:()=>head},boundSourceEntryId:undefined,internalPhase:undefined,mvuRecovery:undefined,
+  binding(){
+   const value=this.host.context();
+   if(this.boundSourceEntryId){const index=value.chat.findIndex((row:any)=>row.__liyuanEntryId===this.boundSourceEntryId);if(index<0)throw Error('target is not in current branch');return {...value,chat:value.chat.slice(0,index+1),sourceEntryId:this.boundSourceEntryId,visibleEntryIds:value.visibleEntryIds.slice(0,value.visibleEntryIds.indexOf(this.boundSourceEntryId)+1),scopeKey:'scope'};}
+   return {...value,scopeKey:'scope'};
+  },
+  assertBinding(scope:string,source:string){const current=this.binding();if(current.scopeKey!==scope||current.sourceEntryId!==source)throw Error('stale source/scope');if(this.mvuRecovery){const actual=this.host.context();if(actual.scopeKey!==this.mvuRecovery.head.scopeKey||actual.sourceEntryId!==this.mvuRecovery.head.sourceEntryId)throw Error('stale branch head');}return current;},
+  get turnSignal(){return this.signal;},set turnSignal(value:AbortSignal|undefined){this.signal=value;},
+ };
+ const runtime=new TavernPluginRuntime(http,()=>''),internals=runtime as any;let evaluated=0;
+ internals.ensure=async()=>({evaluate:async()=>{
+  evaluated++;assert.equal(http.binding().sourceEntryId,'ancestor');assert.equal(http.mvuRecovery.head.sourceEntryId,'reply');assert.equal(http.internalPhase,'after');
+  return {scopeKey:'scope',sourceEntryId:'ancestor',status:'updated'};
+ }});
+ const result=await runtime.recoverMvu(undefined,'ancestor');
+ assert.equal(result.status,'updated');assert.equal(evaluated,1);assert.equal(http.boundSourceEntryId,undefined);assert.equal(http.mvuRecovery,undefined);assert.equal(http.internalPhase,undefined);assert.equal(http.turnSignal,undefined);
+});

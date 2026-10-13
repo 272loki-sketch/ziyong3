@@ -9,8 +9,9 @@ export async function flushPluginFrame(frame: HTMLIFrameElement): Promise<void> 
 		LiyuanNpcParallel?: { flush?: () => Promise<void> };
 		LiyuanVeridisRewrite?: { flush?: () => Promise<void>; failed?: boolean; pending?: number };
 		LiyuanTavernPlugins?: { host?: { flush?: () => Promise<void> } };
+		LiyuanDatabasePluginHost?: { flush?: () => Promise<unknown> };
 	}) | null;
-	const host = hostWindow?.LiyuanNpcParallel ?? hostWindow?.LiyuanVeridisRewrite ?? hostWindow?.LiyuanTavernPlugins?.host;
+	const host = hostWindow?.LiyuanNpcParallel ?? hostWindow?.LiyuanVeridisRewrite ?? hostWindow?.LiyuanTavernPlugins?.host ?? hostWindow?.LiyuanDatabasePluginHost;
 	if (!host?.flush) {
 		// An inaccessible/loading canvas has never been offered for editing.
 		if (frame.getAttribute("aria-hidden") === "true") return;
@@ -22,12 +23,12 @@ export async function flushPluginFrame(frame: HTMLIFrameElement): Promise<void> 
 	} while ("pending" in host && typeof host.pending === "number" && host.pending > 0);
 }
 
-export function usePluginLeave(root: RefObject<HTMLElement | null>, contextTick: number, waitMs = 15_000) {
+export function usePluginLeave(root: RefObject<HTMLElement | null>, contextTick: number | string, waitMs = 15_000) {
 	const parentLeave = useContext(PluginLeaveContext);
 	const epoch = useRef(0);
 	const currentContext = useRef(contextTick);
 	currentContext.current = contextTick;
-	type Attempt = { next: () => void; frame: HTMLIFrameElement; document: Document | null; tick: number; token: number; restore: () => void; failed: boolean };
+	type Attempt = { next: () => void; frame: HTMLIFrameElement; document: Document | null; tick: number | string; token: number; restore: () => void; failed: boolean };
 	const attempt = useRef<Attempt | null>(null);
 	const [pending, setPending] = useState(false);
 	const [error, setError] = useState("");

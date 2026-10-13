@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { auditRepository } from '../scripts/check-repository-privacy.mjs';
 import { approvedDocumentation, approvedBinary, isLocalRecord, contentCategories, pathCategory, MAX_FILE_BYTES } from '../scripts/public-repository-policy.mjs';
 
@@ -220,8 +221,8 @@ test('excluded upstream binary and host diagnostic reject before file or snapsho
     put(path, token);
   }
   assert.equal(pathCategory('packages/coding-agent/examples/extensions/doom-overlay/doom/build/other.wasm', true), null);
-  assert.equal(pathCategory('packages/sdk/PUBLICATION.md', true), null);
-  assert.equal(isLocalRecord('packages/sdk/PUBLICATION.md'), false);
+  assert.equal(pathCategory('packages/sdk/PUBLICATION.md', true), 'local-record');
+  assert.equal(isLocalRecord('packages/sdk/PUBLICATION.md'), true);
   git('add', '-f', '--', ...entries.map(e => e.path));
   git('commit', '-qm', 'Synthetic excluded publication paths');
   const oid = git('rev-parse', `:${entries[0].path}`);
@@ -279,7 +280,7 @@ test('path allowlist rejects private segments, new assets, presets and diagnosti
   for (const path of ['src/.rp-state/a', 'web/.pi/a', 'docs/.local/a', 'src/data/a', 'src/node_modules/a', 'web/screenshots/a', 'src/a.json.tmp-123', 'src/a.bak', 'test/.env.example', '.liyuan/settings.json', 'liyuan.agent.json', 'assets/cards/private.json', 'presets/new.json', 'scripts/probe-private.mjs', 'scripts/local-audit.mjs']) {
     assert.notEqual(pathCategory(path, true), null, path);
   }
-  for (const path of ['README.md', 'AGENTS.md', 'CLAUDE.md', 'TESTING.md', 'LICENSE', 'src/a.ts', 'server/main.ts', 'docs/GENERATION-MODES.md', 'packages/sdk/docs/guide.md', '.liyuan/extensions/roleplay.ts', 'assets/cards/default_Qingwu.json', 'presets/\u9ed8\u8ba4.json']) assert.equal(pathCategory(path, true), null, path);
+  for (const path of ['README.md', 'AGENTS.md', 'CLAUDE.md', 'TESTING.md', 'LICENSE', 'src/a.ts', 'server/main.ts', 'docs/GENERATION-MODES.md', 'packages/coding-agent/docs/sdk.md', '.liyuan/extensions/roleplay.ts', 'assets/cards/default_Qingwu.json', 'presets/\u9ed8\u8ba4.json']) assert.equal(pathCategory(path, true), null, path);
   assert.notEqual(pathCategory('scripts/probe-backstage.mjs', false), null);
   assert.equal(pathCategory('scripts/probe-backstage.mjs', true), null);
 });
@@ -363,4 +364,44 @@ test('high-confidence content rules scan entire text and exact placeholders only
   assert.deepEqual(scan(old, 'test/web-research.test.ts'), []);
   assert.deepEqual(scan(old + 'X', 'test/web-research.test.ts'), ['credential-token']);
   assert.deepEqual(scan(old, 'test/new.test.ts'), ['credential-token']);
+});
+
+test('Markdown and session records cannot use public source directories as approval', t => {
+  const { dir, put, git, audit } = fixture(t);
+  const paths = ['src/story.md', 'server/AUDIT.md', 'web/notes.MD', 'deploy/RELEASE.md',
+    'scripts/report.mdx', '.github/handoff.markdown', 'packages/coding-agent/docs/new.md',
+    'skills/private/SKILL.md', 'skills/主作者正文边界/nested/SKILL.md',
+    'test/story.jsonl', 'src/story.txt', 'web/story.pdf', 'packages/coding-agent/test/fixtures/new-session.jsonl'];
+  for (const path of paths) {
+    assert.equal(pathCategory(path, true), 'local-record', path);
+    put(path, token);
+  }
+  git('add', '--', ...paths);
+  git('commit', '-qm', 'Synthetic records');
+  const oid = git('rev-parse', `HEAD:${paths[0]}`);
+  rmSync(join(dir, '.git/objects', oid.slice(0, 2), oid.slice(2)));
+  for (const path of paths) { rmSync(join(dir, path)); mkdirSync(join(dir, path)); }
+  assert.equal(audit().scanned, 0);
+  for (const args of [['--staged'], ['--commit', 'HEAD']]) {
+    const result = audit(...args);
+    assert.equal(result.scanned, 0);
+    assert.equal(result.findings.length, paths.length);
+    assert.equal(result.findings.every(f => f.category === 'local-record'), true);
+  }
+  for (const path of ['skills/主作者正文边界/SKILL.md', 'packages/coding-agent/examples/extensions/subagent/agents/scout.md',
+    'packages/coding-agent/test/fixtures/skills/nested/child-skill/SKILL.md',
+    'packages/coding-agent/test/fixtures/large-session.jsonl']) assert.equal(pathCategory(path, true), null, path);
+  assert.equal(pathCategory('skills/主作者正文边界/story.json', true), 'unapproved-skill');
+});
+
+
+test('CI checker is included by source ignore policy and only exact installer URL fixtures are public', () => {
+  const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
+  const ignored = spawnSync('git', ['-c', `safe.directory=${root}`, 'check-ignore', '--no-index', 'scripts/check-privacy-ci.mjs'], { cwd: root, encoding: 'utf8' });
+  assert.equal(ignored.status, 1, 'trusted CI runner must not disappear from clean checkout/export');
+  assert.equal(pathCategory('scripts/check-privacy-ci.mjs', true), null);
+  const credentialUrl = ['https://synthetic-user', 'synthetic-secret@example.invalid/other.git'].join(':');
+  assert.deepEqual(contentCategories(Buffer.from(credentialUrl), 'test/deploy-install-safety.test.ts', true), []);
+  assert.deepEqual(contentCategories(Buffer.from(credentialUrl), 'src/not-a-fixture.ts', true), ['credential-url']);
+  assert.deepEqual(contentCategories(Buffer.from(credentialUrl.replace('example.invalid', 'unexpected.invalid')), 'test/deploy-install-safety.test.ts', true), ['credential-url']);
 });

@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { resolve, parse, relative, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { auditRepository } from './check-repository-privacy.mjs';
-import { approvedBinary, MAX_FILE_BYTES } from './public-repository-policy.mjs';
+import { approvedBinary, contentCategories, MAX_FILE_BYTES } from './public-repository-policy.mjs';
 
 export function guard({ mode, cwd = process.cwd(), input = '', report = () => {} }) {
   let scanned = 0;
@@ -29,8 +29,29 @@ export function guard({ mode, cwd = process.cwd(), input = '', report = () => {}
   };
   const oid = value => /^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(value);
   const zero = value => /^0+$/.test(value);
-  const verify = value => {
+  const verify = (value, scanTags = false) => {
+    const seen = new Set();
+    while (git(['cat-file', '-t', value]).toString('ascii').trim() === 'tag') {
+      if (seen.has(value) || seen.size >= 32) throw new Error('invalid-endpoint');
+      seen.add(value);
+      const size = Number(git(['cat-file', '-s', value]).toString('ascii').trim());
+      if (!Number.isSafeInteger(size) || size > MAX_FILE_BYTES) throw new Error('size-limit');
+      const bytes = git(['cat-file', 'tag', value]);
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      if (scanTags) {
+        const message = text.indexOf('\n\n');
+        if (message < 0) throw new Error('invalid-endpoint');
+        const categories = new Set([...contentCategories(bytes, '', false),
+          ...contentCategories(Buffer.from(text.slice(message + 2)), '', false)]);
+        for (const category of categories) emit(category);
+        scanned++;
+      }
+      const target = /^object ([0-9a-f]{40}|[0-9a-f]{64})\n/.exec(text)?.[1];
+      if (!target || target.length !== value.length) throw new Error('invalid-endpoint');
+      value = target;
+    }
     if (git(['rev-parse', '--verify', '--end-of-options', `${value}^{commit}`]).toString('ascii').trim() !== value) throw new Error('invalid-endpoint');
+    return value;
   };
   try {
     if (!['pre-commit', 'pre-push'].includes(mode)) throw new Error('invalid-arguments');
@@ -46,11 +67,12 @@ export function guard({ mode, cwd = process.cwd(), input = '', report = () => {}
           || !fields[0] || !fields[2] || /[\x00-\x20\x7f]/.test(fields[0] + fields[2])) throw new Error('invalid-push-input');
         const [, local, , remote] = fields;
         if (zero(local)) continue;
-        verify(local);
+        const localCommit = verify(local, true);
+        let remoteCommit;
         if (zero(remote)) {
           if (shallow) throw new Error('shallow-history');
-        } else verify(remote); // Missing remote objects fail; never fetch from a hook.
-        const range = git(['rev-list', local, ...(zero(remote) ? [] : [`^${remote}`]), '--']).toString('ascii').trim();
+        } else remoteCommit = verify(remote); // Missing remote objects fail; never fetch from a hook.
+        const range = git(['rev-list', localCommit, ...(remoteCommit ? [`^${remoteCommit}`] : []), '--']).toString('ascii').trim();
         for (const commit of range ? range.split('\n') : []) {
           if (!oid(commit)) throw new Error('invalid-manifest');
           if (boundaries.has(commit)) throw new Error('shallow-history');

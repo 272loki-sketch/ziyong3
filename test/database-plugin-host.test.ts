@@ -6,7 +6,7 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../web/public/database-plugin-host.js", import.meta.url), "utf8");
 
 /** Exercises the host lifecycle without importing upstream bytes, private data or a browser. */
-function hostFixture(view: string, options: { open?: () => Promise<boolean>; stateSave?: () => Promise<any>; contextError?: boolean; legacyOpen?: boolean; scriptLoadFailure?: boolean; standalone?: boolean; binding?: {scopeKey:string;sourceEntryId:string;sha256:string}; context?: Record<string, unknown>; intercept?: (params: any) => any; suppressGeneration?: boolean; modelError?: string; generateHook?: (params:any, window:any, capture:(params:any)=>Promise<string>)=>Promise<unknown> } = {}) {
+function hostFixture(view: string, options: { open?: () => Promise<boolean>; stateSave?: () => Promise<any>; contextError?: boolean; legacyOpen?: boolean; scriptLoadFailure?: boolean; standalone?: boolean; binding?: {scopeKey:string;sourceEntryId:string;sha256:string}; context?: Record<string, unknown>; contextResponse?: () => Record<string, unknown>; intercept?: (params: any) => any; suppressGeneration?: boolean; modelError?: string; generateHook?: (params:any, window:any, capture:(params:any)=>Promise<string>)=>Promise<unknown> } = {}) {
 	const messages: Array<{ type: string; message?: string }> = [];
 	const elements = new Map<string, any>();
 	const polls: Array<() => Promise<void>> = [];
@@ -25,7 +25,7 @@ function hostFixture(view: string, options: { open?: () => Promise<boolean>; sta
 			if ((path.endsWith("/completion") || path.endsWith("/generate")) && options.modelError) return new Response(JSON.stringify({error:options.modelError}),{status:400,headers:{"content-type":"application/json"}});
 			if (path.endsWith("/binding")) return { ok: true, json: async () => ({ ...(options.binding ?? { scopeKey: "fixture-scope", sourceEntryId: "a-1", sha256: "verified-fixture-source" }) }) };
 			if (options.contextError) throw new Error("合成登录已失效");
-			return { ok: true, json: async () => ({ scopeKey: "fixture-scope", sourceEntryId: "a-1", revision: 0, scope: { sessionId: "fixture-session" }, chat: [], chatMetadata: {}, extensionSettings: {}, worldbooks: { Fixture: { entries: [] } }, primaryBook: "Fixture", character: { name: "合成人物" }, userName: "合成用户", ...options.context }) };
+			return { ok: true, json: async () => ({ scopeKey: "fixture-scope", sourceEntryId: "a-1", revision: 0, scope: { sessionId: "fixture-session" }, chat: [], chatMetadata: {}, extensionSettings: {}, worldbooks: { Fixture: { entries: [] } }, primaryBook: "Fixture", character: { name: "合成人物" }, userName: "合成用户", ...(options.contextResponse?.() ?? options.context) }) };
 		},
 	};
 	if (options.standalone) { window.postMessage = window.parent.postMessage; window.parent = window; }
@@ -158,6 +158,27 @@ function upstreamSettings(f: ReturnType<typeof hostFixture>) {
 	assert.equal(typeof namespace[globalMetaKey], "string");
 	return { extensionSettings, namespace, profile: JSON.parse(namespace[profileSettingsKey]), globalMeta: JSON.parse(namespace[globalMetaKey]) };
 }
+
+test("database sync removes stale chat metadata without detaching upstream references", async () => {
+ const initial = { chatMetadata: { retained: { value: "old" }, stale: { value: "must disappear" } } };
+ const f = hostFixture("?view=manager", { context: initial, contextResponse: () => ({ chatMetadata: { retained: { value: "new" } } }) }); await settled(f);
+ const context = f.window.SillyTavern.getContext(), metadata = context.chatMetadata;
+ await f.window.LiyuanDatabasePluginHost.sync();
+ assert.equal(context.chatMetadata, metadata, "the original plugin may retain its metadata object");
+ assert.deepEqual(JSON.parse(JSON.stringify(metadata.retained)), { value: "new" });
+ assert.equal(metadata.stale, undefined, "keys removed by the authoritative context must not survive locally");
+ await context.saveChat();
+ assert.deepEqual(JSON.parse(JSON.stringify(f.savedStates.at(-1).chatMetadata.retained)), { value: "new" });
+ assert.equal(f.savedStates.at(-1).chatMetadata.stale, undefined, "a later save must not resurrect deleted metadata");
+});
+
+test("database sync refuses a new branch even when session/card scope is unchanged", async () => {
+ let sourceEntryId = "a-1";
+ const f = hostFixture("?view=manager", { contextResponse: () => ({ sourceEntryId }) }); await settled(f);
+ sourceEntryId = "branch-b-reply";
+ await assert.rejects(f.window.LiyuanDatabasePluginHost.sync(), /分支需重新载入/);
+ assert.equal(JSON.stringify(f.window.LiyuanDatabasePluginHost.binding()), JSON.stringify({ scopeKey: "fixture-scope", sourceEntryId: "a-1" }), "old manager must not silently adopt another branch");
+});
 
 test("database host: managed 3.8 fill/recall presets bootstrap original settings with host-managed credentials", async () => {
 	// These synthetic credential sentinels must never be copied into upstream settings.

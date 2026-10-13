@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api.ts";
+import { PluginLeaveError, usePluginLeave } from "../plugins/usePluginLeave.tsx";
 import { IconClose, IconRefresh } from "./icons.tsx";
 import "./DatabasePluginManager.css";
 
@@ -19,6 +20,10 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 	const closeRef = useRef<HTMLButtonElement>(null);
 	const viewRef = useRef(view);
 	viewRef.current = view;
+	const frameVisible = !!view.binding && ["loading", "ready"].includes(view.phase);
+	const frameKey = `${attempt}:${frameVisible ? keyOf(view.binding!) : "unbound"}`;
+	// Only replacing the bound frame invalidates its leave confirmation; a same-source status tick does not.
+	const { leave, pending: leaving, error: leaveError, discard } = usePluginLeave(dialogRef, frameKey);
 
 	useEffect(() => {
 		const previous = document.activeElement;
@@ -104,7 +109,7 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 		if (becameIdle) { setView({ phase: "checking" }); setAttempt(value => value + 1); }
 	}, [busy]);
 
-	const refresh = () => { setView({ phase: "checking" }); setAttempt(value => value + 1); };
+	const refresh = () => leave(() => { setView({ phase: "checking" }); setAttempt(value => value + 1); });
 	const runHost = async (method: "openTables" | "refreshTables") => {
 		try {
 			const host = (frameRef.current?.contentWindow as (Window & { LiyuanDatabasePluginHost?: Record<string, () => Promise<unknown>> }) | null)?.LiyuanDatabasePluginHost;
@@ -113,27 +118,33 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 		} catch (error) { setFeedback({ kind: "error", message: error instanceof Error ? error.message : "原表格操作失败" }); }
 	};
 	const readOnly = busy || view.binding?.streaming === true;
-	const frameVisible = !!view.binding && ["loading", "ready"].includes(view.phase);
+	const frameInert = readOnly || leaving || view.phase !== "ready";
+	useLayoutEffect(() => {
+		// Reconcile current read-only policy after the shared hook restores its pre-save inert snapshot.
+		if (frameRef.current) frameRef.current.inert = frameInert;
+	}, [frameInert, leaving, frameKey]);
 	const src = view.binding ? `/database-plugin-host.html?view=manager&scopeKey=${encodeURIComponent(view.binding.scopeKey)}&sourceEntryId=${encodeURIComponent(view.binding.sourceEntryId)}&hostSource=${encodeURIComponent(view.binding.sha256)}` : "";
 
 	return <div ref={dialogRef} className="database-manager-backdrop">
-	<div className="database-manager" role="dialog" aria-modal="true" aria-label="数据库管理台" onKeyDown={event => { if (event.key === "Escape") { event.stopPropagation(); onClose(); } }}>
+	<div className="database-manager" role="dialog" aria-modal="true" aria-label="数据库管理台" onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); leave(onClose); } }}>
 		<header className="database-manager__header">
 			<div className="database-manager__heading"><h2>数据库管理台</h2><span>原插件完整前端 · 当前会话／角色卡／分支</span></div>
 			<div className="database-manager__actions">
-				<button type="button" disabled={view.phase !== "ready" || readOnly} onClick={() => { void runHost("openTables"); }}>实时表格</button>
-				<button type="button" disabled={view.phase !== "ready" || readOnly} onClick={() => { void runHost("refreshTables"); }}>刷新表格</button>
-				<button type="button" onClick={refresh} title="重新加载会丢弃尚未保存的原插件草稿"><IconRefresh size={16} />刷新</button>
+				<button type="button" disabled={view.phase !== "ready" || readOnly || leaving} onClick={() => { void runHost("openTables"); }}>实时表格</button>
+				<button type="button" disabled={view.phase !== "ready" || readOnly || leaving} onClick={() => { void runHost("refreshTables"); }}>刷新表格</button>
+				<button type="button" disabled={leaving} onClick={refresh} title="重新加载会丢弃尚未保存的原插件草稿"><IconRefresh size={16} />刷新</button>
 				<a href="/database-plugin-host.html?view=manager" target="_blank" rel="noopener noreferrer">独立打开</a>
-				<button ref={closeRef} type="button" onClick={onClose} aria-label="返回对话"><IconClose size={16} />返回对话</button>
+				<button ref={closeRef} type="button" disabled={leaving} onClick={() => leave(onClose)} aria-label="返回对话"><IconClose size={16} />返回对话</button>
 			</div>
 		</header>
 		<div className="database-manager__hint">人物、纪要：原「填表工作台」→「可视化表格编辑器」。首次填表前可能为空，可在原「数据管理」导入；不会自动收费重填全历史。梨园模型预设复用现有连接，密钥由服务端管理。</div>
 		{view.enabled === false && <div className="database-manager__notice">当前自动记忆后端未启用，管理数据仍保留；可在设置→上游数据库插件启用。</div>}
 		{readOnly && <div className="database-manager__notice" role="status">正文正在生成，管理台暂时只读，生成结束后可继续操作。</div>}
 		{feedback && <div className="database-manager__notice" role={feedback.kind === "error" ? "alert" : "status"}>{feedback.message}</div>}
+		{leaving && <div className="database-manager__notice" role="status">正在等待原数据库设置保存确认…</div>}
+		<PluginLeaveError error={leaveError} discard={discard} />
 		<div className="database-manager__body">
-			{frameVisible && <iframe ref={frameRef} key={`${attempt}:${keyOf(view.binding!)}`} title="原数据库插件管理台" inert={readOnly} src={src} />}
+			{frameVisible && <iframe ref={frameRef} key={frameKey} title="原数据库插件管理台" aria-hidden={view.phase !== "ready"} inert={frameInert} src={src} />}
 			{view.phase !== "ready" && <div className="database-manager__state" role={view.phase === "error" ? "alert" : "status"}>
 				{view.phase === "checking" || view.phase === "loading" ? <p>{progress}</p> : view.phase === "missing" ? <><h3>尚未安装已核验的数据库源码</h3><p>请在设置→上游数据库插件安装固定版本，再打开管理台。不会自动下载未知版本。</p></> : <><h3>数据库管理台未能打开</h3><p>{view.error}</p></>}
 				{(view.phase === "error" || view.phase === "missing") && <button type="button" onClick={refresh}>重新读取／重试</button>}

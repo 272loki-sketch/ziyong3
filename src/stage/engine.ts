@@ -1203,6 +1203,36 @@ export class StageEngine {
 		}
 	}
 
+	async #recoverPendingDatabaseMemory(sm: StageSessionManager, ev: StageEvents, stable: (anchor: string | null) => boolean): Promise<void> {
+		const provider = this.#deps.databasePluginMemory;
+		if (!provider?.enabled()) return;
+		const branch = sm.getBranch() as BranchEntryLike[];
+		const receipt = [...branch].reverse().find(e => e.customType === "rp-database-memory")?.data as { sourceEntryId?: string; status?: string } | undefined;
+		if (receipt?.status !== "pending") return;
+		const source = branch.find(e => e.id === receipt.sourceEntryId && e.type === "message" && e.message?.role === "assistant");
+		const details = source?.message?.details as Record<string, unknown> | undefined;
+		const workflow = details?.rpGenerationWorkflow as GenerationWorkflow | undefined;
+		if (!receipt.sourceEntryId || source?.message?.stopReason !== "stop" ||
+			typeof details?.rpNarrative !== "string" || !details.rpNarrative.trim() ||
+			(workflow?.recovery && workflow.recovery.status !== "success"))
+			throw Error("数据库恢复来源不是当前分支已保存的完整正文；输入未受理");
+		const anchor = sm.getLeafId();
+		if (this.#abort?.signal.aborted || !stable(anchor)) throw Error("数据库恢复已取消或来源改变");
+		ev.onActivity?.("仅补办已保存正文的数据库记忆整理，不重写正文或重复已完成领域");
+		await provider.after(receipt.sourceEntryId, this.#abort?.signal);
+		if (this.#abort?.signal.aborted || !stable(anchor)) throw Error("数据库恢复已取消或来源改变");
+		sm.appendCustomEntry("rp-database-memory", { sourceEntryId: receipt.sourceEntryId, status: "complete", recovered: true });
+		const settlement = [...branch].reverse().find(e => e.customType === "rp-turn-settlement" &&
+			(e.data as { narrativeEntryId?: string } | undefined)?.narrativeEntryId === receipt.sourceEntryId)?.data as Record<string, unknown> | undefined;
+		if (settlement) {
+			const degraded = (Array.isArray(settlement.degradedDomains) ? settlement.degradedDomains : []).filter(domain => domain !== "memory");
+			const complete = settlement.ledgerDone && settlement.worldDone && settlement.ecologyDone && settlement.presentationDone;
+			sm.appendCustomEntry("rp-turn-settlement", { ...settlement, degradedDomains: degraded,
+				status: !degraded.length && complete ? "complete" : settlement.status, recovered: true });
+		}
+		sm.flush();
+	}
+
 	async retryPendingSettlement(): Promise<StageTurnEndInfo> {
 		if(this.#busy)return {aborted:false,error:"正在生成，请先等待或停止"};
 		const sm=this.#deps.getSessionManager(),sessionId=sm.getSessionId(),ev=this.#deps.events??{};
@@ -1212,20 +1242,7 @@ export class StageEngine {
 		try {
 			const materials=loadStageMaterials(this.#deps.cwd);
 			const stable=(anchor:string|null)=>this.#deps.getSessionManager()===sm&&sm.getSessionId()===sessionId&&turnLeafIsStable(sm,anchor)&&loadStageConfig(this.#deps.cwd).card===materials.config.card;
-			if(this.#deps.databasePluginMemory?.enabled()){
-				const branch=sm.getBranch() as BranchEntryLike[];
-				const receipt=[...branch].reverse().find(e=>e.customType==="rp-database-memory")?.data as {sourceEntryId?:string;status?:string}|undefined;
-				if(receipt?.status==="pending"&&receipt.sourceEntryId){
-					const anchor=sm.getLeafId();
-					ev.onActivity?.("仅补办已保存正文的数据库记忆整理，不重写正文或重复已完成领域");
-					await this.#deps.databasePluginMemory.after(receipt.sourceEntryId,this.#abort.signal);
-					if(this.#abort.signal.aborted||!stable(anchor))throw Error("数据库恢复已取消或来源改变");
-					sm.appendCustomEntry("rp-database-memory",{sourceEntryId:receipt.sourceEntryId,status:"complete",recovered:true});
-					const settlement=[...branch].reverse().find(e=>e.customType==="rp-turn-settlement"&&(e.data as {narrativeEntryId?:string})?.narrativeEntryId===receipt.sourceEntryId)?.data as Record<string,unknown>|undefined;
-					if(settlement){const degraded=(Array.isArray(settlement.degradedDomains)?settlement.degradedDomains:[]).filter(x=>x!=="memory");sm.appendCustomEntry("rp-turn-settlement",{...settlement,degradedDomains:degraded,status:degraded.length?settlement.status:settlement.ledgerDone&&settlement.worldDone&&settlement.ecologyDone&&settlement.presentationDone?"complete":settlement.status,recovered:true});}
-					sm.flush();
-				}
-			}
+			await this.#recoverPendingDatabaseMemory(sm, ev, stable);
 			await this.#recoverPendingTurn(materials,sm,ev,stable,obs);
 		}
 		catch(e){result={aborted:!!this.#abort?.signal.aborted,error:e instanceof Error?e.message:String(e)};ev.onNotify?.("error",result.error??"恢复失败");}
@@ -1570,6 +1587,7 @@ export class StageEngine {
 		let databaseMemorySettled = false;
 		let tavernPluginsSettled = false;
 
+		await this.#recoverPendingDatabaseMemory(sm, ev, stableLeaf);
 		if (generationMode) await this.#recoverPendingTurn(materials, sm, ev, stableLeaf, observation("settlement.recovery"));
 		if (generationMode && nativeTavernPlugins) {
 			const previous = [...(sm.getBranch() as BranchEntryLike[])].reverse().find(e => e.customType === "rp-tavern-plugin-settlement")?.data as {entryId?:string;status?:string}|undefined;
@@ -1665,11 +1683,6 @@ export class StageEngine {
 		const { lastUserText, lastNarrativeText } = rebuiltHistory;
 		const history = databasePluginEnabled ? rebuiltHistory.history.slice(-this.#deps.databasePluginMemory!.recentHistoryMessages()) : rebuiltHistory.history;
 		const summary = rebuiltHistory.summary; // Legacy branch summaries remain read-only migration evidence; no old summary model continues running.
-		if (databasePluginEnabled) {
-			const receipts = branch.filter(e => e.type === "custom" && e.customType === "rp-database-memory").map(e => e.data as { sourceEntryId?: string; status?: string });
-			const latest = receipts.at(-1);
-			if (latest?.status === "pending" && latest.sourceEntryId) { const anchor = sm.getLeafId(); await this.#deps.databasePluginMemory!.after(latest.sourceEntryId, this.#abort?.signal); if (this.#abort?.signal.aborted || !stableLeaf(anchor)) throw new Error("数据库恢复已取消或来源改变"); sm.appendCustomEntry("rp-database-memory", {sourceEntryId:latest.sourceEntryId,status:"complete"}); sm.flush(); }
-		}
 		const literaryProfile = generationMode ? undefined : literaryProfileFromBranch(branch);
 		const committedEcology = literaryEcologyFromBranch(branch);
 		let literaryEcology: ReturnType<typeof literaryEcologyFromBranch> = committedEcology;

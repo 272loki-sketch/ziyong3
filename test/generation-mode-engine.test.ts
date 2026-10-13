@@ -441,6 +441,61 @@ test("原数据库失败不重写已保存故事：留下pending并在下一拍�
 	try{await f.engine.performTurn("收下钥匙。");const saved=replies(f.sm)[0];assert.equal(saved.message.details.rpNarrative,first);assert.ok(f.sm.getBranch().some((e:any)=>e.customType==="rp-database-memory"&&e.data.status==="pending"));await f.engine.performTurn("核对约定。");assert.equal(replies(f.sm).length,2);assert.deepEqual(ids.slice(0,2),[saved.id,saved.id]);assert.equal(ids.length,3);assert.equal(f.sm.getBranch().find((entry:any)=>entry.id===saved.id)?.message.details.rpNarrative,first);assert.deepEqual(f.sm.getBranch().filter((entry:any)=>entry.type==="message"&&entry.message.role==="user").map((entry:any)=>promptMessageText(entry.message)),["收下钥匙。","核对约定。"]);}finally{f.cleanup()}
 });
 
+for (const mode of ["direct", "director"] as const) test(`${mode}: database pending blocks the next input before persistence and ACK`, async () => {
+ let failing = true, accepted = 0;
+ const ended: any[] = [];
+ const first = "Synthetic saved first story.", second = "Synthetic saved second story.";
+ const script = mode === "direct" ? [{text:first}, {text:second}] : [...directorScript(first), ...directorScript(second)];
+ const f = fixture(mode, script, {events:{onTurnEnd:info=>ended.push(info)}, databasePluginMemory:{enabled:()=>true, before:async text=>pluginBeforeResult(text), after:async()=>{if(failing)throw Error("synthetic pending memory");}, recentHistoryMessages:()=>12}});
+ try {
+  await f.engine.performTurn("First synthetic input.");
+  const saved = replies(f.sm)[0], before = f.requests.length;
+  await f.engine.performTurn("Second synthetic input.", {clientMessageId:"blocked-database-input", onAccepted:()=>accepted++});
+  assert.equal(accepted, 0);
+  assert.match(ended.at(-1)?.error ?? "", /synthetic pending memory/);
+  assert.equal(f.requests.length, before, "no new author or already-completed domain is called");
+  assert.equal(replies(f.sm).length, 1);
+  assert.ok(!f.sm.getBranch().some((e:any)=>e.message?.role==="user"&&e.message.details?.rpClientMessageId==="blocked-database-input"));
+  assert.equal(replies(f.sm)[0].message.details.rpAuthorDraft, saved.message.details.rpAuthorDraft);
+  failing = false;
+  await f.engine.performTurn("Second synthetic input.", {clientMessageId:"blocked-database-input", onAccepted:()=>accepted++});
+  assert.equal(accepted, 1);
+  assert.equal(replies(f.sm).length, 2);
+ } finally { f.cleanup(); }
+});
+
+for (const sourceKind of ["missing", "user", "partial"] as const) test(`database recovery rejects ${sourceKind} source before requests`, async () => {
+ let afterCalls = 0;
+ const f = fixture("direct", [], {databasePluginMemory:{enabled:()=>true, before:async text=>pluginBeforeResult(text), after:async()=>{afterCalls++;}, recentHistoryMessages:()=>12}});
+ try {
+  let source = "synthetic-missing-entry";
+  if (sourceKind !== "missing") source = f.sm.appendMessage({role:sourceKind === "user" ? "user" : "assistant", content:[{type:"text",text:"Synthetic partial input."}], stopReason:"aborted", details:{rpNarrative:"Synthetic partial story."}} as never);
+  f.sm.appendCustomEntry("rp-database-memory", {sourceEntryId:source,status:"pending"}); f.sm.flush();
+  const before = structuredClone(f.sm.getBranch());
+  const result = await f.engine.retryPendingSettlement();
+  assert.match(result.error ?? "", /完整正文/);
+  assert.equal(afterCalls, 0);
+  assert.deepEqual(f.sm.getBranch(), before);
+ } finally { f.cleanup(); }
+});
+
+for (const change of ["cancel", "branch", "card"] as const) test(`explicit database recovery discards late ${change} completion`, async () => {
+ let f: ReturnType<typeof fixture>, fail = true;
+ f = fixture("direct", [{text:"Synthetic saved complete story."}], {databasePluginMemory:{enabled:()=>true, before:async text=>pluginBeforeResult(text), after:async()=>{
+  if(fail)throw Error("synthetic first failure");
+  if(change==="cancel") f.engine.abort();
+  if(change==="branch") f.sm.branch((f.sm.getBranch().find((e:any)=>e.message?.role==="user") as any).id);
+  if(change==="card") writeFileSync(join(f.cwd,"liyuan.config.json"),JSON.stringify({card:"other.json",generationMode:"direct"}));
+ },recentHistoryMessages:()=>12}});
+ try {
+  await f.engine.performTurn("First synthetic input.");const anchor=f.sm.getLeafId();fail=false;
+  const result=await f.engine.retryPendingSettlement();assert.match(result.error ?? "", /取消或来源改变/);
+  if(change==="branch") f.sm.branch(anchor);
+  assert.equal(replies(f.sm).length,1);
+  assert.equal(f.sm.getBranch().filter((e:any)=>e.customType==="rp-database-memory"&&e.data.status==="complete").length,0);
+ } finally { f.cleanup(); }
+});
+
 test("显式恢复仅数据库pending：失败保留收据，成功不重复正文或已完成领域",async()=>{
  let fail=true,afterCalls=0;
  const f=fixture("direct",[{text:"合成完整正文。"+"两人继续确认安排。".repeat(25)}],{databasePluginMemory:{enabled:()=>true,before:async text=>pluginBeforeResult(text),after:async()=>{afterCalls++;if(fail)throw Error("synthetic memory failure")},recentHistoryMessages:()=>12}});

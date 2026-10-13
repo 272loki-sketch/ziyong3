@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { getEventListeners } from 'node:events';
+import { EventEmitter, getEventListeners } from 'node:events';
+import { Server } from 'node:http';
+import { PassThrough } from 'node:stream';
+import { chromium } from 'playwright';
 import { NpcParallelRuntime, npcWaitForPage, type NpcParallelRunInput, type NpcParallelSourceLike } from '../server/npc-parallel-runtime.ts';
 
 const candidate = {
@@ -125,4 +128,112 @@ test('receipt polling returns on readiness and preserves its timeout error', asy
   await npcWaitForPage(async () => true, 1000, 'receipt missing', controller.signal);
   await assert.rejects(npcWaitForPage(async () => false, 1, 'synthetic receipt missing', controller.signal), /synthetic receipt missing/);
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('runtime drains actual HTTP generations before releasing its identity lock', { timeout: 5000 }, async t => {
+  for (const mode of ['normal', 'cancel', 'timeout', 'reset', 'close'] as const) {
+    await t.test(mode, async t => {
+      let server!: Server;
+      let timeout!: () => void;
+      const realTimeout = globalThis.setTimeout;
+      t.mock.method(globalThis, 'setTimeout', (callback: () => void, ms: number, ...args: unknown[]) => {
+        if (ms === 15 * 60 * 1000) {
+          timeout = callback;
+          return realTimeout(() => {}, ms);
+        }
+        return realTimeout(callback, ms, ...args);
+      });
+      // No sockets, browser process, upstream assets or production data are used.
+      t.mock.method(Server.prototype, 'listen', function (this: Server, ...args: unknown[]) {
+        server = this;
+        (args.at(-1) as () => void)();
+        return this;
+      });
+      t.mock.method(Server.prototype, 'address', () => ({ address: '127.0.0.1', family: 'IPv4', port: 12345 }));
+      let token = '';
+      const page = {
+        setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, on() {},
+        async goto() {
+          const response = new EventEmitter() as any;
+          response.writeHead = () => {};
+          response.end = (body: Buffer) => { token = JSON.parse(body.toString()).jobToken; };
+          server.emit('request', { url: '/api/npc-parallel/context', method: 'GET', headers: {} }, response);
+          await delay(0);
+        },
+        async evaluate(fn: () => unknown) {
+          const code = String(fn);
+          if (code.includes('emitReceived')) {
+            for (let index = 0; index < 2; index++) {
+              const request = new PassThrough() as any;
+              Object.assign(request, { url: '/__npc-parallel-job/generate', method: 'POST', headers: {
+                origin: 'http://127.0.0.1:12345', 'content-type': 'application/json', 'x-liyuan-npc-parallel-job': token,
+              } });
+              const response = new EventEmitter() as any;
+              response.writeHead = () => {};
+              response.end = () => { response.writableEnded = true; };
+              server.emit('request', request, response);
+              request.end(JSON.stringify({ messages: [{ role: 'user', content: 'synthetic request' }], maxTokens: 4096 }));
+            }
+            await ready;
+            return;
+          }
+          if (code.includes('completion?.ready')) return mode === 'normal';
+          if (code.includes('snapshot()')) return {
+            sourceExtra: {}, sourceMes: 'synthetic body', completion: { saves: 1, edited: 1 }, status: '在场跳过 1',
+          };
+          return true;
+        },
+      };
+      let disposed = false;
+      const context = { async route() {}, async newPage() { return page; }, async close() { disposed = true; } };
+      t.mock.method(chromium, 'launch', async () => ({ async newContext() { return context; }, async close() {} }));
+      const controller = new AbortController();
+      const finishes: Array<(value: string) => void> = [];
+      const failures: Array<(error: Error) => void> = [];
+      let started!: () => void;
+      const ready = new Promise<void>(resolve => { started = resolve; });
+      const runtime = new NpcParallelRuntime({ assetsCwd: process.cwd(), sources: source });
+      let settled = false;
+      let modelSignal!: AbortSignal;
+      const running = runtime.run(base({ npcs: [{ name: 'synthetic npc' }], signal: controller.signal,
+        generate(_request, signal) {
+          modelSignal = signal!;
+          // Deliberately ignore abort until the test explicitly settles both callbacks.
+          return new Promise<string>((resolve, reject) => {
+            finishes.push(resolve); failures.push(reject);
+            if (finishes.length === 2) started();
+          });
+        },
+      }));
+      const outcome = running.then(value => { settled = true; return value; }, error => { settled = true; return error; });
+      await Promise.race([ready, outcome.then(result => { throw new Error(`runtime exited before generation: ${result}`); })]);
+      let management: Promise<void> | undefined;
+      let managementDone = false;
+      if (mode === 'cancel') controller.abort(new DOMException('synthetic cancellation', 'AbortError'));
+      if (mode === 'timeout') timeout();
+      if (mode === 'reset') management = runtime.reset();
+      if (mode === 'close') management = runtime.close();
+      if (management) void management.then(() => { managementDone = true; });
+      await delay(10);
+      assert.equal(settled, false);
+      assert.equal(runtime.busy(), true);
+      assert.equal(managementDone, false);
+      assert.equal(modelSignal.aborted, mode !== 'normal');
+      if (mode !== 'normal') assert.equal(disposed, true);
+      await assert.rejects(runtime.run(base()), /busy/);
+      finishes[0]('late synthetic content');
+      await delay(10);
+      assert.equal(settled, false);
+      assert.equal(runtime.busy(), true);
+      failures[1](new Error('late synthetic rejection'));
+      const result = await outcome;
+      if (mode === 'normal') assert.equal(result.calls, 2);
+      else assert.equal(result.name, mode === 'timeout' ? 'TimeoutError' : 'AbortError');
+      await management;
+      assert.equal(runtime.busy(), false);
+      if (mode === 'close') await assert.rejects(runtime.run(base()), /closed/);
+      else assert.equal((await runtime.run(base())).calls, 0);
+      await runtime.close();
+    });
+  }
 });

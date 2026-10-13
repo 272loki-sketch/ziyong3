@@ -17,6 +17,6 @@
 
 `world-backstage` 仓库使用 MIT License；若后续直接复制其实质代码，应保留原版权与许可证。当前整合为依据公开行为重新实现。
 
-Luker 提示词的固定来源、署名和 AGPL-3.0 许可见 [PROMPT-SOURCES](PROMPT-SOURCES.md)。原酒馆插件、MVU、NPC 与 Veridis 的来源/安装边界分别见 [TAVERN-PLUGINS](TAVERN-PLUGINS.md)、[MVU](MVU.md)、[NPC-PARALLEL](NPC-PARALLEL.md)、[VERIDIS-REWRITE](VERIDIS-REWRITE.md)；原许可和再分发限制不能被梨园许可替代。
+Luker 提示词的固定来源、署名和 AGPL-3.0-only 许可声明见 [PROMPT-SOURCES](PROMPT-SOURCES.md)。原酒馆插件、MVU、NPC 与 Veridis 的来源/安装边界分别见 [TAVERN-PLUGINS](TAVERN-PLUGINS.md)、[MVU](MVU.md)、[NPC-PARALLEL](NPC-PARALLEL.md)、[VERIDIS-REWRITE](VERIDIS-REWRITE.md)；原许可和再分发限制不能被梨园许可替代。
 
 权威边界、一拍流程与维护要点以 [架构](ARCHITECTURE-OVERVIEW.md)、[世界](PLAN-WORLD-ENGINE.md)、[生态](PLAN-LIVING-ECOLOGY.md) 为准。

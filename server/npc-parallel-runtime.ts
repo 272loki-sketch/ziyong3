@@ -289,6 +289,9 @@ export class NpcParallelRuntime {
   #active = false;
   #closed = false;
   #abort: AbortController | null = null;
+  #generations = new Set<Promise<string>>();
+  #runDone: Promise<void> | null = null;
+  #resetting = 0;
   #currentCandidate: NpcParallelCandidate | null = null;
 
   readonly options: { assetsCwd: string; sources: NpcParallelSourceLike };
@@ -298,23 +301,29 @@ export class NpcParallelRuntime {
     this.options = options;
   }
 
-  busy(): boolean { return this.#active; }
+  busy(): boolean { return this.#active || this.#resetting > 0; }
 
   /** Reusable realm reset for source activation/update hooks. */
   async reset(): Promise<void> {
-    this.#abort?.abort(new DOMException('NPC Parallel runtime reset', 'AbortError'));
-    await this.#disposeRuntime();
+    this.#resetting++;
+    try {
+      this.#abort?.abort(new DOMException('NPC Parallel runtime reset', 'AbortError'));
+      await this.#runDone;
+      await this.#disposeRuntime();
+    } finally {
+      this.#resetting--;
+    }
   }
 
   /** Terminal shutdown. Call reset() from source activation hooks so a later run remains possible. */
   async close(): Promise<void> {
     this.#closed = true;
     this.#abort?.abort(new DOMException('NPC Parallel runtime closed', 'AbortError'));
-    await this.#disposeRuntime();
+    await this.reset();
   }
 
   async run(input: NpcParallelRunInput): Promise<NpcParallelRunResult> {
-    if (this.#active) throw new Error('NPC Parallel runtime is busy');
+    if (this.busy()) throw new Error('NPC Parallel runtime is busy');
     if (this.#closed) throw new Error('NPC Parallel runtime is closed');
     if (!input || typeof input.guard !== 'function' || typeof input.generate !== 'function') throw new TypeError('NpcParallelRuntime.run requires guard and managed generate callbacks');
     if (!input.sessionId || !input.card || !input.sourceEntryId) throw new Error('NPC Parallel 缺少 session/card/source 绑定');
@@ -338,13 +347,16 @@ export class NpcParallelRuntime {
     }
     const identity = { sessionId: input.sessionId, card: input.card, sourceEntryId: input.sourceEntryId };
     this.#active = true;
+    let finishRun!: () => void;
+    this.#runDone = new Promise<void>(resolve => { finishRun = resolve; });
     this.#currentCandidate = candidate;
-    this.#abort = new AbortController();
+    const controller = new AbortController();
+    this.#abort = controller;
     let calls = 0;
     const errors: string[] = [];
     const jobToken = randomBytes(24).toString('base64url');
-    const hardTimer = setTimeout(() => this.#abort?.abort(new DOMException('NPC Parallel task timeout', 'TimeoutError')), MAX_RUN_MS);
-    const signals = [this.#abort.signal, ...(input.signal ? [input.signal] : [])];
+    const hardTimer = setTimeout(() => controller.abort(new DOMException('NPC Parallel task timeout', 'TimeoutError')), MAX_RUN_MS);
+    const signals = [controller.signal, ...(input.signal ? [input.signal] : [])];
     const signal = AbortSignal.any(signals);
     const safeError = (message: string) => {
       if (!errors.includes(message)) errors.push(message);
@@ -358,7 +370,7 @@ export class NpcParallelRuntime {
         throw new Error('NPC Parallel active source changed during the job');
       }
     };
-    const managedGenerate = async (request: NpcParallelGenerateRequest, requestSignal?: AbortSignal): Promise<string> => {
+    const generate = async (request: NpcParallelGenerateRequest, requestSignal?: AbortSignal): Promise<string> => {
       assertBound();
       if (calls >= MAX_CALLS) {
         safeError('NPC Parallel 单任务受管模型调用达到8次上限');
@@ -378,12 +390,14 @@ export class NpcParallelRuntime {
       calls++;
       const combined = requestSignal ? AbortSignal.any([signal, requestSignal]) : signal;
       try {
+        combined.throwIfAborted();
         const content = await input.generate({
           messages: [{ role: 'system', content: input.constraintText }, ...messages],
           maxTokens,
           ...(Number.isFinite(Number(request.temperature)) ? { temperature: Number(request.temperature) } : {}),
           ...(typeof request.purpose === 'string' ? { purpose: request.purpose.slice(0, 160) } : {}),
         }, combined);
+        combined.throwIfAborted();
         assertBound();
         if (typeof content !== 'string' || !content.trim()) throw new Error('受管模型返回空内容');
         return content;
@@ -394,6 +408,13 @@ export class NpcParallelRuntime {
         wrapped.name = combined.aborted ? (combined.reason?.name ?? 'AbortError') : 'Error';
         throw wrapped;
       }
+    };
+    const managedGenerate = (request: NpcParallelGenerateRequest, requestSignal?: AbortSignal): Promise<string> => {
+      // Register before invoking user code; an HTTP disconnect does not settle the model callback.
+      const task = Promise.resolve().then(() => generate(request, requestSignal));
+      this.#generations.add(task);
+      void task.then(() => this.#generations.delete(task), () => this.#generations.delete(task));
+      return task;
     };
     try {
       await this.#start(candidate, input, { chat, sourceIndex, worldbooks, roster, jobToken, managedGenerate, assertBound, signal });
@@ -409,6 +430,7 @@ export class NpcParallelRuntime {
         '原版插件没有完成保存/完成回执',
         signal,
       );
+      await Promise.allSettled(this.#generations);
       assertBound();
       const snapshot = await page.evaluate(() => (window as any).LiyuanNpcParallelHost.snapshot());
       const sourceEntry = isRecord(snapshot.sourceExtra) ? extractEntries(snapshot.sourceExtra) : [];
@@ -440,10 +462,15 @@ export class NpcParallelRuntime {
       throw error;
     } finally {
       clearTimeout(hardTimer);
+      controller.abort(new DOMException('NPC Parallel task finished', 'AbortError'));
       await this.#disposeRealm().catch(() => undefined);
+      // Never race drainage against a timeout: an uncooperative callback must retain the identity lock.
+      await Promise.allSettled(this.#generations);
       this.#active = false;
       this.#abort = null;
       this.#currentCandidate = null;
+      this.#runDone = null;
+      finishRun();
     }
   }
 
