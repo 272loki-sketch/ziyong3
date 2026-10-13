@@ -31,8 +31,49 @@ export const approvedDocumentation = new Set([
   'THIRD-PARTY-INSPIRATION.md', 'VERIDIS-REWRITE.md', 'WRITER-API-COMPATIBILITY.md',
 ]);
 
+// SDK documentation/examples are product inputs, not permission for new Markdown.
+const sdkMarkdown = new Set([
+  ...['agent', 'ai', 'coding-agent', 'tui'].flatMap(name => [`packages/${name}/README.md`, `packages/${name}/CHANGELOG.md`]),
+  ...['agent-harness', 'durable-harness', 'hooks', 'models', 'observability'].map(name => `packages/agent/docs/${name}.md`),
+  ...['compaction', 'containerization', 'custom-provider', 'development', 'extensions', 'index', 'json', 'keybindings', 'models', 'packages', 'prompt-templates', 'providers', 'quickstart', 'rpc', 'sdk', 'security', 'session-format', 'sessions', 'settings', 'shell-aliases', 'skills', 'terminal-setup', 'termux', 'themes', 'tmux', 'tui', 'usage', 'windows'].map(name => `packages/coding-agent/docs/${name}.md`),
+  ...['README.md', 'extensions/README.md', 'extensions/doom-overlay/README.md',
+    'extensions/dynamic-resources/SKILL.md', 'extensions/dynamic-resources/dynamic.md',
+    'extensions/plan-mode/README.md', 'extensions/subagent/README.md', 'sdk/README.md',
+    ...['planner', 'reviewer', 'scout', 'worker'].map(name => `extensions/subagent/agents/${name}.md`),
+    ...['implement-and-review', 'implement', 'scout-and-plan'].map(name => `extensions/subagent/prompts/${name}.md`),
+  ].map(name => `packages/coding-agent/examples/${name}`),
+  'packages/coding-agent/test/fixtures/README.synthetic-fixtures.md', 'packages/coding-agent/test/suite/README.md',
+  ...['consecutive-hyphens', 'disable-model-invocation', 'invalid-name-chars', 'invalid-yaml', 'long-name', 'missing-description', 'multiline-description', 'name-mismatch', 'nested/child-skill', 'no-frontmatter', 'root-skill-preferred', 'root-skill-preferred/nested-child', 'unknown-field', 'valid-skill'].map(name => `packages/coding-agent/test/fixtures/skills/${name}/SKILL.md`),
+  ...['first', 'second'].map(name => `packages/coding-agent/test/fixtures/skills-collision/${name}/calendar/SKILL.md`),
+]);
+const builtinSkills = new Set([
+  'Sigon用户偏好', 'Sogon角色深度', 'Stitches拍前导演', 'skill指导', '世界推演',
+  ...['任务目标', '制度日历', '区域环境', '城市资源', '悬疑证据', '生存压力', '社会关系', '组织战略', '规则系统', '通用'].map(name => `世界模块-${name}`),
+  '世界转移审计', '主作者正文边界', '主演分段演出', '主演文本直出', '主演输出恢复',
+  '人物与场所生态', '伏笔编织', '众生侧写生态接入', '剧情自动校准', '剧情记忆摘要',
+  '动态大纲规划', '卡格式完整交付', '卡格式需求识别', '原生工具协议修复', '叙事研究提炼',
+  '大纲转移审计', '导演主Agent', '导演事实审阅', '导演生态参考', '导演角度构思',
+  '导演设定核对', '导演证据整理', '导演预设审阅', '小说人物画像提取', '小说作品构建',
+  '小说分支校准', '小说开场提取', '小说开演边界', '小说消化', '小说研究检索',
+  '小说续更事件提取', '拍后事实信封', '故事编剧室', '文学连续性', '独立谢幕格式',
+  '结构化校验修复', '角色卡世界画像', '角色卡生态池', '通用叙事原型池',
+].map(name => `skills/${name}/SKILL.md`));
+const markdownPaths = new Set([
+  ...[...roots].filter(path => path.endsWith('.md')),
+  ...[...approvedDocumentation].map(name => `docs/${name}`),
+  'deploy/README.md', 'deploy/VPS-OPERATIONS.md', 'licenses/README.md',
+  ...sdkMarkdown, ...builtinSkills,
+]);
+const sessionFixtures = new Set([
+  'packages/coding-agent/test/fixtures/before-compaction.jsonl',
+  'packages/coding-agent/test/fixtures/large-session.jsonl',
+]);
 export function isLocalRecord(path) {
-  return path === 'PUBLICATION.md' || (path.startsWith('docs/') && !approvedDocumentation.has(path.slice(5)));
+  return (path.startsWith('docs/') && !approvedDocumentation.has(path.slice(5)))
+    || (/\.(?:md|mdx|markdown)$/i.test(path) && !markdownPaths.has(path))
+    || (/\.jsonl$/i.test(path) && !sessionFixtures.has(path))
+    || (/\.txt$/i.test(path) && path !== 'licenses/Luker-AGPL-3.0.txt')
+    || /\.(?:docx?|rtf|pdf)$/i.test(path);
 }
 const publicDiagnostics = new Set([
   '_privacy_scan.py', 'check-tavern-canary.mjs', 'deploy-agentic-research.sh',
@@ -46,7 +87,7 @@ const publicDiagnostics = new Set([
 export function pathCategory(path, tracked = false) {
   const parts = path.split('/');
   if (!path || parts.some(p => !p || p === '.' || p === '..') || /[\\\x00]/.test(path)) return 'invalid-path';
-  if (isLocalRecord(path)) return 'local-record';
+  if (path.startsWith('docs/') && isLocalRecord(path)) return 'local-record';
   // Redistribution of this upstream binary has not been cleared.
   if (path === 'packages/coding-agent/examples/extensions/doom-overlay/doom/build/doom.wasm') return 'excluded-third-party-asset';
   if (path === 'scripts/test-flash-sdk-transport.mjs') return 'local-diagnostic';
@@ -58,10 +99,12 @@ export function pathCategory(path, tracked = false) {
     || /^(?:rp\.config[^/]*\.json|rp-preset\.json|rp\.agent(?:\.meta)?\.json|liyuan-profiles|liyuan\.(?:agent|agent\.meta|config)\.json|liyuan-preset\.json|auth\.json|network\.json)$/i.test(p))) return 'private-path';
   if (path === '.liyuan/extensions/roleplay.ts') return null;
   if (parts.includes('.liyuan')) return 'private-path';
+  if (parts[0] === 'licenses') return ['licenses/Luker-AGPL-3.0.txt', 'licenses/README.md'].includes(path) ? null : 'unapproved-license';
+  if (isLocalRecord(path)) return 'local-record';
+  if (parts[0] === 'skills') return builtinSkills.has(path) ? null : 'unapproved-skill';
   if (parts.length === 1) return roots.has(path) ? null : 'unapproved-root';
   if (parts[0] === 'assets') return assets.has(path) ? null : 'unapproved-asset';
   if (parts[0] === 'presets') return tracked && presets.has(path) ? null : 'unapproved-preset';
-  if (parts[0] === 'licenses') return ['licenses/Luker-AGPL-3.0.txt', 'licenses/README.md'].includes(path) ? null : 'unapproved-license';
   if (parts[0] === 'scripts' && /(?:^|[-_/])(?:local|private|production|prod|ops|audit|inspect|capture|dump|diagnos\w*|probe|canary|drive|smoke|deploy|analyze|privacy_scan|rename|research-test|test-flash|test-plugin)(?:[-_.\/]|$)/i.test(path.slice(8))) {
     return tracked && publicDiagnostics.has(path.slice(8)) ? null : 'local-diagnostic';
   }
@@ -95,6 +138,7 @@ const syntheticTokens = new Map([
   ['test/repair-runtime.test.ts', ['sk-' + 'abcdefghijk123456789']],
 ]);
 const syntheticUrls = new Map([
+  ['test/deploy-install-safety.test.ts', ['https://' + 'synthetic-user:synthetic-secret@example.invalid']],
   ['test/database-plugin-source.test.ts', ['https://' + 'user:pass@gcore.jsdelivr.net']],
   ['test/mvu-managed-routing.test.ts', ['https://' + 'user:pass@parser.invalid']],
   ['test/mvu-model-list.test.ts', ['https://' + 'user:password@managed.invalid']],

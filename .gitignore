@@ -160,6 +160,7 @@ web/.liyuan-tavern-*/
 !scripts/check-public-data.mjs
 !scripts/check-repository-privacy.mjs
 !scripts/check-publication-range.mjs
+!scripts/check-privacy-ci.mjs
 !scripts/check-docs.mjs
 !scripts/check-director-chat.mjs
 !scripts/_privacy_scan.py
