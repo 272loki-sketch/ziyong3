@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { searchVisibleCanonEvidence } from "../src/novel-play/research.ts";
 import type { NovelPackage } from "../src/novel-play/canon.ts";
 import type { NovelSource } from "../src/novel-play/source.ts";
+import { storedZip } from "./support/stored-zip-fixture.ts";
 
 const chapter = "第一事件发生。第二事件发生。秘密事件发生。";
 const evidence = (quote: string) => ({ chunkIndex: 0, start: chapter.indexOf(quote), end: chapter.indexOf(quote)+quote.length, quote });
@@ -72,10 +73,9 @@ test("normalization matches full-width names without fabricating normalized sour
 	const hits=searchVisibleCanonEvidence(p,s,{kind:"source-end",packageRevision:"revision"},"alpha");assert.ok(hits[0].quote.includes("ＡＬＰＨＡ"));assert.equal(long.slice(hits[0].start,hits[0].end),hits[0].quote);
 });
 test("EPUB source ingestion excludes script/style text before immutable evidence is built",async()=>{
-	const{execFileSync}=await import("node:child_process");const{epubToText}=await import("../src/outline/corpus.ts");
+	const{epubToText}=await import("../src/outline/corpus.ts");
 	const body="雨桥相遇。她尚不知道真相。".repeat(20);
 	const files={"META-INF/container.xml":'<container><rootfiles><rootfile full-path="book/content.opf"/></rootfiles></container>',"book/content.opf":'<package><manifest><item id="c1" href="chapter.xhtml"/></manifest><spine><itemref idref="c1"/></spine></package>',"book/chapter.xhtml":`<html><head><style>SYNTHETIC_STYLE_NOT_STORY</style></head><body><h1>第一章</h1><script>SYNTHETIC_SCRIPT_NOT_CANON</script><p>${body}</p></body></html>`};
-	const py="import sys,json,io,zipfile\nfiles=json.load(sys.stdin)\nb=io.BytesIO()\nwith zipfile.ZipFile(b,'w',compression=zipfile.ZIP_STORED) as z:\n for name,text in files.items(): z.writestr(name,text.encode('utf-8'))\nsys.stdout.buffer.write(b.getvalue())\n";
-	const zip=execFileSync("python3",["-c",py],{input:JSON.stringify(files)});const text=epubToText(zip);
+	const zip=storedZip(Object.entries(files));const text=epubToText(zip);
 	assert.ok(text.includes(body));assert.doesNotMatch(text,/SYNTHETIC_STYLE_NOT_STORY|SYNTHETIC_SCRIPT_NOT_CANON/);
 });

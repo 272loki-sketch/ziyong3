@@ -24,7 +24,7 @@
 
 ### 文档与记录
 
-公开文档只允许 `README.md`、`TESTING.md`、`AGENTS.md`、`CLAUDE.md`、两份部署指南，以及[文档导航](DOCUMENTATION-INDEX.md)中的现行主题指南和导航本身；精确路径白名单由 `scripts/public-repository-policy.mjs` 维护，不允许整个 `docs/` 目录。验收、研究实施报告、审计、历史协议、交接、Release/版本记录及 `PLAN-KNOWLEDGE-ENGINE`、`KNOWLEDGE-RESEARCH-VALIDATION`、`DATABASE-DETACHMENT` 文档不在公开集合内。
+公开 Markdown 只允许 `README.md`、`TESTING.md`、`AGENTS.md`、`CLAUDE.md`、两份部署指南、`licenses/README.md`，以及[文档导航](DOCUMENTATION-INDEX.md)中的现行主题指南和导航本身；许可原文另按 `licenses/Luker-AGPL-3.0.txt` 精确白名单处理。精确路径白名单由 `scripts/public-repository-policy.mjs` 维护，不允许整个 `docs/` 目录。验收、研究实施报告、审计、历史协议、交接、Release/版本记录及 `PLAN-KNOWLEDGE-ENGINE`、`KNOWLEDGE-RESEARCH-VALIDATION`、`DATABASE-DETACHMENT` 文档不在公开集合内。
 
 本地验收记录不随公开仓库发布。记录和日期留在本地源目录，曾经跟踪不等于批准公开，也不授权删除或重写；日志、Word 文档、文档图片与截图同样不发布。公开指南保留长期职责、兼容限制和未验证范围，但不链接本地记录或附件。导出器须跳过源记录并裁除公开基准树遗留记录，只修改候选树，不改源文件；它不能清除旧远端历史、已有 clone 或旧发行包中的副本。完整审阅与授权边界见[隐私与公开流程](PRIVACY-AND-PUBLISHING.md#公开指南白名单)。
 

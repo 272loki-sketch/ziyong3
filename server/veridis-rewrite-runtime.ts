@@ -1,6 +1,8 @@
 /** Detached original-engine host. No upstream module/prompt/rule engine is copied or patched here. */
 import { Worker } from 'node:worker_threads';
+import { lstatSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { isAbsolute, relative, sep } from 'node:path';
 import { abortable } from '../src/async-abort.ts';
 import type { VeridisRewriteCandidate } from './veridis-rewrite-source.ts';
 
@@ -57,6 +59,8 @@ const MAX_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_SETTINGS_BYTES = 4 * 1024 * 1024;
 const MAX_RUN_MS = 15 * 60 * 1000;
 const ENGINE_PATHS = ['src/host/appContext.js', 'src/settings/defaults.js', 'src/aiRewrite/runtime.js', 'src/aiRewrite/response.js'];
+const SAFE_WORKER_ERROR_NAMES = ['Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'AggregateError'] as const;
+const SAFE_WORKER_ERROR_CODES = ['ERR_ACCESS_DENIED'] as const;
 const dangerous = new Set(['__proto__', 'prototype', 'constructor']);
 const credentialKey = /^(?:api[_-]?key|key|api[_-]?token|token|access[_-]?token|refresh[_-]?token|secret|password|authorization|oauth)$/i;
 function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === 'object' && !Array.isArray(value); }
@@ -141,6 +145,8 @@ function targetProjection(original: string, result: WorkerResult, allowed: Range
 /** Worker glue only. Every target, template, response map and composition is upstream-owned. */
 const WORKER = String.raw`
 const { parentPort, workerData } = require('node:worker_threads');
+const safeErrorNames = new Set(${JSON.stringify(SAFE_WORKER_ERROR_NAMES)});
+const safeErrorCodes = new Set(${JSON.stringify(SAFE_WORKER_ERROR_CODES)});
 const pending = new Map();
 let sequence = 0;
 parentPort.on('message', message => {
@@ -223,7 +229,16 @@ const accepted = Object.create(null);
     targets: items.map(item => ({ id: item.id, start: item.start, end: item.end, text: workerData.authorDraft.slice(item.start, item.end) })),
     replacements: accepted, errors: success ? [] : ['原改写引擎未完成有效 AI 改写；保留完整原稿'],
   }});
-})().catch(() => parentPort.postMessage({ type: 'fatal', error: '原改写模块初始化或执行失败，未产生可采纳显示投影' }));
+})().catch(error => {
+  // Preserve a safe machine-readable cause for host diagnostics without
+  // forwarding exception text, paths, plugin data, or credentials.
+  let errorName, errorCode;
+  try {
+    if (typeof error?.name === 'string' && safeErrorNames.has(error.name)) errorName = error.name;
+    if (typeof error?.code === 'string' && safeErrorCodes.has(error.code)) errorCode = error.code;
+  } catch { /* hostile custom error accessors are not diagnostic data */ }
+  parentPort.postMessage({ type: 'fatal', errorName, errorCode });
+});
 `;
 
 export class VeridisRewriteRuntime {
@@ -260,10 +275,23 @@ export class VeridisRewriteRuntime {
       await ensureCurrent();
       const candidate = this.#sources.active();
       if (!candidate) throw new Error('Veridis Rewrite 尚未安装或原版完整性失败');
+      // A valid cache may be reached through a platform alias (macOS /var ->
+      // /private/var). Permission flags and file: URLs must use the same
+      // canonical path or Node can deny the module imports in the Worker.
+      const rootStat = lstatSync(candidate.root);
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error('Veridis Rewrite 候选根目录不是安全的普通目录');
+      const assetsRoot = realpathSync(candidate.root);
       const modules = ENGINE_PATHS.map(path => {
         const file = this.#sources.resolveAsset(path, candidate);
         if (!file) throw new Error(`Veridis Rewrite 缺少已验证的原模块：${path}`);
-        return pathToFileURL(file).href;
+        const fileStat = lstatSync(file);
+        if (!fileStat.isFile() || fileStat.isSymbolicLink()) throw new Error(`Veridis Rewrite 原模块不是安全的普通文件：${path}`);
+        const canonicalFile = realpathSync(file);
+        const relativeFile = relative(assetsRoot, canonicalFile);
+        if (!relativeFile || relativeFile === '..' || relativeFile.startsWith(`..${sep}`) || isAbsolute(relativeFile)) {
+          throw new Error(`Veridis Rewrite 原模块越出已验证资产根目录：${path}`);
+        }
+        return pathToFileURL(canonicalFile).href;
       });
       const safeSettings = cloneSettings(input.settings);
       const allowed = narrativeRanges(input.authorDraft, input.narrative);
@@ -275,7 +303,7 @@ export class VeridisRewriteRuntime {
         eval: true, env: {}, stdout: true, stderr: true,
         // Only private verified assets may be read. No filesystem writes, subprocesses,
         // addon loading or nested workers are granted to upstream modules.
-        execArgv: ['--permission', `--allow-fs-read=${candidate.root}`],
+        execArgv: ['--permission', `--allow-fs-read=${assetsRoot}${sep}`],
         resourceLimits: { maxOldGenerationSizeMb: 192 },
         workerData: { sourceEntryId: input.sourceEntryId, authorDraft: input.authorDraft, settings: safeSettings.publicSettings, defaultRules: defaultVeridisHostSettings().rules, allowed, protected: protectedSpans,
           modules: { host: modules[0], defaults: modules[1], engine: modules[2], response: modules[3] } },
@@ -291,7 +319,14 @@ export class VeridisRewriteRuntime {
         worker!.on('message', (message: unknown) => {
           if (!record(message) || typeof message.type !== 'string') { finish(() => reject(new Error('原改写 Worker 返回未知协议'))); return; }
           if (message.type === 'done') { finish(() => resolvePromise(message.result as WorkerResult)); return; }
-          if (message.type === 'fatal') { finish(() => reject(new Error('原改写模块初始化或执行失败，拒绝显示投影'))); return; }
+          if (message.type === 'fatal') {
+            const safeName = (value: unknown) => typeof value === 'string' && (SAFE_WORKER_ERROR_NAMES as readonly string[]).includes(value) ? value : undefined;
+            const safeCode = (value: unknown) => typeof value === 'string' && (SAFE_WORKER_ERROR_CODES as readonly string[]).includes(value) ? value : undefined;
+            const details = [safeName(message.errorName), safeCode(message.errorCode)].filter((value): value is string => !!value);
+            const cause = details.length ? new Error(`Worker ${details.join(' ')}`) : undefined;
+            finish(() => reject(new Error('原改写模块初始化或执行失败，拒绝显示投影', cause ? { cause } : undefined)));
+            return;
+          }
           if (message.type === 'stop') {
             for (const task of requests.values()) if (task.generationId === message.generationId) task.controller.abort(new Error('原改写请求取消或超时'));
             return;

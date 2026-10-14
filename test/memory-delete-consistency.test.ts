@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+import { cleanupMemoryFixture } from "./support/memory-fixture.ts";
 import { memoryScopeRoot } from "../src/memory/config.ts";
 import {
 	getMemoryStatus,
@@ -70,7 +71,7 @@ test("memory: 延迟 embedding 写入 vs 删除，删除结算后旧条目不复
 	} finally {
 		gate?.release();
 		await Promise.allSettled(pending);
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -100,7 +101,7 @@ test("memory: 延迟 embedding 写入 vs 清空，清空结算后旧快照和在
 	} finally {
 		gate?.release();
 		await Promise.allSettled(pending);
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -147,6 +148,6 @@ test("memory: 延迟 embedding 写入 vs 删库，数据/配置/旧JSONL移除�
 	} finally {
 		gate?.release();
 		await Promise.allSettled(pending);
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });

@@ -2,7 +2,7 @@ name: privacy
 
 on:
   push:
-  pull_request:
+  pull_request_target:
   workflow_dispatch:
 
 permissions:
@@ -13,19 +13,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Only base tools run. Candidate checkout is data, with no install/build/scripts.
+      # A first push (zero before) has no trusted baseline and deliberately fails.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.before || github.event.repository.default_branch }}
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22.19.0"
-      - name: Public candidate privacy policy
-        run: npm run privacy:check
-      - name: Introduced commit privacy policy
-        if: ${{ !cancelled() }}
-        run: node scripts/check-publication-range.mjs "$GITHUB_EVENT_NAME"
-      - name: Public documentation and synthetic fixture policy
-        if: ${{ !cancelled() }}
-        run: node scripts/check-public-data.mjs
+      - name: Trusted base scans candidate objects and introduced commits
+        working-directory: candidate
+        run: node ../trusted/scripts/check-privacy-ci.mjs
+      - name: Trusted base checks public documentation links
+        working-directory: candidate
+        run: node ../trusted/scripts/check-docs.mjs --root .

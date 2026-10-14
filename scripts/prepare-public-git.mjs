@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Snapshot exporter, not a commit/push command or a semantic privacy certification.
 import { spawnSync } from 'node:child_process';
-import { constants, lstatSync, openSync, fstatSync, readSync, closeSync, mkdirSync, mkdtempSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
+import { constants, lstatSync, openSync, fstatSync, readSync, closeSync, mkdirSync, mkdtempSync, writeFileSync, chmodSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join, dirname, parse, relative, isAbsolute } from 'node:path';
-import { pathToFileURL, fileURLToPath } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { MAX_FILE_BYTES, pathCategory, contentCategories, approvedBinary } from './public-repository-policy.mjs';
 import { auditRepository } from './check-repository-privacy.mjs';
@@ -17,6 +17,20 @@ export function validateRemote(remote) {
   if (typeof remote !== 'string' || /[\s\x00-\x1f\\%?#]/.test(remote)) return false;
   const match = /^(?:https:\/\/([^/:@]+)\/|git@([^/:@]+):)([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+)$/.exec(remote);
   return !!match && hosts.has(match[1] || match[2]) && match[3].split('/').every(p => p !== '.' && p !== '..' && !p.startsWith('-'));
+}
+
+function sameFilesystemPath(left, right) {
+  const canonical = path => {
+    const value = realpathSync(resolve(path)).replace(/\\/g, '/');
+    return process.platform === 'win32' ? value.toLowerCase() : value;
+  };
+  return canonical(left) === canonical(right);
+}
+
+function isMain() {
+  if (!process.argv[1]) return false;
+  try { return sameFilesystemPath(process.argv[1], fileURLToPath(import.meta.url)); }
+  catch { return false; }
 }
 
 function environment() {
@@ -155,8 +169,8 @@ export function preparePublicGit({ source = process.cwd(), output, remote, branc
     if (typeof source !== 'string' || typeof branch !== 'string' || typeof allowBinaryChanges !== 'boolean') throw new Error('invalid-arguments');
     source = resolve(source);
     parents(source);
-    const root = git(source, ['rev-parse', '--show-toplevel']).toString('utf8').replace(/\n$/, '');
-    if (root !== source) throw new Error('repository-root-required');
+    const root = git(source, ['rev-parse', '--show-toplevel']).toString('utf8').replace(/\r?\n$/, '');
+    if (!sameFilesystemPath(root, source)) throw new Error('repository-root-required');
     if (!branch || branch.startsWith('-') || /[\x00-\x20\x7f]/.test(branch)) throw new Error('invalid-branch');
     try { git(source, ['check-ref-format', '--branch', branch]); } catch { throw new Error('invalid-branch'); }
     if (remote !== undefined && !validateRemote(remote)) throw new Error('invalid-remote');
@@ -227,9 +241,9 @@ export function preparePublicGit({ source = process.cwd(), output, remote, branc
       destination = outputPath(source, output);
       mkdirSync(destination, { mode: 0o700 });
     } else {
-      const parent = process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir();
-      parents(resolve(parent));
-      if (contains(source, resolve(parent))) throw new Error('unsafe-output');
+      const parent = realpathSync(process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir());
+      parents(parent);
+      if (contains(source, parent)) throw new Error('unsafe-output');
       destination = mkdtempSync(join(parent, 'liyuan-public-'));
     }
     chmodSync(destination, 0o700);
@@ -299,7 +313,7 @@ export function preparePublicGit({ source = process.cwd(), output, remote, branc
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isMain()) {
   const options = { report: line => console.log(line) };
   let valid = true;
   const seen = new Set();

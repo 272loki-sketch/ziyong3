@@ -1,18 +1,20 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { auditRepository } from '../scripts/check-repository-privacy.mjs';
 import { auditPublicationRange } from '../scripts/check-publication-range.mjs';
+// Keep the dedicated CI trust-boundary regressions in the existing privacy suite.
+import './privacy-ci.test.ts';
 
 const cli = resolve('scripts/check-publication-range.mjs');
 const zero = '0'.repeat(40);
 const token = ['ghp_', 'A'.repeat(36)].join('');
 
 function fixture(t: TestContext) {
-  const dir = mkdtempSync(join(tmpdir(), 'publication-range-'));
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'publication-range-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const git = (...args: string[]) => {
     const result = spawnSync('git', args, { cwd: dir, encoding: 'utf8', env: {

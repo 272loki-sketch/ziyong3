@@ -22,8 +22,8 @@
 ## 2. 一拍
 
 ```text
-输入持久化与 ACK → 必要 pending 恢复 → 捕获分支/资料/状态
-→ 输入绑定的 direct 或 director → 单作者定稿
+输入绑定模式 → 必要 pending 恢复与来源守卫（失败则拒绝、草稿保留）
+→ user 持久化与 ACK → 捕获当前分支上下文 → direct 或 director 单作者定稿
 → 保存规范正文、完整原稿、绑定交付与 pending → onAuthorReady
 → 启用的后台领域并发计算 → 来源检查 → 串行落树与收据
 → 完整运行结束、释放共享写锁 → 下一拍
@@ -95,13 +95,13 @@ NPC 只在生态路内部生成与采纳，不第二次推进人物；Veridis �
 
 完整原稿、绑定交付和 pending flush 后触发 `onAuthorReady`；`onTurnEnd` / `performTurn` Promise 仍表示含后台的完整结束。`isSettling` 与 WS settling 明确区分两者，刷新读取完整原稿而不是恢复生成壳。
 
-后台六路是场记、世界、鲜活世界、原数据库、酒馆插件/MVU 与 Veridis，按启用和条件运行。共用冻结规范正文及拍前快照，用 `allSettled` 等待已启动任务退出，来源检查后串行写共享树。数据库/MVU 不等显示投影；owner 资料写操作是其必要前置例外。共享写锁保留到后台结束，新输入只排队。`timeToAuthorReadyMs` 与 `totalMs` 分开观测。
+后台六路是场记、世界、鲜活世界、原数据库、酒馆插件/MVU 与 Veridis，按启用和条件运行。共用冻结规范正文及拍前快照，用 `allSettled` 等待已启动任务退出，来源检查后串行写共享树。数据库/MVU 不等显示投影；owner 资料写操作是其必要前置例外。共享写锁保留到后台结束；新输入只排队，出队后必要恢复通过并持久化前不ACK。`timeToAuthorReadyMs` 与 `totalMs` 分开观测。
 
 后台完成只向匹配 `entryId/entryScope` 发 `liyuan:turn-state-refreshed` 供派生卷宗只读重查，不通过通用 plugins-changed 重跑卡脚本。完整合同见 [执行流程](PLAN-ROUND-FLOW.md#前台交付与后台完成)。
 
 ### 权限、取消和恢复
 
-ACK 仅表示输入已保存。切会话、卡或真实分支使旧结果失效，设置元数据不伪装切支。已保存完整稿的后台失败/取消不标半稿、不退回旧 Roll；缺失领域按收据恢复，已完成领域不重复。故事中的付款、删除或发帖不是现实操作授权；工具/MCP 风险权限仍独立有效。
+Web剧情的ACK仅在必要上一拍恢复通过且新user持久化后发送，只表示输入已保存。恢复失败则拒绝新输入、不向 Session Tree 落新user并保留客户端草稿；现代deliveryProtocol重放沿用同一入口，旧SDK不承诺可靠ACK。切会话、卡或真实分支使旧结果失效，设置元数据不伪装切支。已保存完整稿的后台失败/取消不标半稿、不退回旧 Roll；缺失领域按收据恢复，已完成领域不重复。故事中的付款、删除或发帖不是现实操作授权；工具/MCP 风险权限仍独立有效。
 
 ### 导演室创作对谈
 

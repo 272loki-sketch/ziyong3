@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, chmodSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, chmodSync, statSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { preparePublicGit, validateRemote } from '../scripts/prepare-public-git.mjs';
@@ -11,7 +11,7 @@ const token = ['ghp_', 'A'.repeat(36)].join('');
 const cli = resolve('scripts/prepare-public-git.mjs');
 
 function fixture(t: any) {
-  const parent = process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir();
+  const parent = realpathSync(process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir());
   const dir = mkdtempSync(join(parent, 'public-git-test-'));
   const source = join(dir, 'source');
   mkdirSync(source);
@@ -64,7 +64,7 @@ test('exports disk snapshot, skips private and unapproved entries without reads,
   assert.equal(result.skipped['private-path'], 2);
   assert.equal(result.skipped['unapproved-asset'], 1);
   assert.equal(result.skipped['local-diagnostic'], 1);
-  assert.equal(result.skipped['unapproved-root'], 1);
+  assert.equal(result.skipped['local-record'], 1);
   assert.equal(readFileSync(join(result.output, 'src/a.ts'), 'utf8'), 'safe disk version\n');
   assert.equal(gitAt(result.output, 'show', ':src/a.ts'), 'safe disk version');
   assert.equal(gitAt(result.output, 'ls-files'), '.gitignore\nsrc/a.ts\nsrc/new.ts');
@@ -442,6 +442,53 @@ test('hooks reject subsequent baseline binary edits without treating preparation
   const run = spawnSync(process.execPath, ['.git/liyuan-public-guard/public-git-guard.mjs', 'pre-commit'], { cwd: result.output, encoding: 'utf8' });
   assert.equal(run.status, 1);
   assert.match(run.stdout, /binary-change-review-required "web\/public\/logo.png"/);
+});
+
+test('pre-push peels annotated and nested tags, scans messages, and rejects noncommit targets', t => {
+  const { put, prepare, gitAt } = fixture(t);
+  put('src/a.ts');
+  const result = prepare();
+  assert.equal(result.ok, true);
+  const cwd = result.output;
+  gitAt(cwd, 'commit', '-qm', 'Synthetic base');
+  const base = gitAt(cwd, 'rev-parse', 'HEAD'), zero = '0'.repeat(base.length);
+  const push = (local: string, remote = zero) => spawnSync('sh', ['.git/hooks/pre-push'], {
+    cwd, input: `refs/tags/synthetic ${local} refs/tags/synthetic ${remote}\n`, encoding: 'utf8',
+  });
+  gitAt(cwd, '-c', 'tag.gpgsign=false', 'tag', '-a', 'clean', '-m', 'Synthetic release');
+  const clean = gitAt(cwd, 'rev-parse', 'clean');
+  assert.equal(push(clean).status, 0);
+  assert.equal(push(base).status, 0);
+  gitAt(cwd, '-c', 'tag.gpgsign=false', 'tag', '-a', 'secret', '-m', token);
+  const secret = gitAt(cwd, 'rev-parse', 'secret');
+  gitAt(cwd, '-c', 'tag.gpgsign=false', 'tag', '-a', 'nested', 'secret', '-m', 'Synthetic outer');
+  for (const local of [secret, gitAt(cwd, 'rev-parse', 'nested')]) {
+    const run = push(local, clean);
+    assert.equal(run.status, 1);
+    assert.match(run.stdout, /credential-token ""/);
+    assert.equal((run.stdout + run.stderr).includes(token), false);
+  }
+  assert.equal(push(clean, 'f'.repeat(base.length)).status, 1);
+  assert.equal(push(gitAt(cwd, 'rev-parse', 'HEAD:src/a.ts')).status, 1);
+  gitAt(cwd, '-c', 'tag.gpgsign=false', 'tag', '-a', 'json-message', '-m', JSON.stringify({ apiKey: 'synthetic-non-placeholder-value' }));
+  const jsonMessage = push(gitAt(cwd, 'rev-parse', 'json-message'), clean);
+  assert.equal(jsonMessage.status, 1);
+  assert.match(jsonMessage.stdout, /secret-json-field ""/);
+  const messageFile = join(cwd, '.git/message');
+  writeFileSync(messageFile, Buffer.alloc(16 * 1024 * 1024 + 1, 65));
+  gitAt(cwd, '-c', 'tag.gpgsign=false', 'tag', '-a', 'oversize', '-F', messageFile);
+  assert.match(push(gitAt(cwd, 'rev-parse', 'oversize')).stdout, /size-limit ""/);
+  const invalidTag = join(cwd, '.git/invalid-tag');
+  writeFileSync(invalidTag, Buffer.concat([Buffer.from(`object ${base}\ntype commit\ntag invalid\ntagger Synthetic <synthetic@example.invalid> 1 +0000\n\n`), Buffer.from([255])]));
+  const invalidOid = gitAt(cwd, 'hash-object', '-t', 'tag', '-w', invalidTag);
+  assert.equal(push(invalidOid).status, 1);
+  writeFileSync(join(cwd, 'src/a.ts'), token);
+  gitAt(cwd, 'add', '--', 'src/a.ts');
+  gitAt(cwd, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'Synthetic unsafe commit');
+  gitAt(cwd, '-c', 'tag.gpgsign=false', 'tag', '-a', 'unsafe-tree', '-m', 'Synthetic release');
+  const unsafe = push(gitAt(cwd, 'rev-parse', 'unsafe-tree'), clean);
+  assert.equal(unsafe.status, 1);
+  assert.match(unsafe.stdout, /credential-token "src\/a.ts"/);
 });
 
 test('candidate staged hooks reject excluded assets, diagnostics, local records and binary documents', t => {

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { cleanupMemoryFixture } from "./support/memory-fixture.ts";
 
 import { buildRpSummaryInitialPrompt, buildRpSummaryPrompt, buildRpSummaryUpdatePrompt, RP_SUMMARY_SECTIONS } from "../src/scribe.ts";
 import {
@@ -59,7 +60,7 @@ test("rp-memory: 事件卡 upsert + list + has", async () => {
 		assert.equal(again.length, 1);
 		assert.equal(again[0]!.summary, "更新后的概括");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -83,7 +84,7 @@ test("rp-memory: 事件卡 → 证据两阶段召回（沿 sourceRefs 找到归�
 		assert.ok(evd.length >= 1, "应沿事件取回归档证据");
 		assert.match(evd[0]!.text, /讨债|递|伞/, "证据块应含原文细节");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -96,7 +97,7 @@ test("rp-memory: 事件→证据 无事件卡时不产出证据", async () => {
 		const evd = await memoryEvidenceForEvent(cwd, scope, "event_nonexistent");
 		assert.equal(evd.length, 0);
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -187,7 +188,7 @@ test("rp-memory: 归档带 sourceRefs 后 meta 携带", async () => {
 		assert.equal(chunks[0]!.meta?.kind, "evidence");
 		assert.deepEqual(chunks[0]!.meta?.sourceRefs, [{ entryId: "entry-7777", entryType: "message", turn: 7 }]);
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -202,7 +203,7 @@ test("rp-memory: 分支可见性过滤只返回当前祖先链上的事件与证
 		const visible = await memoryRecallForTurn(cwd, scope, "第一次见面 递伞", new Set(["entry-0001"]));
 		assert.ok(visible.some((hit) => hit.meta?.kind === "event"));
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -251,7 +252,7 @@ test("rp-memory: 语义去重——同事件不同描述→合并一张卡+sourc
 	assert.match(merged.summary, /解除/);
 	assert.ok(merged.sourceRefs.length >= 2, "sourceRefs 累积不丢");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -276,7 +277,7 @@ test("rp-memory: 长期事件 sourceRefs 保留最新24条而非最旧证据", a
 		assert.equal(refs[0]!.entryId, "entry-7");
 		assert.equal(refs.at(-1)!.entryId, "entry-30");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -290,7 +291,7 @@ test("rp-memory: 锚词直通——recallAnchors命中不依赖embedding质量",
 		assert.ok(eventHit, "锚词直通应命中事件卡（local-hash下embedding可能不中）");
 		assert.equal(eventHit.score, 2);
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -323,7 +324,7 @@ test("rp-memory: 线召回——按弧线聚合、分支过滤、cap生效", asy
 		const hidden = memoryArcRecallForTurn(cwd, scope, new Set(["entry-turn-999"]));
 		assert.equal(hidden.length, 0, "兄弟分支无可见事件→无线");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -343,7 +344,7 @@ test("rp-memory: memory_diff审计记录create/merge", async () => {
 	assert.ok(diff2.length >= 2);
 	assert.ok(diff2[0].op === "merge" || diff2[0].op === "update");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -384,7 +385,7 @@ test("rp-memory: 逐 entry 归档 → 事件证据精确到条目，不误拉到
 		assert.ok(evidence[0]!.text.includes("青玉佩"), "证据应来自 entry-002 而非寒暄/沉默条目");
 		assert.ok(!evidence[0]!.text.includes("寒暄"), "不得误拉到 entry-001");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -407,7 +408,7 @@ test("rp-memory: 分支可见性 every 语义——多 sourceRefs 需全部落�
 		const visible = memoryListEventDigests(cwd, scope, new Set(["ancestor-1", "sibling-9"]));
 		assert.ok(visible.some((e) => e.title === "跨分支合并事件"), "全部 refs 在祖先链 → 可见");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -441,7 +442,7 @@ test("rp-memory: 显式 merge 跨分支目标被拒，共享来源才放行", as
 		}, { mergeInto: targetId });
 		assert.equal(shared.stored, true, "共享来源 → 允许合并");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -464,7 +465,7 @@ test("rp-memory: 并发归档不丢写（keyed 锁串行化）", async () => {
 			assert.ok(chunks.some((c) => c.text.includes(`token-${i}`)), `第 ${i} 段归档不得被并发覆盖丢失`);
 		}
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 

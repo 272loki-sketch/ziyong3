@@ -53,7 +53,7 @@ git push https://github.com/OWNER/REPO.git HEAD:main
 
 ### 公开指南白名单
 
-公开 Markdown 采用精确路径白名单，不按 `docs/*.md` 整体放行。入口为 `README.md`、`TESTING.md`、`AGENTS.md`、`CLAUDE.md`，部署指南为 `deploy/README.md`、`deploy/VPS-OPERATIONS.md`；`docs/` 仅批准[文档导航](DOCUMENTATION-INDEX.md)中的现行功能、架构、使用和开发维护指南，连同导航本身。批准路径由 `scripts/public-repository-policy.mjs` 明确列举，新增指南须先审阅再更新政策，不能由新链接自动获准。
+公开 Markdown 采用精确路径白名单，不按 `docs/*.md` 整体放行。入口为 `README.md`、`TESTING.md`、`AGENTS.md`、`CLAUDE.md`，部署指南为 `deploy/README.md`、`deploy/VPS-OPERATIONS.md`，许可声明为 `licenses/README.md`；`docs/` 仅批准[文档导航](DOCUMENTATION-INDEX.md)中的现行功能、架构、使用和开发维护指南，连同导航本身。许可证原文 `licenses/Luker-AGPL-3.0.txt` 是独立的精确路径许可，不因此开放 `licenses/` 目录。批准路径由 `scripts/public-repository-policy.mjs` 明确列举，新增指南须先审阅再更新政策，不能由新链接自动获准。
 
 验收、报告、审计、历史协议、交接、研究实施及 Release/版本历史不属于指南白名单；`PLAN-KNOWLEDGE-ENGINE`、`KNOWLEDGE-RESEARCH-VALIDATION` 和 `DATABASE-DETACHMENT` 文档也只在本地保留。Word 文档、文档图片、截图、日志和报告附件不导出、不上传、不随发行包发布。公开指南不得用本地 Markdown 链接指向这些资料；必要的职责、兼容限制和未验证范围留在指南中，证据引用改为“本地验收记录不随公开仓库发布”或已批准的长期指南。
 
@@ -97,7 +97,7 @@ npm run privacy:commit -- <ref>
 
 `<ref>` 行是命令语法说明，执行时须替换为真实 ref。`privacy:commit` 检查该提交的树与 blob 字节，不依赖当前工作树或索引，也不扫描全部历史。须审阅全部拟推送提交，而非只看最新提交；被忽略的文件仍可能已存在于历史中。
 
-隐私 CI 对每次 push 与 pull request 执行，不设分支或路径过滤；权限只读，checkout 不持久保存凭据。CI 使用 Node 22.19.0，无需安装依赖即运行工作树门禁、公共数据门禁与 `scripts/check-publication-range.mjs`。范围检查逐一审计 push/PR 引入的提交，避免“先加入秘密、随后删掉”只因最终树干净而通过；新分支检查全部可达历史，手动运行检查 HEAD，缺端点或浅历史则失败。CI 在推送后才运行，不能防止首次泄露，本地推送前门禁不可省略；检查失败应阻止后续合并或发行。
+隐私 CI 对 push 与 pull_request_target 执行，不设分支或路径过滤；权限只读，checkout 不持久保存凭据。CI 使用 Node 22.19.0，从 PR base 或 push before 的可信 checkout 运行 `scripts/check-privacy-ci.mjs`，候选 checkout 只作为数据，不安装依赖、不执行候选脚本或 fixture 生成器。可信工具逐一审计 head 和引入的提交，并用可信生成器比对合成 fixture，避免“先加入秘密、随后删掉”或修改待审扫描器绕过检查。首次 push、缺可信工具、缺端点或浅历史均失败关闭；引入新检查器须先建立经审阅的可信基线。CI 在推送后才运行，不能防止首次泄露，本地推送前门禁不可省略；分支保护、工作流变更审阅及 required check 仍需独立配置，检查失败应阻止后续合并或发行。
 
 这些门禁是有限范围的路径与内容检查，不是全历史审计、二进制或语义隐私认证、全面秘密检测，也不是版权批准。`public-repository-policy.mjs` 的二进制例外只允许其中精确列举且已跟踪的现有路径，不按扩展名或目录整体放行；这些例外不进行二进制字节的语义秘密或来源扫描，内容变更仍须人工公开审阅。检查发现不得打印凭据、私人故事原文或命中的私人片段。合成测试不得抽取生产会话、thinking、截图或导入卡。
 
@@ -119,4 +119,4 @@ powershell -NoProfile -File scripts/pack-release.ps1 -Target linux
 
 按用户授权，维护/部署默认不新建手工本地备份或归档；GitHub 恢复源必须核验仓库 URL、精确 commit、匹配产物来源与校验和及可获取性。它只覆盖已推送、核验且获准公开的内容，不是 dirty、未推送提交、私人配置、会话、记忆或插件状态的备份。不得为“云端备份”上传这些私有内容，也不得为补齐恢复源自动提交或推送；操作若危及未覆盖内容，应停止并请求专项保留/恢复方案。
 
-已有本地备份保留，不因新政策删除；原子保存 `.bak` 和更新器内部回退机制不禁用。旧更新脚本仍会归档，不能宣称已符合默认不新增手工归档的流程，见[现有脚本限制](LOCAL-UPSTREAM-UPDATES.md#现有脚本限制)。部署须另行授权，按 [VPS 运维](../deploy/VPS-OPERATIONS.md)执行恢复源核验、空闲检查、候选构建与运行验证，不回滚故事或数据库来回退代码。公开检查不会部署代码、批准 Release、修改私人设置、启用插件或把数据迁移到 `.local/`。
+已有本地备份保留，不因新政策删除；原子保存 `.bak` 和更新器内部回退机制不禁用。旧更新脚本仍有归档副作用，不能宣称已符合默认不新增手工归档的流程；运行前须重新审阅脚本并另行授权。部署须另行授权，按 [VPS 运维](../deploy/VPS-OPERATIONS.md)执行恢复源核验、空闲检查、候选构建与运行验证，不回滚故事或数据库来回退代码。公开检查不会部署代码、批准 Release、修改私人设置、启用插件或把数据迁移到 `.local/`。

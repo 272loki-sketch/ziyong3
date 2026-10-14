@@ -4,9 +4,12 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { OutlineEngine } from "../src/outline/engine.ts";
 import { loadStageMaterials } from "../src/stage/materials.ts";
+
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
 class FauxSession {
 	entries: Array<{ id: string; type: string; customType?: string; data?: unknown }> = [{ id: "leaf", type: "custom", customType: "seed", data: {} }];
@@ -59,7 +62,7 @@ test("研究子agent 串联 outlineCorpusResearch → outlineChat 全链路", as
 		const engine = new OutlineEngine({
 			cwd,
 			getSessionManager: () => sm,
-			loadMaterials: () => loadStageMaterials(new URL("..", import.meta.url).pathname),
+			loadMaterials: () => loadStageMaterials(repositoryRoot),
 			runSideModel: async (step, _system, userText) => {
 				steps.push(step);
 				if (step === "outlineCorpusResearch") {

@@ -323,6 +323,17 @@ function Stage-Clean {
     Remove-Item $presets -Recurse -Force -ErrorAction SilentlyContinue
   }
 
+  # Public maintenance entrypoints and their import/hook dependencies must survive trimming.
+  $maintenancePaths = @(
+    "scripts\prepare-public-git.mjs",
+    "scripts\public-git-guard.mjs",
+    "scripts\public-repository-policy.mjs",
+    "scripts\check-repository-privacy.mjs",
+    "scripts\check-docs.mjs",
+    "scripts\check-public-data.mjs",
+    "scripts\check-publication-range.mjs"
+  ) | ForEach-Object { Join-Path $dest $_ }
+
   # Drop test / internal tooling from release tree
   $dropGlobs = @(
     "test",
@@ -349,23 +360,19 @@ function Stage-Clean {
     "scripts\_*.sh",
     # root-level dev scratch (underscore convention) + probe dumps
     "_*",
-    "TESTING.md",
-    "CLAUDE.md",
     "docs\st-ux-inventory.md",
     "docs\superpowers",
-    # 内部架构设计文档：研发过程记录（含逆向分析路径、未修问题定位、
-    # 被数据推翻的自我结论），仓库里可见即可，不随发布包分发
-    "docs\PLAN-*.md",
+    # Preserve approved public guides and their link closure; trim local records.
     "docs\REVIEW-*.md",
     "docs\DRAFT-*.md",
-    "docs\PRESET-SPLIT-TAXONOMY.md",
-    # 内部文档（含本地绝对路径/会话定位，仅仓库可见）+ 预设装载期生成物（用户数据）
-    "docs\READING-THINKING.md",
+    # Preset-load generated user data never ships.
     "skills\预设-*"
   )
   foreach ($g in $dropGlobs) {
     $p = Join-Path $dest $g
-    Get-Item $p -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-Item $p -ErrorAction SilentlyContinue | Where-Object {
+      $_.FullName -notin $maintenancePaths
+    } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
   }
   # source maps not required at runtime
   Get-ChildItem (Join-Path $dest "packages") -Recurse -Filter "*.map" -ErrorAction SilentlyContinue |

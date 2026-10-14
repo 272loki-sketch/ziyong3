@@ -32,8 +32,11 @@ function withTempCwd(run: (cwd: string) => Promise<void> | void): Promise<void> 
 }
 
 const mode = (path: string) => lstatSync(path).mode & 0o777;
+function assertPosixMode(path: string, expected: number): void {
+	if (process.platform !== "win32") assert.equal(mode(path), expected, path);
+}
 
-test("private root/scopes/files use restrictive permissions; bytes and scope isolation are preserved", async () => withTempCwd(async (cwd) => {
+test("POSIX private root/scopes/files modes are restrictive where supported; bytes and scope isolation are preserved", async () => withTempCwd(async (cwd) => {
 	const store = new DatabasePluginStore(cwd);
 	const root = join(cwd, DATABASE_PLUGIN_STORE_DIRECTORY);
 	const scope: DatabasePluginScope = { sessionId: "session-a", card: "cards/a.png" };
@@ -41,7 +44,7 @@ test("private root/scopes/files use restrictive permissions; bytes and scope iso
 	const payload = Buffer.from([0, 1, 2, 127, 128, 254, 255]);
 	const saved = await store.putFile(scope, "user/files/TavernDB_ACU_vector_registry", payload.toString("base64"));
 
-	assert.equal(mode(root), 0o700);
+	assertPosixMode(root, 0o700);
 	assert.equal(saved.name, "TavernDB_ACU_vector_registry");
 	assert.equal(saved.path, "/api/database-plugin/files/TavernDB_ACU_vector_registry");
 	assert.equal(saved.sha256, createHash("sha256").update(payload).digest("hex"));
@@ -58,9 +61,9 @@ test("private root/scopes/files use restrictive permissions; bytes and scope iso
 	const scopeDirectory = join(scopesRoot, (await import("node:crypto")).createHash("sha256")
 		.update(JSON.stringify({ sessionId: scope.sessionId, card: scope.card })).digest("hex"));
 	const objectPath = join(scopeDirectory, "objects", saved.name);
-	assert.equal(mode(scopesRoot), 0o700);
-	assert.equal(mode(scopeDirectory), 0o700);
-	assert.equal(mode(objectPath), 0o600);
+	assertPosixMode(scopesRoot, 0o700);
+	assertPosixMode(scopeDirectory, 0o700);
+	assertPosixMode(objectPath, 0o600);
 }));
 
 test("delete and list expose only regular plugin objects and preserve missing-file semantics", async () => withTempCwd(async (cwd) => {
@@ -230,10 +233,10 @@ test("scope state snapshot and head files are private and concurrent reads retur
 	const scopeDirectory = join(root, scopeHash);
 	const snapshotsDirectory = join(scopeDirectory, "state-snapshots");
 	const snapshotName = (await readdir(snapshotsDirectory))[0]!;
-	assert.equal(mode(scopeDirectory), 0o700);
-	assert.equal(mode(snapshotsDirectory), 0o700);
-	assert.equal(mode(join(scopeDirectory, "state-head.json")), 0o600);
-	assert.equal(mode(join(snapshotsDirectory, snapshotName)), 0o600);
+	assertPosixMode(scopeDirectory, 0o700);
+	assertPosixMode(snapshotsDirectory, 0o700);
+	assertPosixMode(join(scopeDirectory, "state-head.json"), 0o600);
+	assertPosixMode(join(snapshotsDirectory, snapshotName), 0o600);
 	const head = JSON.parse(readFileSync(join(scopeDirectory, "state-head.json"), "utf8")) as { globalRevision: number };
 	assert.equal(head.globalRevision, 1);
 }));

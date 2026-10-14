@@ -8,19 +8,39 @@ import type{NpcParallelScope}from'../src/stage/npc-parallel.ts';
 export interface VeridisRewriteHost {binding():NpcParallelScope;isBusy():boolean;model():{provider:string;id:string}|undefined;branch():Array<{customType?:string;data?:unknown}>}
 const json=(res:ServerResponse,status:number,data:unknown)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));};
 async function body(req:IncomingMessage){let bytes=0,text='';for await(const chunk of req){bytes+=chunk.length;if(bytes>4*1024*1024)throw Error('净化设置请求过大');text+=chunk;}return JSON.parse(text||'{}');}
-const credentialKey=/^(?:api[_-]?key|key|api[_-]?token|token|access[_-]?token|refresh[_-]?token|secret|password|authorization|oauth)$/i;
+const credentialKey=/^(?:api[_-]?key|key|api[_-]?token|token|access[_-]?token|refresh[_-]?token|secret|client[_-]?secret|private[_-]?key|password|passwd|passphrase|credential|credentials|authorization|oauth)$/i;
+function publicRewriteString(value:string):string{
+ if(/^https?:\/\//i.test(value))try{
+  const url=new URL(value);let changed=!!(url.username||url.password);url.username='';url.password='';
+  for(const key of url.searchParams.keys())if(credentialKey.test(key)){url.searchParams.set(key,'host-managed');changed=true;}
+  if(changed)return url.toString();
+ }catch{}
+ if(/^[ \t]*(?:authorization|proxy-authorization|x-api-key|api-key|x-goog-api-key|cookie|[\w-]*token)\s*:/im.test(value))return value.replace(/^([ \t]*(?:authorization|proxy-authorization|x-api-key|api-key|x-goog-api-key|cookie|[\w-]*token)\s*:)[^\r\n]*/gim,'$1 host-managed');
+ return value;
+}
 export function publicRewriteSettings(value:unknown):any{
  if(Array.isArray(value))return value.map(publicRewriteSettings);
  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).filter(([k])=>!credentialKey.test(k)).map(([k,v])=>[k,publicRewriteSettings(v)]));
- return value;
+ return typeof value==='string'?publicRewriteString(value):value;
+}
+function hasPrivateSettings(value:any):boolean{
+ if(typeof value==='string')return publicRewriteString(value)!==value;
+ return !!value&&typeof value==='object'&&Object.entries(value).some(([k,v])=>credentialKey.test(k)&&v!==''&&v!==null||hasPrivateSettings(v));
 }
 function mergePrivateSettings(before:any,proposed:any):any{
+ // Restore bytes only when the user returned this exact string's public projection.
+ // Changed URLs/headers are replacements, never a basis for splicing old credentials.
+ if(typeof before==='string'&&typeof proposed==='string'&&publicRewriteString(before)!==before&&proposed===publicRewriteString(before))return before;
+ if((Array.isArray(before)!==Array.isArray(proposed)||typeof before!==typeof proposed||(before===null)!==(proposed===null))&&hasPrivateSettings(before))throw Error('字段含隐藏凭据，不能删除或替换其数据结构；请保留原字段');
  if(Array.isArray(proposed)){
-  const previous=Array.isArray(before)?before:[],hasSecrets=(value:any):boolean=>value&&typeof value==='object'&&Object.entries(value).some(([k,v])=>credentialKey.test(k)&&v!==''&&v!==null||hasSecrets(v));
+  const previous=Array.isArray(before)?before:[];
   const key=(value:any)=>value&&typeof value==='object'&&!Array.isArray(value)&&typeof value.id==='string'&&value.id?value.id:undefined;
-  if(previous.some(hasSecrets)){
+  if(previous.some(hasPrivateSettings)){
    const ids=previous.map(key),nextIds=proposed.map(key);
-   if(ids.every(Boolean)&&nextIds.every(Boolean)&&new Set(ids).size===ids.length&&new Set(nextIds).size===nextIds.length){const indexed=new Map(previous.map(value=>[key(value),value]));return proposed.map(value=>mergePrivateSettings(indexed.get(key(value)),value));}
+   if(ids.every(Boolean)&&nextIds.every(Boolean)&&new Set(ids).size===ids.length&&new Set(nextIds).size===nextIds.length){
+    const nextKeys=new Set(nextIds);if(previous.some(value=>hasPrivateSettings(value)&&!nextKeys.has(key(value))))throw Error('数组项含隐藏凭据，不能删除；请保留原id');
+    const indexed=new Map(previous.map(value=>[key(value),value]));return proposed.map(value=>mergePrivateSettings(indexed.get(key(value)),value));
+   }
    if(JSON.stringify(publicRewriteSettings(previous))!==JSON.stringify(publicRewriteSettings(proposed)))throw Error('数组含隐藏凭据且没有唯一稳定id，不能确认重排后的归属；请保持结构');
   }
   return proposed.map((value,index)=>mergePrivateSettings(previous[index],value));
@@ -29,7 +49,7 @@ function mergePrivateSettings(before:any,proposed:any):any{
  const result:any=Object.fromEntries(Object.entries(proposed).filter(([k])=>!credentialKey.test(k)).map(([k,v])=>[k,mergePrivateSettings(before?.[k],v)]));
  if(before&&typeof before==='object'&&!Array.isArray(before))for(const[k,v]of Object.entries(before)){
   if(credentialKey.test(k))result[k]=v;
-  else if(!(k in result)&&v&&typeof v==='object'){const hidden=mergePrivateSettings(v,{});if(Object.keys(hidden).length)result[k]=hidden;}
+  else if(!Object.hasOwn(result,k)&&hasPrivateSettings(v))throw Error('字段含隐藏凭据，不能删除；请保留原字段');
  }
  return result;
 }
@@ -57,13 +77,14 @@ export class VeridisRewriteHttp {
   globalPresetLibrary():{presets:Record<string,any>;defaultPreset?:string}{
    const path=join(this.cwd,'.liyuan-veridis-rewrite','global-presets.json');let stat;try{stat=lstatSync(path);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return {presets:{}};throw error;}if(stat.isSymbolicLink()||!stat.isFile()||stat.size>4*1024*1024)throw Error('Invalid global Veridis preset file');
    const data=JSON.parse(readFileSync(path,'utf8'));if(data.version!==1||!data.presets||typeof data.presets!=='object'||Array.isArray(data.presets))throw Error('Invalid global Veridis preset library');
-   assertSettings(data.presets);if(data.defaultPreset!==undefined&&(typeof data.defaultPreset!=='string'||!Object.hasOwn(data.presets,data.defaultPreset)))throw Error('Invalid global Veridis default preset');return {presets:publicRewriteSettings(data.presets),defaultPreset:data.defaultPreset};
+   assertSettings(data.presets);if(data.defaultPreset!==undefined&&(typeof data.defaultPreset!=='string'||!Object.hasOwn(data.presets,data.defaultPreset)))throw Error('Invalid global Veridis default preset');// Keep private library values intact; status() is the browser projection boundary.
+   return {presets:data.presets,defaultPreset:data.defaultPreset};
   }
   effectiveSettings(stored:any):any{
    const library=this.globalPresetLibrary(),settings=structuredClone(stored??defaultVeridisHostSettings());
    if(Object.keys(library.presets).length)settings.presets={...library.presets,...settings.presets};
    if(library.defaultPreset&&settings.useGlobalDefaultPreset!==false&&!settings.activePreset&&(!stored||!Array.isArray(settings.rules)||settings.rules.length===0)){
-    const preset=library.presets[library.defaultPreset],rules=Array.isArray(preset)?preset:preset?.rules;
+     const preset=settings.presets[library.defaultPreset],rules=Array.isArray(preset)?preset:preset?.rules;
     if(!Array.isArray(rules))throw Error('Invalid global Veridis default rules');
     settings.activePreset=library.defaultPreset;settings.defaultPreset=library.defaultPreset;settings.rules=structuredClone(rules);
     if(preset.aiRewrite){const parameters=structuredClone(preset.aiRewrite);delete parameters.enabled;delete parameters.autoTriggerEnabled;settings.aiRewrite={...settings.aiRewrite,...parameters};}
@@ -113,7 +134,7 @@ export class VeridisRewriteHttp {
     if(data.enabled&&!this.host.model())throw Error('净化独立3.8Flash岗位未配置');checkBusy();this.sources.configure({...(typeof data.enabled==='boolean'?{enabled:data.enabled}:{}),...(typeof data.autoUpdate==='boolean'?{autoUpdate:data.autoUpdate}:{})});
    }else if(path.endsWith('/settings')){
     if(!data.settings||typeof data.settings!=='object'||Array.isArray(data.settings))throw Error('净化规则设置必须是对象');assertSettings(data.settings);
-    const state=structuredClone(saved.state);state.extensionSettings.veridis_rewrite=mergePrivateSettings(saved.state.extensionSettings.veridis_rewrite,data.settings);
+    const state=structuredClone(saved.state);state.extensionSettings.veridis_rewrite=mergePrivateSettings(this.effectiveSettings(saved.state.extensionSettings.veridis_rewrite),data.settings);
     this.store.save(scope,saved.revision,state,()=>{this.guard(scope);checkBusy();});
    }else{
     const action=path.split('/').at(-1);checkBusy();if(this.management)throw Object.assign(Error('已有净化管理任务，请等待'),{statusCode:409});this.management={scope,revision:saved.revision,alive:()=>!req.aborted&&!res.destroyed};try{

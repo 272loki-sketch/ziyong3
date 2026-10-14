@@ -3,10 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { OutlineConflictError, OutlineEngine } from "../src/outline/engine.ts";
 import { loadStageMaterials } from "../src/stage/materials.ts";
 import type { BranchEntryLike } from "../src/stage/assemble.ts";
+
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
 class FauxSession {
 	entries: BranchEntryLike[] = [{ id: "leaf", type: "custom", customType: "seed", data: {} }];
@@ -20,9 +23,9 @@ class FauxSession {
 test("OutlineEngine chat stores pending and confirm commits proposal then rp-outline", async () => {
 	const sm = new FauxSession();
 	const engine = new OutlineEngine({
-		cwd: new URL("..", import.meta.url).pathname,
+		cwd: repositoryRoot,
 		getSessionManager: () => sm,
-		loadMaterials: () => loadStageMaterials(new URL("..", import.meta.url).pathname),
+		loadMaterials: () => loadStageMaterials(repositoryRoot),
 		runSideModel: async (step) => step === "outlineAudit"
 			? JSON.stringify({ version: 1, verdict: "approve", issues: [], summary: "ok" })
 			: JSON.stringify({ answer: "两个方向", options: [{ id: "a" }, { id: "b" }], proposal: { version: 1, id: "p1", mode: "manual", baseRevision: 0, baseHash: engine.getView().state.hash, baseLeafId: "leaf", kind: "chat", rationale: "慢热", researchInspirationIds: [], patch: { premise: "慢热同行" } } }),
@@ -39,9 +42,9 @@ test("OutlineEngine next-beat discussion persists structured scene advice withou
 	const sm = new FauxSession();
 	let requestFocus = "";
 	const engine = new OutlineEngine({
-		cwd: new URL("..", import.meta.url).pathname,
+		cwd: repositoryRoot,
 		getSessionManager: () => sm,
-		loadMaterials: () => loadStageMaterials(new URL("..", import.meta.url).pathname),
+		loadMaterials: () => loadStageMaterials(repositoryRoot),
 		runSideModel: async (_step, _system, userText) => {
 			requestFocus = JSON.parse(userText).request.focus;
 			return JSON.stringify({ answer: "先让对方主动打破沉默。", options: ["安静试探", "外部打断"], sceneAdvice: { recommendedBeat: "以一件眼前小事恢复互动", openingMove: "对方先移动桌上的物件", characterMoves: ["NPC 主动开口"], conversationTargets: [{ character: "图书委员", reason: "此刻正在整理现场，职责提供自然接触理由", openingTopic: "询问借阅登记或归架顺序", risk: "对方可能只想完成工作" }], dialogueCues: ["话题表面日常，实际确认态度"], pressure: "沉默继续会错过窗口", playerSpace: "用户可回应或继续观察", stopPoint: "问题落到用户是否接话", alternatives: ["第三人经过造成短暂打断"], mixedRoute: "先帮忙整理两分钟，再找图书委员确认一本书的去向" }, proposal: null });
@@ -60,9 +63,9 @@ test("OutlineEngine daily discussion persists three distinct candidate cards", a
 	const sm = new FauxSession();
 	const plan = (title: string, index: number) => ({ title, genre: "发糖", duration: "一小时", location: ["庭院", "集市", "书库"][index], participants: ["甲", "乙"], initiator: `${index ? "乙" : "甲"}主动邀请`, surfaceActivity: ["共同整理花架", "临时采购物资", "雨天整理档案"][index], privateIntent: "确认彼此默契", sweetBeats: ["递工具时记得习惯"], friction: "对完成顺序意见不同", misunderstanding: "误以为对方想独自完成", characterBoundaries: ["不替用户承诺"], relationshipChange: "从客气协作变为自然配合", playerChoices: ["先解释", "用行动回应"], stopPoint: "问题落到用户选择", followUpSeeds: ["下次共同任务"], researchRefs: [], entryCondition: "当前事务尚未收尾", continuityHook: "承接上一拍留下的物品", whyNow: "今天是完成事务的最后窗口", intensity: ["light", "medium", "strong"][index], initiativeType: ["照料", "求助", "试探"][index], pressureType: ["时间", "资源", "秘密"][index], choiceType: ["回应", "分工", "坦白"][index], relationshipEffect: ["熟悉", "信任", "边界变化"][index] });
 	const engine = new OutlineEngine({
-		cwd: new URL("..", import.meta.url).pathname,
+		cwd: repositoryRoot,
 		getSessionManager: () => sm,
-		loadMaterials: () => loadStageMaterials(new URL("..", import.meta.url).pathname),
+		loadMaterials: () => loadStageMaterials(repositoryRoot),
 		runSideModel: async () => JSON.stringify({ answer: "三种不同的小剧情。", dailyPlans: [plan("整理花架", 0), plan("临时采购", 1), plan("雨天归档", 2)], proposal: null }),
 	});
 	const result = await engine.chat("给我一些日常小剧情", { focus: "daily" });
@@ -75,7 +78,7 @@ test("OutlineEngine rejects stale leaf before model result is stored", async () 
 	const sm = new FauxSession();
 	let release!: () => void;
 	const wait = new Promise<void>((resolve) => { release = resolve; });
-	const engine = new OutlineEngine({ cwd: new URL("..", import.meta.url).pathname, getSessionManager: () => sm, loadMaterials: () => loadStageMaterials(new URL("..", import.meta.url).pathname), runSideModel: async () => { await wait; return JSON.stringify({ answer: "x" }); } });
+	const engine = new OutlineEngine({ cwd: repositoryRoot, getSessionManager: () => sm, loadMaterials: () => loadStageMaterials(repositoryRoot), runSideModel: async () => { await wait; return JSON.stringify({ answer: "x" }); } });
 	const running = engine.chat("愿望");
 	sm.appendCustomEntry("other", {}); release();
 	await assert.rejects(running, OutlineConflictError);
@@ -84,9 +87,9 @@ test("OutlineEngine rejects stale leaf before model result is stored", async () 
 test("OutlineEngine records audit rejection without writing rp-outline", async () => {
 	const sm = new FauxSession();
 	const engine = new OutlineEngine({
-		cwd: new URL("..", import.meta.url).pathname,
+		cwd: repositoryRoot,
 		getSessionManager: () => sm,
-		loadMaterials: () => loadStageMaterials(new URL("..", import.meta.url).pathname),
+		loadMaterials: () => loadStageMaterials(repositoryRoot),
 		runSideModel: async (step) => step === "outlineAudit"
 			? JSON.stringify({ version: 1, verdict: "reject", issues: [], summary: "越过边界" })
 			: JSON.stringify({ answer: "方向", proposal: { version: 1, id: "p-reject", mode: "manual", baseRevision: 0, baseHash: engine.getView().state.hash, baseLeafId: "leaf", kind: "chat", rationale: "候选", researchInspirationIds: [], patch: { premise: "候选" } } }),
@@ -115,9 +118,9 @@ test("outline research store writes only compact source and mechanism JSON", asy
 test("OutlineEngine clearChats appends clear marker and only returns chats after it", async () => {
 	const sm = new FauxSession();
 	const engine = new OutlineEngine({
-		cwd: new URL("..", import.meta.url).pathname,
+		cwd: repositoryRoot,
 		getSessionManager: () => sm,
-		loadMaterials: () => loadStageMaterials(new URL("..", import.meta.url).pathname),
+		loadMaterials: () => loadStageMaterials(repositoryRoot),
 		runSideModel: async () => JSON.stringify({ answer: "第一条" }),
 	});
 	await engine.chat("第一条");

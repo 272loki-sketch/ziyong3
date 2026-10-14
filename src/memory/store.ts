@@ -89,6 +89,18 @@ function openDatabase(cwd: string): SqliteDatabase {
 	return db;
 }
 
+/** Release this owner's cached connection after its pending work has finished.
+ * No files, scopes, config, or migration history are deleted. A later operation
+ * reopens the same persisted database; unrelated project connections stay open.
+ */
+export function closeMemoryDatabase(cwd: string): boolean {
+ const path = dbPath(cwd), db = dbCache.get(path);
+ if (!db) return false;
+ db.close();
+ dbCache.delete(path);
+ return true;
+}
+
 function parseChunk(line: string): MemoryChunk | null {
 	try {
 		const c = JSON.parse(line) as MemoryChunk;

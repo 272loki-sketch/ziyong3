@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, posix } from "node:path";
+import { approvedDocumentation, pathCategory } from "../scripts/public-repository-policy.mjs";
 import test from "node:test";
 
 // Never execute pack-release.ps1: it can build and reads a real working tree.
@@ -27,24 +28,35 @@ function functionSource(name: string): string {
 	const end = source.indexOf("\nfunction ", start + 1);
 	return source.slice(start, end < 0 ? undefined : end);
 }
-function pythonProgram(name: string, values: Record<string, string>): string {
+function pythonProgram(name: string, values: Record<string, string>): { code: string; input: string } {
 	const match = functionSource(name).match(/\$py = @"\n([\s\S]*?)\n"@/);
 	assert.ok(match, `missing embedded Python in ${name}`);
-	return match[1].replace(/\$(ReleaseDataPolicyJson|ReleasePathPolicyPython|SourceDir|ZipPath)\b/g, (_all, variable: string) => {
-		const value = { ReleaseDataPolicyJson: policyJson, ReleasePathPolicyPython: predicate, ...values }[variable];
+	// Send filesystem paths as JSON on stdin rather than interpolating Windows
+	// backslashes into Python source literals.
+	let program = match[1]
+		.replaceAll("Path(r'''$SourceDir''')", 'Path(fixture_paths["SourceDir"])')
+		.replaceAll("Path(r'''$ZipPath''')", 'Path(fixture_paths["ZipPath"])')
+		.replaceAll("zipfile.ZipFile(r'''$ZipPath''')", 'zipfile.ZipFile(fixture_paths["ZipPath"])')
+		.replaceAll("+ r'''$ZipPath'''", '+ fixture_paths["ZipPath"]');
+	program = program.replace(/\$(ReleaseDataPolicyJson|ReleasePathPolicyPython)\b/g, (_all, variable: string) => {
+		const value = { ReleaseDataPolicyJson: policyJson, ReleasePathPolicyPython: predicate }[variable];
 		assert.notEqual(value, undefined, `missing fixture value ${variable}`);
 		return value;
 	});
+	assert.doesNotMatch(program, /\$(?:SourceDir|ZipPath)\b/, `${name} has an unsubstituted path`);
+	return { code: `import json, sys\nfixture_paths = json.loads(sys.stdin.read())\n${program}`, input: JSON.stringify(values) };
 }
-function python(code: string): { status: number | null; stdout: string; stderr: string } {
+
+function python(code: string, input = ""): { status: number | null; stdout: string; stderr: string } {
 	const result = spawnSync(process.platform === "win32" ? "python" : "python3", ["-c", code], {
-		encoding: "utf8", timeout: 5_000, maxBuffer: 1024 * 1024,
+		input, encoding: "utf8", timeout: 5_000, maxBuffer: 1024 * 1024,
+		env: { ...process.env, PYTHONIOENCODING: "utf-8" },
 	});
 	assert.ifError(result.error); // Python stdlib is also required by the real packaging script.
 	return result;
 }
 function fixture(run: (root: string, stage: string, zip: string) => void): void {
-	const root = mkdtempSync(join(tmpdir(), "liyuan-release-policy-"));
+	const root = mkdtempSync(join(realpathSync(tmpdir()), "liyuan-release-policy-"));
 	try { run(root, join(root, "stage"), join(root, "fixture.zip")); }
 	finally { rmSync(root, { recursive: true, force: true }); }
 }
@@ -107,28 +119,107 @@ test("release: actual embedded ZIP writer excludes user data from an isolated fi
 	for (const [path, content] of Object.entries(productFiles)) put(stage, path, content);
 	for (const path of privatePaths) put(stage, path, "PRIVATE-FIXTURE-ONLY");
 	const writer = pythonProgram("Write-Utf8Zip", { SourceDir: stage, ZipPath: zip });
-	const written = python(writer + "\nprint(json.dumps(zipfile.ZipFile(zip_path).namelist()))\n");
+	const written = python(writer.code + "\nprint(json.dumps(zipfile.ZipFile(zip_path).namelist()))\n", writer.input);
 	assert.equal(written.status, 0, written.stderr);
 	const names = JSON.parse(written.stdout.trim().split("\n").at(-1)!) as string[];
 	assert.deepEqual([...names].sort(), Object.keys(productFiles).map(path => `Liyuan/${path}`).sort());
-	const checked = python(pythonProgram("Test-ReleaseZip", { ZipPath: zip }));
+	const checker = pythonProgram("Test-ReleaseZip", { ZipPath: zip });
+	const checked = python(checker.code, checker.input);
 	assert.equal(checked.status, 0, checked.stdout + checked.stderr);
 }));
 
 test("release: actual embedded ZIP checker rejects injected user directories even if staging/archive pruning regress", () => fixture((_root, stage, zip) => {
 	for (const [path, content] of Object.entries(productFiles)) put(stage, path, content);
-	assert.equal(python(pythonProgram("Write-Utf8Zip", { SourceDir: stage, ZipPath: zip })).status, 0);
-	const injection = `import zipfile\nwith zipfile.ZipFile(${JSON.stringify(zip)}, 'a') as z:\n` + privatePaths.map(path => `    z.writestr(${JSON.stringify(`Liyuan/${path}`)}, 'PRIVATE-FIXTURE-ONLY')`).join("\n");
-	assert.equal(python(injection).status, 0);
-	const checked = python(pythonProgram("Test-ReleaseZip", { ZipPath: zip }));
+	const writer = pythonProgram("Write-Utf8Zip", { SourceDir: stage, ZipPath: zip });
+	assert.equal(python(writer.code, writer.input).status, 0);
+	const injection = `import json, sys, zipfile\nzip_path = json.loads(sys.stdin.read())\nwith zipfile.ZipFile(zip_path, 'a') as z:\n` + privatePaths.map(path => `    z.writestr(${JSON.stringify(`Liyuan/${path}`)}, 'PRIVATE-FIXTURE-ONLY')`).join("\n");
+	assert.equal(python(injection, JSON.stringify(zip)).status, 0);
+	const checker = pythonProgram("Test-ReleaseZip", { ZipPath: zip });
+	const checked = python(checker.code, checker.input);
 	assert.equal(checked.status, 1, checked.stdout + checked.stderr);
 	for (const path of privatePaths) assert.ok(checked.stdout.includes(`Liyuan/${path}`), `missing leak rejection: ${path}`);
 }));
 
 test("release: checker fails closed when the required RP/vision product wiring is missing", () => fixture((_root, _stage, zip) => {
-	assert.equal(python(`import zipfile\nwith zipfile.ZipFile(${JSON.stringify(zip)}, 'w') as z:\n    z.writestr('Liyuan/package.json', '{}')`).status, 0);
-	const checked = python(pythonProgram("Test-ReleaseZip", { ZipPath: zip }));
+	assert.equal(python("import json, sys, zipfile\nzip_path = json.loads(sys.stdin.read())\nwith zipfile.ZipFile(zip_path, 'w') as z:\n    z.writestr('Liyuan/package.json', '{}')", JSON.stringify(zip)).status, 0);
+	const checker = pythonProgram("Test-ReleaseZip", { ZipPath: zip });
+	const checked = python(checker.code, checker.input);
 	assert.equal(checked.status, 1);
 	assert.match(checked.stdout, /MISSING \.liyuan\/extensions\/roleplay\.ts/);
 	assert.match(checked.stdout, /MISSING server\/mcp\/vision-server\.mjs/);
 }));
+
+test("release: manifest public maintenance tools retain their import and hook dependency closure after trimming and ZIP", () => fixture((_root, stage, zip) => {
+	const staging = functionSource("Stage-Clean");
+	const array = (name: string): string[] => {
+		const match = staging.match(new RegExp(`\\$${name} = @\\(\\n([\\s\\S]*?)\\n  \\)`));
+		assert.ok(match, `missing ${name}`);
+		return [...match[1].matchAll(/^\s*"([^"]+)"/gm)].map(value => value[1].replace(/\\/g, "/"));
+	};
+	const retained = array("maintenancePaths");
+	const drops = array("dropGlobs");
+	const excludedFiles = array("xf");
+	assert.match(staging, /\$maintenancePaths[\s\S]*?ForEach-Object \{ Join-Path \$dest \$_ \}/);
+	assert.match(staging, /Get-Item \$p[^\n]*\| Where-Object \{\n\s*\$_\.FullName -notin \$maintenancePaths\n\s*\} \| Remove-Item/);
+	const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+	const pending: string[] = ["git:public", "privacy:check", "privacy:staged", "privacy:commit", "docs:check"].map(name => {
+		const match = manifest.scripts[name]?.match(/^node (scripts\/[^ ]+\.mjs)(?: |$)/);
+		assert.ok(match, `missing public maintenance entrypoint ${name}`);
+		return match[1];
+	});
+	// The exporter copies these tools into candidate hooks, rather than importing the guard.
+	const exporter = readFileSync(new URL("../scripts/prepare-public-git.mjs", import.meta.url), "utf8");
+	const hookTools = exporter.match(/for \(const name of \[([^\]]+)\]\)/);
+	assert.ok(hookTools, "missing exporter hook tool dependencies");
+	for (const match of hookTools[1].matchAll(/'([^']+\.mjs)'/g)) pending.push(`scripts/${match[1]}`);
+	pending.push("scripts/check-public-data.mjs", "scripts/check-publication-range.mjs");
+	const files: Record<string, string> = { ...productFiles, "package.json": JSON.stringify(manifest) };
+	const visited = new Set<string>();
+	while (pending.length) {
+		const path = pending.pop()!;
+		if (visited.has(path)) continue;
+		visited.add(path);
+		assert.equal(pathCategory(path, true), null, `unapproved maintenance dependency ${path}`);
+		assert.ok(retained.includes(path), `unprotected maintenance dependency ${path}`);
+		const text = readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
+		files[path] = text;
+		for (const match of text.matchAll(/\b(?:from\s*|import\s*\(\s*)["'](\.[^"']+)["']/g)) {
+			pending.push(posix.normalize(posix.join(posix.dirname(path), match[1])));
+		}
+	}
+	assert.deepEqual([...visited].sort(), [...retained].sort(), "retention must be limited to the reviewed dependency closure");
+	const survives = python(`import fnmatch, json\nfiles = ${JSON.stringify([...Object.keys(files), "scripts/check-private-fixture.mjs"])}\ndrops = ${JSON.stringify(drops)}\nexcluded = ${JSON.stringify(excludedFiles)}\nretained = ${JSON.stringify(retained)}\nprint(json.dumps([p for p in files if not any(fnmatch.fnmatchcase(p.rsplit('/', 1)[-1], g) for g in excluded) and (p in retained or not any(fnmatch.fnmatchcase(p, g) for g in drops))]))`);
+	assert.equal(survives.status, 0, survives.stderr);
+	const staged = JSON.parse(survives.stdout) as string[];
+	assert.ok(!staged.includes("scripts/check-private-fixture.mjs"), "unapproved check tools must still be trimmed");
+	for (const path of staged) put(stage, path, files[path]);
+	const writer = pythonProgram("Write-Utf8Zip", { SourceDir: stage, ZipPath: zip });
+	const written = python(writer.code + "\nprint(json.dumps(zipfile.ZipFile(zip_path).namelist()))\n", writer.input);
+	assert.equal(written.status, 0, written.stderr);
+	const names = JSON.parse(written.stdout.trim().split("\n").at(-1)!) as string[];
+	for (const path of visited) assert.ok(names.includes(`Liyuan/${path}`), `missing archived dependency ${path}`);
+	const checker = pythonProgram("Test-ReleaseZip", { ZipPath: zip });
+	const checked = python(checker.code, checker.input);
+	assert.equal(checked.status, 0, checked.stdout + checked.stderr);
+	// Exercise real static imports without exporting a repository or running an audit.
+	const help = spawnSync(process.execPath, [join(stage, "scripts/prepare-public-git.mjs"), "--help"], {
+		cwd: dirname(stage), encoding: "utf8", timeout: 5_000,
+	});
+	assert.ifError(help.error);
+	assert.equal(help.status, 0, help.stdout + help.stderr);
+	assert.match(help.stdout, /Usage: node scripts\/prepare-public-git\.mjs/);
+}));
+
+
+test("release: approved public guide closure is not trimmed as historical development notes", () => {
+ const staging = functionSource("Stage-Clean");
+ const match = staging.match(/\$dropGlobs = @\(\n([\s\S]*?)\n  \)/);
+ assert.ok(match);
+ const drops = [...match[1].matchAll(/^\s*"([^"]+)"/gm)].map(value => value[1].replace(/\\/g, "/"));
+ const guides = ["README.md", "TESTING.md", "AGENTS.md", "CLAUDE.md", "deploy/README.md", "deploy/VPS-OPERATIONS.md", "licenses/README.md", ...[...approvedDocumentation].map(name => `docs/${name}`)];
+ const checked = python(`import fnmatch, json\nguides = ${JSON.stringify(guides)}\ndrops = ${JSON.stringify(drops)}\nprint(json.dumps([p for p in guides if any(fnmatch.fnmatchcase(p, g) for g in drops)]))`);
+ assert.equal(checked.status, 0, checked.stderr);
+ assert.deepEqual(JSON.parse(checked.stdout), [], "public README and navigation links must survive release trimming");
+ assert.ok(drops.includes("test"));
+ assert.ok(drops.includes("docs/superpowers"));
+});

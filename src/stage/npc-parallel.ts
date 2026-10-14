@@ -70,7 +70,7 @@ export function admitNpcBatch(raw:string,batch:NpcParallelBatch,scope:NpcParalle
    for(const id of ids){
     const event=typeof id==='string'?next.occurrences.find(e=>e.id===id):undefined;
     if(typeof id!=='string'||!event||!event.participants.some(p=>p===candidate.actorId||p===candidate.name)){
-     eventErrors.push(`${candidate.name} 共享事件引用或参与者不匹配：eventId=${JSON.stringify(id)}，actorId=${JSON.stringify(candidate.actorId)}，participants=${event?JSON.stringify(event.participants):'[]'}；${typeof id!=='string'?'eventId必须是字符串':!event?'事件不存在':'该actor不在事件participants中'}。eventIds只能绑定该actor实际参与的发生事件；不得为了通过校验把actor凭空加入已有事件participants。`);
+     eventErrors.push(`${candidate.name} 共享事件引用或参与者不匹配：eventId=${JSON.stringify(id)}，actorId=${JSON.stringify(candidate.actorId)}，participants=${event?JSON.stringify(event.participants):'[]'}；${typeof id!=='string'?'eventId必须是字符串':!event?'事件不存在':'该actor不在事件participants中'}`);
     }
    }
    if(eventErrors.length){errors.push(...eventErrors);continue;}

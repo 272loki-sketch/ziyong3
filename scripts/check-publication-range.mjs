@@ -1,10 +1,24 @@
 #!/usr/bin/env node
 // Event refs never fall back to HEAD. Diagnostics contain only categories and escaped OIDs.
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { auditRepository } from './check-repository-privacy.mjs';
+
+function sameFilesystemPath(left, right) {
+  const canonical = path => {
+    const value = realpathSync(resolve(path)).replace(/\\/g, '/');
+    return process.platform === 'win32' ? value.toLowerCase() : value;
+  };
+  return canonical(left) === canonical(right);
+}
+
+function isMain() {
+  if (!process.argv[1]) return false;
+  try { return sameFilesystemPath(process.argv[1], fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
 
 const isOid = value => typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
 const isZero = value => isOid(value) && /^0+$/.test(value);
@@ -86,7 +100,7 @@ export function auditPublicationRange({ cwd = process.cwd(), eventName,
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isMain()) {
   const result = auditPublicationRange({
     eventName: process.argv.length === 3 ? process.argv[2] : undefined,
     report: line => console.log(line),

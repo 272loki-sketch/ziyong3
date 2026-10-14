@@ -260,6 +260,8 @@ export function NpcParallelPanel({ contextTick, storyBusy = false, toast, onOpen
 	const [managerOpen, setManagerOpen] = useState(false);
 	const [managerTheme, setManagerTheme] = useState<"light" | "dark">("light");
 	const requestId = useRef(0);
+	const contextGeneration = useRef(0);
+	const operationGeneration = useRef(0);
 	const operationRunning = useRef(false);
 	const mounted = useRef(false);
 	const hasStatus = useRef(false);
@@ -290,13 +292,21 @@ export function NpcParallelPanel({ contextTick, storyBusy = false, toast, onOpen
 	}, []);
 
 	useEffect(() => {
+		const generation = ++contextGeneration.current;
+		operationGeneration.current++;
 		mounted.current = true;
+		// A prior scope's request may still be in flight, but it no longer owns
+		// the controls or operation lock for this context.
+		operationRunning.current = false;
+		setOperation("");
 		void refresh(true).catch(() => {});
 		const poll = window.setInterval(() => {
 			if (!operationRunning.current) void refresh(false).catch(() => {});
 		}, 12_000);
 		return () => {
 			mounted.current = false;
+			if (contextGeneration.current === generation) contextGeneration.current++;
+			operationGeneration.current++;
 			requestId.current++;
 			window.clearInterval(poll);
 		};
@@ -307,13 +317,15 @@ export function NpcParallelPanel({ contextTick, storyBusy = false, toast, onOpen
 	};
 	const runOperation = async (label: string, request: () => Promise<NpcParallelStatus>, success: (next: NpcParallelStatus) => string) => {
 		if (operationRunning.current) return;
+		const generation = contextGeneration.current;
+		const operation = ++operationGeneration.current;
 		operationRunning.current = true;
 		requestId.current++;
 		setOperation(label);
 		setFeedback(null);
 		try {
 			const next = await request();
-			if (mounted.current) {
+			if (mounted.current && generation === contextGeneration.current && operation === operationGeneration.current) {
 				setStatus(next);
 				setStatusError("");
 				const text = success(next);
@@ -322,11 +334,15 @@ export function NpcParallelPanel({ contextTick, storyBusy = false, toast, onOpen
 			}
 		} catch (error) {
 			const text = errorText(error);
-			if (mounted.current) setFeedback({ level: "error", text });
-			notify("error", text);
+			if (mounted.current && generation === contextGeneration.current && operation === operationGeneration.current) {
+				setFeedback({ level: "error", text });
+				notify("error", text);
+			}
 		} finally {
-			operationRunning.current = false;
-			if (mounted.current) setOperation("");
+			if (operation === operationGeneration.current) {
+				operationRunning.current = false;
+				if (mounted.current) setOperation("");
+			}
 		}
 	};
 	const config = (body: { enabled?: boolean; autoUpdate?: boolean }) => runOperation(
@@ -350,11 +366,14 @@ export function NpcParallelPanel({ contextTick, storyBusy = false, toast, onOpen
 		next => feedbackTextForAction(name, next),
 	);
 	const retryStatus = () => {
+		const generation = contextGeneration.current;
 		setFeedback(null);
 		void refresh(true).then(next => {
+			if (!mounted.current || generation !== contextGeneration.current) return;
 			const text = `状态已重新读取：${next.installed ? `已安装 ${next.version ?? "版本未知"}` : "尚未安装"}。`;
 			setFeedback({ level: "success", text });
 		}).catch(error => {
+			if (!mounted.current || generation !== contextGeneration.current) return;
 			const text = errorText(error);
 			setFeedback({ level: "error", text });
 		});

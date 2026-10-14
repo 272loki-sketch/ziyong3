@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,8 +34,9 @@ async function fixture(run: (value: { cwd: string; repo: string; source: TavernP
 	} finally { source?.close(); rmSync(base, { recursive: true, force: true }); }
 }
 function filePermissions(path: string) {
-	assert.equal(statSync(path).mode & 0o777, statSync(path).isDirectory() ? 0o700 : 0o600, path);
-	if (statSync(path).isDirectory()) for (const name of readdirSync(path)) filePermissions(join(path, name));
+	const info = statSync(path);
+	if (process.platform !== "win32") assert.equal(info.mode & 0o777, info.isDirectory() ? 0o700 : 0o600, path);
+	if (info.isDirectory()) for (const name of readdirSync(path)) filePermissions(join(path, name));
 }
 
 test("fixed trusted sources, read-only defaults, complete commit and byte-identical private runtime copy", () => fixture(async ({ cwd, repo, source }) => {
@@ -229,16 +231,29 @@ test("closing an in-flight source check cancels before activation and removes it
 }));
 
 test("native Git gets explicit proxy then dedicated env then HTTPS/HTTP fallback; no network is called", async () => {
-	const base = mkdtempSync(join(tmpdir(), "liyuan-tavern-git-proxy-")), log = join(base, "args.txt"), executable = join(base, "git");
-	writeFileSync(executable, `#!/bin/sh\nprintf '%s\\n' "$@" > '${log}'\nprintf '${"a".repeat(40)}\\tHEAD\\n'\n`, { mode: 0o700 });
-	const keys = ["PATH", "LIYUAN_TAVERN_GIT_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] as const; const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+	const calls: { file: string; args: readonly string[]; options: childProcess.ExecFileOptions }[] = [];
+	const originalExecFile = childProcess.execFile;
+	childProcess.execFile = ((file: string, args: readonly string[], options: childProcess.ExecFileOptions, callback: (error: Error | null, stdout: Buffer, stderr: Buffer) => void) => {
+		calls.push({ file, args: [...args], options });
+		queueMicrotask(() => callback(null, Buffer.from(`${"a".repeat(40)}\tHEAD\n`), Buffer.alloc(0)));
+		return {} as childProcess.ChildProcess;
+	}) as typeof childProcess.execFile;
+	syncBuiltinESMExports();
+	const keys = ["LIYUAN_TAVERN_GIT_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] as const; const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 	try {
-		process.env.PATH = `${base}:${process.env.PATH}`; process.env.LIYUAN_TAVERN_GIT_PROXY = "http://127.0.0.1:7011"; process.env.HTTPS_PROXY = "http://127.0.0.1:7012"; process.env.HTTP_PROXY = "http://127.0.0.1:7013";
+		process.env.LIYUAN_TAVERN_GIT_PROXY = "http://127.0.0.1:7011"; process.env.HTTPS_PROXY = "http://127.0.0.1:7012"; process.env.HTTP_PROXY = "http://127.0.0.1:7013";
 		for (const [explicit, expected, remove] of [["http://127.0.0.1:7010", "7010", undefined], [undefined, "7011", undefined], [undefined, "7012", "LIYUAN_TAVERN_GIT_PROXY"], [undefined, "7013", "HTTPS_PROXY"]] as const) {
-			if (remove) delete process.env[remove]; await createTavernPluginGitProvider(explicit).resolveCommit(TAVERN_PLUGIN_UPSTREAMS.helper, new AbortController().signal);
-			const args = readFileSync(log, "utf8"); assert.match(args, new RegExp(`http\\.proxy=http://127\\.0\\.0\\.1:${expected}`)); assert.match(args, /https:\/\/github.com\/N0VI028\/JS-Slash-Runner.git/);
+			if (remove) delete process.env[remove];
+			const beforeCount = calls.length;
+			await createTavernPluginGitProvider(explicit).resolveCommit(TAVERN_PLUGIN_UPSTREAMS.helper, new AbortController().signal);
+			assert.equal(calls.length, beforeCount + 1);
+			const args = calls.at(-1)!.args.join(" "); assert.equal(calls.at(-1)!.file, "git");
+			assert.match(args, new RegExp(`http\\.proxy=http://127\\.0\\.0\\.1:${expected}`)); assert.match(args, /https:\/\/github.com\/N0VI028\/JS-Slash-Runner.git/);
 		}
-	} finally { for (const key of keys) { if (before[key] === undefined) delete process.env[key]; else process.env[key] = before[key]; } rmSync(base, { recursive: true, force: true }); }
+	} finally {
+		for (const key of keys) { if (before[key] === undefined) delete process.env[key]; else process.env[key] = before[key]; }
+		childProcess.execFile = originalExecFile; syncBuiltinESMExports();
+	}
 });
 
 

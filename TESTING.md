@@ -129,7 +129,7 @@ node --test test/generation-mode-engine.test.ts test/stage-performance.test.ts t
 LIYUAN_DELIVERY_DIST=/tmp/liyuan-candidate-web LIYUAN_DELIVERY_ARTIFACTS=/tmp/liyuan-delivery-report node --test --test-concurrency=1 web/test/author-ready-delivery.test.mjs
 ```
 
-合成慢后台核对：原稿/格式/pending 先 flush 后 `onAuthorReady`，后台不挡可读正文与发送，下一拍只排队，刷新不复活生成壳；取消、失败、切支、重 Roll 与恢复不撤回原稿/重复事实。对应 entryId/entryScope 的刷新只重读派生快照，不能重跑卡脚本。记录前台就绪和完整后台耗时，不将并行阶段简单求和。
+合成慢后台核对：原稿/格式/pending 先 flush 后 `onAuthorReady`，后台不挡可读正文；新输入先排队，出队后必要恢复通过并持久化前不ACK。direct/director数据库pending失败回归确认不新增user、不触发 `onAccepted`、不调用新作者；恢复成功后同一输入可再处理。刷新不复活生成壳；取消、失败、切支、重 Roll 与恢复不撤回原稿/重复事实。对应 entryId/entryScope 的刷新只重读派生快照，不能重跑卡脚本。记录前台就绪和完整后台耗时，不将并行阶段简单求和。
 
 ### 检查面板实际展开
 

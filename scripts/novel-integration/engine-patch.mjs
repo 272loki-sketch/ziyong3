@@ -25,15 +25,20 @@ function assertApplied(source) {
 }
 export function apply(source) {
 	if (typeof source !== "string") throw new TypeError("engine source must be a string");
-	if (source.includes(MARKER)) { assertApplied(source); return source; }
-	let next = source;
+	// The snippets below are kept in LF form. Normalize only for matching, then
+	// restore the source's newline convention after transformation. Already
+	// patched input is validated in normalized form but returned byte-for-byte.
+	const newline = source.includes("\r\n") ? "\r\n" : "\n";
+	const normalized = source.replace(/\r\n/g, "\n");
+	if (normalized.includes(MARKER)) { assertApplied(normalized); return source; }
+	let next = normalized;
 	for (const [before, after] of replacements) {
 		assertExactlyOnce(next, before, "source");
 		next = next.replace(before, after);
 	}
 	if (!next.includes(MARKER)) throw new Error("engine patch marker was not installed");
 	assertApplied(next);
-	return next;
+	return newline === "\n" ? next : next.replace(/\n/g, newline);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
