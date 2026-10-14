@@ -1,7 +1,7 @@
 /** Original-byte Veridis Rewrite source manager. Upstream assets are never patched or rebuilt. */
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, type Stats } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { writeJsonAtomicWithBackup } from "../src/atomic-json.ts";
 import { acquireTavernPluginLock } from "./tavern-plugin-lock.ts";
@@ -346,13 +346,25 @@ function assertLocalReferences(files: Map<string, Buffer>): void {
   }
 }
 function defaultPointer(): Pointer { return { schema: 1, enabled: false, autoUpdate: false }; }
-function tightenPrivateTree(path: string): void {
-  const info = lstatSync(path);
+export interface VeridisRewritePrivateTreeFs {
+  lstatSync(path: string): Stats;
+  readdirSync(path: string): string[];
+  chmodSync(path: string, mode: number): void;
+}
+export function tightenPrivateTree(path: string, fsOps: VeridisRewritePrivateTreeFs = { lstatSync, readdirSync, chmodSync }): void {
+  const info = fsOps.lstatSync(path);
   if (info.isSymbolicLink()) throw new Error("Veridis Rewrite 暂存树含符号链接");
   if (info.isDirectory()) {
-    chmodSync(path, 0o700);
-    for (const name of readdirSync(path)) tightenPrivateTree(join(path, name));
-  } else if (info.isFile()) chmodSync(path, 0o600);
+    fsOps.chmodSync(path, 0o700);
+    for (const name of fsOps.readdirSync(path)) {
+      try { tightenPrivateTree(join(path, name), fsOps); }
+      catch (error) {
+        // Git can remove maintenance.lock between readdir and lstat. Ignore
+        // only a vanished child; unsafe entries and other I/O errors still fail.
+        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+      }
+    }
+  } else if (info.isFile()) fsOps.chmodSync(path, 0o600);
   else throw new Error("Veridis Rewrite 暂存树含非普通文件");
 }
 function assertExactAssetTree(root: string, expected: Set<string>): void {

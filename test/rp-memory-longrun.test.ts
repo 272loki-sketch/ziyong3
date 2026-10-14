@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { cleanupMemoryFixture } from "./support/memory-fixture.ts";
 
 import { memoryArchiveCompacted, memoryArcRecallForTurn, memoryListEventDigests, memoryRecallForTurn, memoryUpsertEventDigest, updateMemoryConfig, updateStoreConfig } from "../src/memory/service.ts";
 import type { RpEventDigest } from "../src/memory/types.ts";
@@ -46,7 +47,7 @@ test("rp-memory 1000-floor simulation: core event remains recallable after norma
 		const hidden = await memoryRecallForTurn(cwd, scope, "第一次见面 那把伞", new Set(["entry-turn-1000"]));
 		assert.equal(hidden.length, 0, "兄弟分支/不可见来源不得召回初遇证据");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -73,6 +74,6 @@ test("rp-memory arc evolution: 同一误会线多次提取→去重合并不超�
 		assert.match(arcs[0].text, /拍1|拍23|拍87/);
 	assert.match(arcs[0].text, /误会/);
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });

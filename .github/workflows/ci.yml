@@ -65,6 +65,11 @@ jobs:
         run: npm ci
 
       - name: Domain unit tests
+        # Canonical runner-owned temp avoids macOS /var -> /private/var aliases.
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: npm test
 
   smoke-web:

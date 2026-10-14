@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { checkDocumentation } from '../scripts/check-docs.mjs';
 
 function fixture(t: TestContext) {
-  const parent = existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir();
+  const parent = realpathSync(process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir());
   const root = mkdtempSync(join(parent, 'documentation-links-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const put = (path: string, text = '') => {

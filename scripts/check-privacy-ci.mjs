@@ -2,14 +2,28 @@
 // Run ONLY from the trusted base checkout, with the candidate repository as cwd.
 // No candidate modules, package scripts, generators or executables are loaded.
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { auditRepository } from './check-repository-privacy.mjs';
 import { auditPublicationRange } from './check-publication-range.mjs';
 import { countUngeneralizedHomePaths, analyzeSessionFixtureJsonl } from './check-public-data.mjs';
 import { pathCategory, MAX_FILE_BYTES } from './public-repository-policy.mjs';
 import { generateFixture, FIXTURE_NAMES } from '../packages/coding-agent/test/fixtures/generate-synthetic-fixtures.ts';
+
+function sameFilesystemPath(left, right) {
+  const canonical = path => {
+    const value = realpathSync(resolve(path)).replace(/\\/g, '/');
+    return process.platform === 'win32' ? value.toLowerCase() : value;
+  };
+  return canonical(left) === canonical(right);
+}
+
+function isMain() {
+  if (!process.argv[1]) return false;
+  try { return sameFilesystemPath(process.argv[1], fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
 
 export function auditPrivacyCI({ cwd = process.cwd(), eventName = process.env.GITHUB_EVENT_NAME,
   eventPath = process.env.GITHUB_EVENT_PATH, report = () => {} } = {}) {
@@ -69,6 +83,6 @@ export function auditPrivacyCI({ cwd = process.cwd(), eventName = process.env.GI
   return { ok: findings.length === 0, findings };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isMain()) {
   process.exitCode = auditPrivacyCI({ report: line => console.log(line) }).ok ? 0 : 1;
 }

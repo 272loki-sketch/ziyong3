@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -13,7 +13,7 @@ const cli = resolve('scripts/check-repository-privacy.mjs');
 const token = ['ghp_', 'A'.repeat(36)].join('');
 const legacyPrivateNames = ['rp.config.json', 'rp.config.local.json', 'rp.config-private.json', 'rp-preset.json', 'rp.agent.json', 'rp.agent.meta.json', 'liyuan-profiles'];
 function fixture(t: any) {
-  const parent = process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir();
+  const parent = realpathSync(process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir());
   const dir = mkdtempSync(join(parent, 'repository-privacy-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const git = (...args: string[]) => {

@@ -27,6 +27,9 @@ function fixture(run: (data: { cwd: string; store: TavernPluginStore }) => void)
 	try { run({ cwd, store: new TavernPluginStore(cwd) }); }
 	finally { rmSync(cwd, { recursive: true, force: true }); }
 }
+function assertPosixMode(path: string, expected: number) {
+	if (process.platform !== "win32") assert.equal(lstatSync(path).mode & 0o777, expected, path);
+}
 
 test("siblings cannot see each other's metadata, message variables or derived worldbooks", () => fixture(({ store }) => {
 	const root = binding(), a = binding("a", ["root", "a"]), b = binding("b", ["root", "b"]);
@@ -147,7 +150,7 @@ test("existing child retains old immutable ancestor snapshot; new child inherits
 
 test("atomic index.bak retains every object needed to read that actual previous state", () => fixture(({ store }) => {
 	save(store, binding(), state("first")); save(store, binding(), state("second")); const paths = scopePaths(store), backup = readFileSync(paths.backup);
-	assert.equal(lstatSync(paths.index).mode & 0o777, 0o600); assert.equal(lstatSync(paths.backup).mode & 0o777, 0o600);
+	assertPosixMode(paths.index, 0o600); assertPosixMode(paths.backup, 0o600);
 	// Restore only the actual .bak from this isolated fixture, without depending on v2/v3 index internals.
 	writeFileSync(paths.index, backup); assert.equal(store.read(binding()).state.chatMetadata.marker, "first"); assert.equal(store.read(binding()).revision, 1);
 }));

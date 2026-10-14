@@ -1,10 +1,24 @@
 #!/usr/bin/env node
 // Read-only gate. All diagnostics are category + JSON-escaped path, never content/errors.
 import { spawnSync } from 'node:child_process';
-import { constants, lstatSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
+import { constants, lstatSync, openSync, fstatSync, readSync, closeSync, realpathSync } from 'node:fs';
 import { resolve, join, parse, relative } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { MAX_FILE_BYTES, pathCategory, contentCategories } from './public-repository-policy.mjs';
+
+function sameFilesystemPath(left, right) {
+  const canonical = path => {
+    const value = realpathSync(resolve(path)).replace(/\\/g, '/');
+    return process.platform === 'win32' ? value.toLowerCase() : value;
+  };
+  return canonical(left) === canonical(right);
+}
+
+function isMain() {
+  if (!process.argv[1]) return false;
+  try { return sameFilesystemPath(process.argv[1], fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
 
 function git(cwd, args, input) {
   cwd = resolve(cwd);
@@ -44,8 +58,8 @@ export function auditRepository({ cwd = process.cwd(), args = [], report = () =>
   let scanned = 0;
   try {
     if (!(args.length === 0 || (args.length === 1 && args[0] === '--staged') || (args.length === 2 && args[0] === '--commit' && args[1]))) throw new Error('invalid-arguments');
-    const root = git(cwd, ['rev-parse', '--show-toplevel']).toString('utf8').replace(/\n$/, '');
-    if (resolve(cwd) !== resolve(root)) throw new Error('repository-root-required');
+    const root = git(cwd, ['rev-parse', '--show-toplevel']).toString('utf8').replace(/\r?\n$/, '');
+    if (!sameFilesystemPath(cwd, root)) throw new Error('repository-root-required');
     let entries;
     if (args[0] === '--commit') {
       const oid = git(root, ['rev-parse', '--verify', '--end-of-options', `${args[1]}^{commit}`]).toString('ascii').trim();
@@ -150,7 +164,7 @@ export function auditRepository({ cwd = process.cwd(), args = [], report = () =>
   return { ok: findings.length === 0, findings, scanned };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isMain()) {
   const result = auditRepository({ args: process.argv.slice(2), report: line => console.log(line) });
   console.log(`${result.ok ? 'pass' : 'fail'} ${JSON.stringify('')}`);
   process.exitCode = result.ok ? 0 : 1;

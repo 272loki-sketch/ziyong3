@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { cleanupMemoryFixture } from "./support/memory-fixture.ts";
 
 import { handleApiRequest, type RestHost } from "../server/rest.ts";
 import { memoryListChunks, persistChunks, updateMemoryConfig } from "../src/memory/index.ts";
@@ -19,7 +20,7 @@ async function fixture(run: (cwd: string, host: RestHost, notices: string[]) => 
 		notify: (_level: string, text: string) => { notices.push(text); },
 	} as unknown as RestHost;
 	try { await run(cwd, host, notices); }
-	finally { rmSync(cwd, { recursive: true, force: true }); }
+	finally { cleanupMemoryFixture(cwd); }
 }
 async function request(host: RestHost, method: string, url: string, payload?: unknown): Promise<{ status: number; body: any }> {
 	const req = Readable.from(payload === undefined ? [] : [Buffer.from(JSON.stringify(payload))]) as Readable & { method: string; url: string };

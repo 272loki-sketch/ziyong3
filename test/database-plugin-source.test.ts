@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,7 +15,7 @@ const ref = (tag: string) => `https://gcore.jsdelivr.net/gh/AlbusKen/shujuku@${t
 
 type FetchMock = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 function fixture(run: (cwd: string, cleanup: () => void) => Promise<void> | void): Promise<void> {
-	const cwd = mkdtempSync(join(tmpdir(), "liyuan-database-plugin-"));
+	const cwd = mkdtempSync(join(realpathSync(tmpdir()), "liyuan-database-plugin-"));
 	const cleanup = () => rmSync(cwd, { recursive: true, force: true });
 	return Promise.resolve().then(() => run(cwd, cleanup)).finally(cleanup);
 }
@@ -27,6 +27,13 @@ function store(cwd: string, fetch: FetchMock, options: { ref?: string; expectedS
 }
 
 const defaultFixture = new TextEncoder().encode("synthetic upstream plugin fixture; not vendor source\n");
+
+function assertPosixMode(path: string, expected: number): void {
+	// Node exposes POSIX permission bits on POSIX filesystems. Windows `mode`
+	// is not an ACL query, so keep the functional/security behavior tests running
+	// there without claiming a POSIX-mode or ACL assertion.
+	if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, expected, path);
+}
 
 test("source defaults and config remain pinned to the requested upstream ref and digest", () => {
 	assert.equal(DEFAULT_DATABASE_PLUGIN_REF, "https://gcore.jsdelivr.net/gh/AlbusKen/shujuku@naiv1.2.4/index.js");
@@ -90,19 +97,19 @@ test("verified source is cached privately, resolved locally, read-only and activ
 	assert.equal(sourceStore.resolveSource()?.active, false);
 	assert.deepEqual(sourceStore.readCurrentPinnedJS(), Buffer.from(bytes));
 	assert.equal(fetchCalls, 1, "resolve/read must not cause a network request");
-	assert.equal(statSync(sourceStore.cacheDir).mode & 0o777, 0o700);
-	assert.equal(statSync(sourceStore.filesDir).mode & 0o777, 0o700);
-	assert.equal(statSync(sourceStore.manifestsDir).mode & 0o777, 0o700);
-	assert.equal(statSync(candidate.filePath).mode & 0o777, 0o600);
+	assertPosixMode(sourceStore.cacheDir, 0o700);
+	assertPosixMode(sourceStore.filesDir, 0o700);
+	assertPosixMode(sourceStore.manifestsDir, 0o700);
+	assertPosixMode(candidate.filePath, 0o600);
 	const manifestFiles = readdirSync(sourceStore.manifestsDir);
 	assert.equal(manifestFiles.length, 1);
-	assert.equal(statSync(join(sourceStore.manifestsDir, manifestFiles[0])).mode & 0o777, 0o600);
+	assertPosixMode(join(sourceStore.manifestsDir, manifestFiles[0]), 0o600);
 
 	const active = await sourceStore.activateRef(digest);
 	assert.equal(active.active, true);
 	assert.equal(sourceStore.resolveSource()?.active, true);
 	assert.equal(existsSync(sourceStore.activePointerPath), true);
-	assert.equal(statSync(sourceStore.activePointerPath).mode & 0o777, 0o600);
+	assertPosixMode(sourceStore.activePointerPath, 0o600);
 	assert.deepEqual(sourceStore.readCurrentPinnedJS(), Buffer.from(bytes));
 	const activePointerBeforeInvalidActivation = readFileSync(sourceStore.activePointerPath);
 	await assert.rejects(sourceStore.activateRef("e".repeat(64)), /No verified cached database plugin candidate/);

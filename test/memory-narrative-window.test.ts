@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { cleanupMemoryFixture } from "./support/memory-fixture.ts";
 import { entryRawText } from "../src/stage/compact.ts";
 import { narrativeMemoryWindow, committedNarrativeText, type NarrativeMemoryEntry } from "../src/memory/narrative-window.ts";
 import { loadChunks } from "../src/memory/store.ts";
@@ -40,7 +41,7 @@ test("memory every-three host projection persists all three narratives and hides
 		const visible = new Set(entries(3).map(e => e.id!)); const hidden = new Set(["sibling-user", "sibling-author"]);
 		assert.ok((await memorySearch(cwd, scope, "narrative", "编号物品1", 10, visible)).length > 0);
 		assert.equal((await memorySearch(cwd, scope, "narrative", "编号物品1", 10, hidden)).length, 0);
-	} finally { rmSync(cwd, { recursive: true, force: true }); }
+	} finally { cleanupMemoryFixture(cwd); }
 });
 
 test("archived source coordinates refer to canonical narrative rather than interleaved author/format text", () => {

@@ -16,9 +16,14 @@ RUN npm install --omit=dev --no-audit --no-fund \
 COPY server ./server
 COPY src ./src
 COPY assets ./assets
+COPY skills ./skills
+COPY LICENSE ./LICENSE
+COPY licenses ./licenses
 COPY .liyuan/extensions ./.liyuan/extensions
 COPY liyuan.config.example.json liyuan.agent.example.json ./
 COPY start.sh docker-entrypoint.sh ./
+# Backend imports and plugin managers load host adapters from public, not only dist.
+COPY web/public ./web/public
 COPY web/dist ./web/dist
 COPY web/package.json ./web/package.json
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, chmodSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, chmodSync, statSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { preparePublicGit, validateRemote } from '../scripts/prepare-public-git.mjs';
@@ -11,7 +11,7 @@ const token = ['ghp_', 'A'.repeat(36)].join('');
 const cli = resolve('scripts/prepare-public-git.mjs');
 
 function fixture(t: any) {
-  const parent = process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir();
+  const parent = realpathSync(process.platform === 'linux' && existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir());
   const dir = mkdtempSync(join(parent, 'public-git-test-'));
   const source = join(dir, 'source');
   mkdirSync(source);

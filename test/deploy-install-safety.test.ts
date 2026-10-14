@@ -10,6 +10,11 @@ const installer = fileURLToPath(new URL("../deploy/install.sh", import.meta.url)
 const repo = "https://example.invalid/synthetic.git";
 const secretRepo = "https://synthetic-user:synthetic-secret@example.invalid/other.git";
 
+// This is the Linux installer; native Windows uses start.bat, not POSIX shebang mocks.
+const installerTest = (name: string, run: () => void) => test(name, {
+	skip: process.platform === "win32" ? "Linux installer requires POSIX bash/executable mocks; Windows launcher is separate" : false,
+}, run);
+
 function install(options: {
 	existing?: boolean;
 	status?: string;
@@ -97,7 +102,7 @@ else if (command === 'symbolic-ref') {
 }
 
 for (const status of [" M tracked.txt\n", "M  staged.txt\n", "?? untracked.txt\n"]) {
-	test(`installer refuses dirty status ${status.trim()} before fetch or npm`, () => {
+	installerTest(`installer refuses dirty status ${status.trim()} before fetch or npm`, () => {
 		const result = install({ status });
 		assert.equal(result.code, 1);
 		assert.deepEqual(result.git.map(([command]) => command), ["status"]);
@@ -105,7 +110,7 @@ for (const status of [" M tracked.txt\n", "M  staged.txt\n", "?? untracked.txt\n
 	});
 }
 
-test("installer verifies explicit CLI and environment origins without exposing credentials", () => {
+installerTest("installer verifies explicit CLI and environment origins without exposing credentials", () => {
 	for (const options of [{ args: ["--repo", secretRepo] }, { repoEnv: secretRepo }]) {
 		const result = install({ ...options, origin: repo });
 		assert.equal(result.code, 1);
@@ -118,7 +123,7 @@ test("installer verifies explicit CLI and environment origins without exposing c
 	assert.ok(!matching.output.includes("synthetic-secret"));
 });
 
-test("installer refuses an empty origin before fetch", () => {
+installerTest("installer refuses an empty origin before fetch", () => {
 	const result = install({ origin: "" });
 	assert.equal(result.code, 1);
 	assert.deepEqual(result.git.map(([command]) => command), ["status", "remote"]);
@@ -126,7 +131,7 @@ test("installer refuses an empty origin before fetch", () => {
 });
 
 for (const fail of ["status", "remote", "fetch", "checkout", "merge"]) {
-	test(`installer stops on ${fail} failure without npm or credential leakage`, () => {
+	installerTest(`installer stops on ${fail} failure without npm or credential leakage`, () => {
 		const result = install({ fail, origin: secretRepo });
 		assert.equal(result.code, 1);
 		assert.ok(!result.commands.some(([name]) => name === "npm"));
@@ -135,7 +140,7 @@ for (const fail of ["status", "remote", "fetch", "checkout", "merge"]) {
 	});
 }
 
-test("clean inherited branch preserves its origin and fast-forwards the requested remote branch", () => {
+installerTest("clean inherited branch preserves its origin and fast-forwards the requested remote branch", () => {
 	const result = install({ ref: "feature/synthetic" });
 	assert.equal(result.code, 0);
 	assert.deepEqual(result.git, [
@@ -146,7 +151,7 @@ test("clean inherited branch preserves its origin and fast-forwards the requeste
 	assert.ok(result.commands.some(([name]) => name === "npm"));
 });
 
-test("existing tags and remote-only refs install without a pull or merge", () => {
+installerTest("existing tags and remote-only refs install without a pull or merge", () => {
 	for (const options of [{ ref: "v0.0.0-synthetic" }, { ref: "new-branch", fail: "local-checkout" }]) {
 		const result = install({ ...options, detached: true });
 		assert.equal(result.code, 0);
@@ -155,7 +160,7 @@ test("existing tags and remote-only refs install without a pull or merge", () =>
 	}
 });
 
-test("fresh branch and tag clone retain requested refs and redact repository URLs", () => {
+installerTest("fresh branch and tag clone retain requested refs and redact repository URLs", () => {
 	for (const ref of ["main", "v0.0.0-synthetic"]) {
 		const result = install({ existing: false, ref, args: ["--repo", secretRepo] });
 		assert.equal(result.code, 0);

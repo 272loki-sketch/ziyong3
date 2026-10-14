@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { VeridisRewriteSources, VERIDIS_REWRITE_UPSTREAM, type VeridisRewriteHooks } from "../server/veridis-rewrite-source.ts";
+import { VeridisRewriteSources, VERIDIS_REWRITE_UPSTREAM, tightenPrivateTree as tightenVeridisPrivateTree, type VeridisRewriteHooks, type VeridisRewritePrivateTreeFs } from "../server/veridis-rewrite-source.ts";
 import { acquireTavernPluginLock } from "../server/tavern-plugin-lock.ts";
 
 const git = (repo: string, ...args: string[]) => execFileSync("git", ["-c", "credential.helper=", "-c", "core.hooksPath=/dev/null", "-C", repo, ...args], {
@@ -47,7 +47,9 @@ async function fixture(run: (value: { base: string; cwd: string; repo: string })
 function hooks(overrides: Partial<VeridisRewriteHooks> = {}): VeridisRewriteHooks {
   return { isIdle: () => true, validateCandidate: async () => true, ...overrides };
 }
-function assertPrivateMode(path: string, mode: number) { assert.equal(lstatSync(path).mode & 0o777, mode, path); }
+function assertPrivateMode(path: string, mode: number) {
+  if (process.platform !== "win32") assert.equal(lstatSync(path).mode & 0o777, mode, path);
+}
 
 
 test("fixed public source, secure defaults, original bytes and controlled-runtime-tree installation", () => fixture(async ({ cwd, repo }) => {
@@ -81,6 +83,42 @@ test("fixed public source, secure defaults, original bytes and controlled-runtim
     assert.equal(source.status().autoUpdate, true);
   } finally { source.close(); }
 }));
+
+test("private-tree tightening tolerates only a child removed between readdir and lstat", () => {
+  const removed = join("synthetic", "objects", "maintenance.lock");
+  const modes = new Map<string, number>();
+  const stat = (kind: "directory" | "file" | "symlink") => ({
+    isSymbolicLink: () => kind === "symlink",
+    isDirectory: () => kind === "directory",
+    isFile: () => kind === "file",
+  }) as ReturnType<VeridisRewritePrivateTreeFs["lstatSync"]>;
+  const fsOps: VeridisRewritePrivateTreeFs = {
+    lstatSync(path) {
+      if (path === removed) throw Object.assign(new Error("removed by synthetic Git maintenance"), { code: "ENOENT" });
+      if (path === "synthetic" || path === join("synthetic", "objects")) return stat("directory");
+      if (path === join("synthetic", "objects", "kept.pack")) return stat("file");
+      throw Object.assign(new Error(`unexpected fixture path: ${path}`), { code: "ENOENT" });
+    },
+    readdirSync(path) {
+      if (path === "synthetic") return ["objects"];
+      if (path === join("synthetic", "objects")) return ["maintenance.lock", "kept.pack"];
+      return [];
+    },
+    chmodSync(path, mode) { modes.set(path, mode); },
+  };
+  assert.doesNotThrow(() => tightenVeridisPrivateTree("synthetic", fsOps));
+  assert.equal(modes.get("synthetic"), 0o700);
+  assert.equal(modes.get(join("synthetic", "objects")), 0o700);
+  assert.equal(modes.get(join("synthetic", "objects", "kept.pack")), 0o600);
+  assert.equal(modes.has(removed), false);
+  assert.throws(() => tightenVeridisPrivateTree("synthetic", {
+    ...fsOps,
+    lstatSync(path) {
+      if (path === join("synthetic", "objects", "maintenance.lock")) throw Object.assign(new Error("synthetic permission error"), { code: "EACCES" });
+      return fsOps.lstatSync(path);
+    },
+  }), { code: "EACCES" });
+});
 
 
 test("checkUpdate stages only; missing/failed synthetic validation can never activate a download", () => fixture(async ({ cwd, repo }) => {
@@ -407,7 +445,7 @@ test("installer CLI stages fixture bytes only and never activates/enables them",
   assert.equal(report.enabled, false);
   assert.equal(report.version, "1.0.0");
   assert.match(report.note, /不代表运行兼容/);
-  assert.equal(lstatSync(join(cwd, ".liyuan-veridis-rewrite")).mode & 0o777, 0o700);
+  assertPrivateMode(join(cwd, ".liyuan-veridis-rewrite"), 0o700);
 }));
 
 test("proxy parameter accepts HTTP(S) only and refuses embedded credentials", () => fixture(async ({ cwd, repo }) => {

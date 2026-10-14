@@ -1,12 +1,26 @@
 // Installed with its trusted scanner/policy under candidate .git, never run from
 // the editable candidate scripts directory. No network or repository writes.
 import { spawnSync } from 'node:child_process';
-import { readFileSync, lstatSync } from 'node:fs';
+import { readFileSync, lstatSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { resolve, parse, relative, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { auditRepository } from './check-repository-privacy.mjs';
 import { approvedBinary, contentCategories, MAX_FILE_BYTES } from './public-repository-policy.mjs';
+
+function sameFilesystemPath(left, right) {
+  const canonical = path => {
+    const value = realpathSync(resolve(path)).replace(/\\/g, '/');
+    return process.platform === 'win32' ? value.toLowerCase() : value;
+  };
+  return canonical(left) === canonical(right);
+}
+
+function isMain() {
+  if (!process.argv[1]) return false;
+  try { return sameFilesystemPath(process.argv[1], fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
 
 export function guard({ mode, cwd = process.cwd(), input = '', report = () => {} }) {
   let scanned = 0;
@@ -55,7 +69,7 @@ export function guard({ mode, cwd = process.cwd(), input = '', report = () => {}
   };
   try {
     if (!['pre-commit', 'pre-push'].includes(mode)) throw new Error('invalid-arguments');
-    if (git(['rev-parse', '--show-toplevel']).toString('utf8').replace(/\n$/, '') !== resolve(cwd)) throw new Error('repository-root-required');
+    if (!sameFilesystemPath(git(['rev-parse', '--show-toplevel']).toString('utf8').replace(/\r?\n$/, ''), cwd)) throw new Error('repository-root-required');
     const commits = new Set();
     if (mode === 'pre-push') {
       if (Buffer.byteLength(input) > 1024 * 1024) throw new Error('invalid-push-input');
@@ -109,7 +123,7 @@ export function guard({ mode, cwd = process.cwd(), input = '', report = () => {}
   return { ok: findings.length === 0, findings, scanned };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isMain()) {
   let input = '';
   try {
     if (process.argv[2] === 'pre-push') {

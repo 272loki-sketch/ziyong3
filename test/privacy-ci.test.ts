@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { auditPrivacyCI } from '../scripts/check-privacy-ci.mjs';
 import { generateFixture, FIXTURE_NAMES } from '../packages/coding-agent/test/fixtures/generate-synthetic-fixtures.ts';
 
 test('trusted CI scans head and every commit without executing candidate checker or generator', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'privacy-ci-'));
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'privacy-ci-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const git = (...args: string[]) => {
     const result = spawnSync('git', args, { cwd: dir, encoding: 'utf8', env: {

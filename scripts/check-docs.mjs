@@ -1,9 +1,23 @@
-import { lstatSync, readFileSync } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pathCategory } from './public-repository-policy.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+function sameFilesystemPath(left, right) {
+  const canonical = path => {
+    const value = realpathSync(resolve(path)).replace(/\\/g, '/');
+    return process.platform === 'win32' ? value.toLowerCase() : value;
+  };
+  return canonical(left) === canonical(right);
+}
+
+function isMain() {
+  if (!process.argv[1]) return false;
+  try { return sameFilesystemPath(process.argv[1], fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
+
 const entries = ['README.md', 'TESTING.md', 'AGENTS.md', 'CLAUDE.md', 'docs/DOCUMENTATION-INDEX.md'];
 
 // Deliberately a small Markdown parser, not a heading or full CommonMark validator.
@@ -50,8 +64,8 @@ export function checkDocumentation({ root = repositoryRoot } = {}) {
     return stat;
   };
   const inspect = (source, target) => {
-    const absolute = resolve(root, target);
-    const local = relative(root, absolute).split(sep).join('/');
+    const absolute = resolve(root, ...target.split('/'));
+    const local = relative(root, absolute).split(/[\\/]/).join('/');
     if (!local || local === '..' || local.startsWith('../') || isAbsolute(local) || /[\\\x00]/.test(target)) {
       fail(source, target, 'outside-repository');
       return;
@@ -93,14 +107,14 @@ export function checkDocumentation({ root = repositoryRoot } = {}) {
         fail(source, decoded, 'outside-repository');
         continue;
       }
-      const next = inspect(source, relative(root, resolve(root, dirname(source), decoded)));
+      const next = inspect(source, posix.join(posix.dirname(source), decoded));
       if (next && !visited.has(next)) pending.push(next);
     }
   }
   return { ok: findings.length === 0, files, checkedLinks, findings };
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMain()) {
   const args = process.argv.slice(2);
   if (args.length && !(args.length === 2 && args[0] === '--root')) {
     console.error('Usage: node scripts/check-docs.mjs [--root repository-directory]');

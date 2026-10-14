@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { cleanupMemoryFixture } from "./support/memory-fixture.ts";
 import { memoryScopeId } from "../src/memory/config.ts";
 import { cosine, embedTextLocal } from "../src/memory/embed.ts";
 import {
@@ -58,7 +59,7 @@ test("memory: 默认库名 剧情/额外", () => {
 		assert.equal(st.stores.find((s) => s.id === "narrative")?.name, "剧情数据库");
 		assert.equal(st.stores.find((s) => s.id === "external")?.name, "额外数据库");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -79,7 +80,7 @@ test("memory: 额外库导入检索", async () => {
 		assert.ok(hits.length >= 1);
 		assert.ok(hits[0]!.text.includes("青梧") || hits.some((h) => h.text.includes("青梧")));
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -96,7 +97,7 @@ test("memory: 禁止向剧情库导入", async () => {
 			/剧情数据库|不能手动/,
 		);
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -129,7 +130,7 @@ test("memory: 剧情合并入库不每轮一条", async () => {
 		const hitsB = await memorySearch(cwd, scopeB, "narrative", "青梧 玉佩", 3);
 		assert.equal(hitsB.length, 0);
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -158,7 +159,7 @@ test("memory: everyNTurns 周期写入完整 N 拍并携带分支锚点", async 
 		const hidden = await memorySearch(cwd, scopeA, "物品1", 5, new Set(["a-2", "a-3"]));
 		assert.equal(hidden.some((chunk) => chunk.text.includes("物品1")), false, "兄弟分支不得看见无祖先锚点的周期记忆");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -180,7 +181,7 @@ test("memory: 周期纪要与压缩证据并发写入不互相覆盖", async () 
 		assert.ok(chunks.some((chunk) => chunk.text.includes("current-memory-token")));
 		assert.ok(chunks.some((chunk) => chunk.text.includes("archived-memory-token")));
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -194,7 +195,7 @@ test("memory: 相同 chunk id 可在不同 scope 独立存在", async () => {
 		assert.equal(loadChunks(cwd, scopeA, "narrative")[0]!.text, chunk.text);
 		assert.equal(loadChunks(cwd, scopeB, "narrative")[0]!.text, "另一个会话的独立内容");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -217,7 +218,7 @@ test("memory: 手动写入额外库 + 列表 + 删除单条", async () => {
 		assert.equal(list2.length, list.length - 1);
 		assert.ok(!list2.some((c) => c.id === id));
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -232,7 +233,7 @@ test("memory: recallForTurn 受 injectOnTurn 控制", async () => {
 		updateMemoryConfig(cwd, { injectOnTurn: false });
 		assert.equal((await memoryRecallForTurn(cwd, scopeA, "青梧 玉佩")).length, 0);
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -254,7 +255,7 @@ test("memory: 配置云端字段不落明文到 public", () => {
 		assert.ok(pub.cloudEmbed.apiKey.includes("•") || pub.cloudEmbed.apiKey === "");
 		assert.ok(!pub.cloudEmbed.apiKey.includes("sk-secret"));
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });
 
@@ -279,6 +280,6 @@ test("memory: 重向量化保留原文", async () => {
 		assert.equal(after[0]!.text, text0);
 		assert.equal(after[0]!.meta.embedMode, "local");
 	} finally {
-		rmSync(cwd, { recursive: true, force: true });
+		cleanupMemoryFixture(cwd);
 	}
 });

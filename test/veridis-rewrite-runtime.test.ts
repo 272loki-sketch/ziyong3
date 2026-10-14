@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -29,6 +29,7 @@ export async function runAiRewriteForMessageNow(_payload,{preparedTask:task}){
  if(settings.privateRead){await import('node:fs').then(fs=>fs.readFileSync(settings.privateRead));}
  if(settings.privateWrite){await import('node:fs').then(fs=>fs.writeFileSync(settings.privateWrite,'should never happen'));}
  if(settings.unknownHostApi)await globalThis.unknownNewHostApi();
+ if(settings.throwCustomError){const error=new Error('PRIVATE_ERROR_MARKER synthetic_secret ghp_secret');error.name='synthetic_secret';error.code='ghp_secret';throw error;}
  const maxBatch=Math.max(1,settings.aiRewrite.maxItemsPerRequest||20),accepted=new Map;
  for(let index=0;index<task.items.length;index+=maxBatch){
    const items=task.items.slice(index,index+maxBatch),prompt=settings.aiRewrite.promptTemplate+'\\n'+items.map(item=>'<rewrite_target id="'+item.id+'">'+item.text+'</rewrite_target>').join('\\n');
@@ -46,9 +47,11 @@ export async function runAiRewriteForMessageNow(_payload,{preparedTask:task}){
  return {status:'applied'};
 }
 `;
-async function fixture(run: (state: { base: string; root: string; runtime: VeridisRewriteRuntime; candidate: VeridisRewriteCandidate; setCandidate: (candidate: VeridisRewriteCandidate | null) => void }) => Promise<void>) {
+async function fixture(run: (state: { base: string; root: string; runtime: VeridisRewriteRuntime; candidate: VeridisRewriteCandidate; setCandidate: (candidate: VeridisRewriteCandidate | null) => void }) => Promise<void>, options: { pathAlias?: boolean } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'liyuan-veridis-runtime-test-'));
-  const root = join(base, 'private-assets');
+  const alias = options.pathAlias ? join(base, 'path-alias') : undefined;
+  if (alias) symlinkSync(base, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const root = join(alias ?? base, 'private-assets');
   const modules: Record<string, string> = { 'src/settings/defaults.js': DEFAULTS, 'src/host/appContext.js': HOST, 'src/aiRewrite/response.js': RESPONSE, 'src/aiRewrite/runtime.js': ENGINE };
   for (const [path, body] of Object.entries(modules)) { const file=join(root,path);mkdirSync(dirname(file),{recursive:true,mode:0o700});writeFileSync(file,body,{mode:0o600}); }
   const candidate: VeridisRewriteCandidate = { root, version: 'synthetic-3.5', commit: '1'.repeat(40), sha256: '2'.repeat(64), manifest: { version: 'synthetic-3.5', js: 'index.js' } };
@@ -56,7 +59,7 @@ async function fixture(run: (state: { base: string; root: string; runtime: Verid
   const sources: VeridisRewriteSourceLike = { active: () => active, resolveAsset: (path, requested) => Object.hasOwn(modules, path) && (!requested || requested.root === root) ? join(root,path) : null };
   const runtime = new VeridisRewriteRuntime({ assetsCwd: base, sources });
   try { await run({ base, root, runtime, candidate, setCandidate: value => active=value }); }
-  finally { await runtime.close(); rmSync(base, { recursive: true, force: true }); }
+  finally { await runtime.close(); if (alias) rmSync(alias, { force: true }); rmSync(base, { recursive: true, force: true }); }
 }
 const narrative = '他说了不易察觉的变化。';
 const input = (patch: Partial<VeridisRewriteRunInput> = {}): VeridisRewriteRunInput => ({
@@ -64,6 +67,13 @@ const input = (patch: Partial<VeridisRewriteRunInput> = {}): VeridisRewriteRunIn
   generate: async request => JSON.stringify(Object.fromEntries([...request.messages[0].content.matchAll(/<rewrite_target id="([^"]+)"[^>]*>([\s\S]*?)<\/rewrite_target>/g)].map(match => [match[1], match[2].replace('不易察觉', '细微')]))),
   ...patch,
 });
+
+test('Worker canonicalizes module file URLs and read permissions through a platform path alias', () => fixture(async ({ runtime }) => {
+  const result = await runtime.run(input());
+  assert.equal(result.text, '他说了细微的变化。');
+  assert.equal(result.changed, true);
+  assert.equal(result.calls, 1);
+}, { pathAlias: true }));
 
 test('finite host starting rules are optional data and never contain a copied global prompt', () => {
   const initial = defaultVeridisHostSettings();
@@ -173,13 +183,32 @@ test('concurrent Workers have independent original appContext and settings', () 
 
 test('Worker permissions refuse private filesystem reads and writes outside verified asset root', () => fixture(async ({ runtime,base }) => {
   const outside=join(base,'synthetic-private.txt');writeFileSync(outside,'PRIVATE SYNTHETIC ONLY');
-  await assert.rejects(runtime.run(input({settings:{privateRead:outside}})),/初始化或执行失败/);
-  await assert.rejects(runtime.run(input({settings:{privateWrite:outside}})),/初始化或执行失败/);
+  for (const settings of [{privateRead:outside},{privateWrite:outside}]) {
+    await assert.rejects(runtime.run(input({settings})), error => {
+      assert.match((error as Error).message,/初始化或执行失败/);
+      assert.equal(((error as Error & { cause?: Error }).cause)?.message, 'Worker Error ERR_ACCESS_DENIED');
+      return true;
+    });
+  }
   assert.equal(readFileSync(outside,'utf8'),'PRIVATE SYNTHETIC ONLY');
 }));
 
 test('unknown new host API fails before generation and is never claimed compatible', () => fixture(async ({ runtime }) => {
-  await assert.rejects(runtime.run(input({settings:{unknownHostApi:true},generate:async()=>{throw Error('must never generate');}})),/初始化或执行失败/);
+  await assert.rejects(runtime.run(input({settings:{unknownHostApi:true},generate:async()=>{throw Error('must never generate');}})), error => {
+    assert.match((error as Error).message,/初始化或执行失败/);
+    assert.equal(((error as Error & { cause?: Error }).cause)?.message, 'Worker TypeError');
+    return true;
+  });
+}));
+
+test('custom Worker error name/code and message are not forwarded as diagnostics', () => fixture(async ({ runtime }) => {
+  await assert.rejects(runtime.run(input({settings:{throwCustomError:true}})), error => {
+    const caught = error as Error & { cause?: Error };
+    assert.match(caught.message,/初始化或执行失败/);
+    assert.equal(caught.cause, undefined);
+    assert.doesNotMatch(`${caught.message}\n${caught.stack ?? ''}`, /synthetic_secret|ghp_secret|PRIVATE_ERROR_MARKER/);
+    return true;
+  });
 }));
 
 test('missing/changed source and unsafe settings fail without provider calls', () => fixture(async ({ runtime,setCandidate }) => {

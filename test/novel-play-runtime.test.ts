@@ -107,11 +107,35 @@ test("append upgrade is branch-local and projects old progress into the child pa
 	assert.equal(projected?.progress.nodeId, b);
 	assert.equal(projected?.progress.packageRevision, "child-revision");
 });
-test("engine patch removes director-only projection from rpPrep and blocks aborted writes", () => {
-	const engine = readFileSync(new URL("../src/stage/engine.ts", import.meta.url), "utf8"), patched = applyEnginePatch(engine);
-	assert.match(patched, /novel-play-runtime-integration-v2/);
-	assert.doesNotMatch(patched, /rerollPrep\?\.novelProjection/);
-	assert.doesNotMatch(patched, /\.\.\.\(novelProjection \? \{ novelProjection \} : \{\}\)/);
-	assert.match(patched, /if \(!aborted && userText !== null\)/);
-	assert.equal(applyEnginePatch(patched), patched);
+test("engine patch applies LF/CRLF legacy input and preserves each newline style", () => {
+	const legacyLf = [
+		'from "../novel-play/runtime.ts"; // novel-play-runtime-integration-v1',
+		"\tsceneConductor?: SceneConductor;",
+		"\tnovelProjection?: NovelPlayProjection;",
+		"}",
+		"\t\tlet novelProjection = rerollPrep?.novelProjection;",
+		"\t\tlet preparedNovelPlay: PreparedNovelPlayTurn | undefined;",
+		"\t\t\t\t\t...(sceneConductor ? { sceneConductor } : {}),",
+		"\t\t\t\t\t...(novelProjection ? { novelProjection } : {}),",
+		"\t\t\tif (userText !== null) {",
+	].join("\n");
+	for (const newline of ["\n", "\r\n"]) {
+		const source = legacyLf.replace(/\n/g, newline);
+		const patched = applyEnginePatch(source);
+		assert.match(patched, /novel-play-runtime-integration-v2/);
+		assert.doesNotMatch(patched, /rerollPrep\?\.novelProjection/);
+		assert.doesNotMatch(patched, /\.\.\.\(novelProjection \? \{ novelProjection \} : \{\}\)/);
+		assert.match(patched, /if \(!aborted && userText !== null\)/);
+		if (newline === "\r\n") assert.doesNotMatch(patched, /(?<!\r)\n/);
+		else assert.doesNotMatch(patched, /\r\n/);
+		assert.equal(applyEnginePatch(patched), patched, "already-patched input stays byte-for-byte unchanged");
+	}
+
+	// Also exercise the real source path's existing v2-marker detection. This is
+	// a code transform only; it must not add or alter prompt-injection text.
+	const engine = readFileSync(new URL("../src/stage/engine.ts", import.meta.url), "utf8");
+	for (const newline of ["\n", "\r\n"]) {
+		const actual = engine.replace(/\r\n/g, "\n").replace(/\n/g, newline);
+		assert.equal(applyEnginePatch(actual), actual);
+	}
 });

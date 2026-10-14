@@ -4,7 +4,12 @@ import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
 test('MVU retry persistence masks only source variables/receipt and extra_analysis, never another binding',()=>{
- const code=readFileSync(new URL('../web/public/tavern-compat/bridge.js',import.meta.url),'utf8').replace(/^import .*;\n/,'').replace(/export \{[^}]+\};\s*$/,'');
+ const bridge=readFileSync(new URL('../web/public/tavern-compat/bridge.js',import.meta.url),'utf8');
+ // Run the classic-script VM path with CRLF too: Windows checkouts may convert
+ // this host adapter, and the import must still be removed before vm evaluation.
+ const windowsBridge=bridge.replace(/\r\n/g,'\n').replace(/\n/g,'\r\n');
+ const code=windowsBridge.replace(/^import[^\r\n]*;\r?\n/,'').replace(/^export \{[^\r\n]+\};?\r?$/m,'');
+ assert.doesNotMatch(code,/^\s*(?:import|export)\s/m);
  const sandbox:any={getCurrentLocale:()=>'',t:()=>'',localizeTemplate:(v:any)=>v};vm.runInNewContext(code,sandbox);
  const h=sandbox.LiyuanTavern,context={scopeKey:'scope',sourceEntryId:'reply'};h.context=context;h.chat=[{__liyuanEntryId:'ancestor',variables:[{stat_data:{safe:1}}]},{__liyuanEntryId:'reply',variables:[{stat_data:{lost:0}}],extra:{new:true}}];
  h.metadata={unrelated:42,__liyuanMvuProcessed:{reply:{status:'updated'},other:{status:'normal'}}};h.extensions={variables:{global:{extra_analysis:true,unrelated:true}},mvu_settings:{keep:true}};h.characters=[{data:{extensions:{keep:true}}}];h.presets=[{extensions:{keep:true}}];h.books={};

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabasePluginHttp } from "../server/database-plugin-http.ts";
@@ -11,7 +11,7 @@ import { DatabasePluginRuntime } from "../server/database-plugin-runtime.ts";
 const state = (label: string) => ({ messages: {}, chatMetadata: { label }, extensionSettings: {}, worldbooks: {} });
 
 test("detachment blocker: ancestor whole-snapshot publication hides descendant preflight state", async () => {
- const cwd = mkdtempSync(join(tmpdir(), "liyuan-detachment-safety-"));
+ const cwd = mkdtempSync(join(realpathSync(tmpdir()), "liyuan-detachment-safety-"));
  try {
   const store = new DatabasePluginStore(cwd), scope = { sessionId: "synthetic", card: "synthetic.json" };
   await store.saveState(scope, "A", 0, state("A baseline"));
@@ -26,7 +26,7 @@ test("detachment blocker: ancestor whole-snapshot publication hides descendant p
 });
 
 test("detachment blocker: global background source binding also changes management context", async () => {
- const cwd = mkdtempSync(join(tmpdir(), "liyuan-detachment-safety-"));
+ const cwd = mkdtempSync(join(realpathSync(tmpdir()), "liyuan-detachment-safety-"));
  try {
   const current = { scope: { sessionId: "synthetic" }, sourceEntryId: "B", visibleEntryIds: ["A", "B"],
    chat: [{ __liyuanEntryId: "A" }, { __liyuanEntryId: "B" }], character: {}, userName: "Synthetic" };

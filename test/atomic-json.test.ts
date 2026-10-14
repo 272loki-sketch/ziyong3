@@ -69,6 +69,10 @@ function names(dir: string): string[] {
 	return readdirSync(dir).sort();
 }
 
+function assertPosixMode(path: string, expected: number): void {
+	if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o7777, expected, path);
+}
+
 test("ENOSPC 写新配置临时文件时原 config 与旧 bak 均保持，临时文件清理", () => fixture((dir, path) => {
 	const original = '{ "generationMode": "director" }\n';
 	const oldBak = '{"older":"backup"}\n';
@@ -114,7 +118,7 @@ test("JSON 序列化失败发生在任何文件系统操作之前", () => fixtur
 	assert.deepEqual(names(dir), []);
 }));
 
-test("成功时 .bak 精确保存旧字节，主文件保留 mode/owner，spacing 可指定", () => fixture((dir, path) => {
+test("成功时 .bak 精确保存旧字节；POSIX 上主文件保留 mode/owner，spacing 可指定", () => fixture((dir, path) => {
 	const original = '{ "legacy" : [1, 2] }\r\n';
 	writeFileSync(path, original, { mode: 0o640 });
 	const before = statSync(path);
@@ -124,10 +128,12 @@ test("成功时 .bak 精确保存旧字节，主文件保留 mode/owner，spacin
 	assert.equal(readFileSync(`${path}.bak`, "utf8"), original);
 	assert.equal(readFileSync(path, "utf8"), `${JSON.stringify({ generationMode: "direct", nested: { keep: true } }, null, 2)}\n`);
 	const after = statSync(path);
-	assert.equal(after.mode & 0o7777, before.mode & 0o7777);
-	assert.equal(after.uid, before.uid);
-	assert.equal(after.gid, before.gid);
-	assert.equal(statSync(`${path}.bak`).mode & 0o7777, before.mode & 0o7777);
+	if (process.platform !== "win32") {
+		assert.equal(after.mode & 0o7777, before.mode & 0o7777);
+		assert.equal(after.uid, before.uid);
+		assert.equal(after.gid, before.gid);
+		assert.equal(statSync(`${path}.bak`).mode & 0o7777, before.mode & 0o7777);
+	}
 	assert.deepEqual(names(dir), ["config.json", "config.json.bak"]);
 }));
 
@@ -137,7 +143,7 @@ test("默认JSON缩进为tab", () => fixture((dir, path) => {
 	assert.equal(readFileSync(path, "utf8"), `${JSON.stringify(value, null, "\t")}\n`);
 }));
 
-test("首次创建失败不留下目标或 bak；成功时使用私有 0600", () => fixture((dir, path) => {
+test("首次创建失败不留下目标或 bak；POSIX 上成功时使用私有 0600", () => fixture((dir, path) => {
 	assert.throws(() => writeJsonAtomicWithBackup(path, { first: true }, { ops: failWritesFor("new") }), { code: "ENOSPC" });
 	assert.equal(existsSync(path), false);
 	assert.equal(existsSync(`${path}.bak`), false);
@@ -149,6 +155,6 @@ test("首次创建失败不留下目标或 bak；成功时使用私有 0600", ()
 	assert.deepEqual(names(dir), []);
 
 	writeJsonAtomicWithBackup(path, { first: true });
-	assert.equal(statSync(path).mode & 0o7777, 0o600);
+	assertPosixMode(path, 0o600);
 	assert.equal(existsSync(`${path}.bak`), false);
 }));
