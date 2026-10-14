@@ -8,6 +8,9 @@ start.command text eol=lf
 Dockerfile text eol=lf
 docker-compose.yml text eol=lf
 
+# Preserve the verified GNU license bytes on every checkout, including Windows.
+licenses/Luker-AGPL-3.0.txt text eol=lf
+
 # Windows 启动器保持 CRLF
 *.bat text eol=crlf
 *.ps1 text eol=crlf

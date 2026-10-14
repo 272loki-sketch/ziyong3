@@ -213,7 +213,7 @@ test('excluded upstream binary and host diagnostic reject before file or snapsho
   ];
   const ignore = readFileSync(resolve('.gitignore'), 'utf8');
   for (const { path, category } of entries) {
-    assert.equal(ignore.split('\n').includes(path.startsWith('scripts/drive-') ? '/scripts/drive-*.mjs' : `/${path}`), true);
+    assert.equal(ignore.split(/\r?\n/).includes(path.startsWith('scripts/drive-') ? '/scripts/drive-*.mjs' : `/${path}`), true);
     for (const tracked of [false, true]) {
       assert.equal(pathCategory(path, tracked), category);
       assert.equal(approvedBinary(path, tracked), false);
@@ -245,6 +245,7 @@ test('license approval is exact, available, mirrored in ignore rules and content
   assert.match(ignore, /^\/licenses\/\*$/m);
   assert.deepEqual([...ignore.matchAll(/^!\/(licenses\/.+)$/gm)].map(m => m[1]).sort(), [...paths].sort());
   const license = readFileSync(resolve(paths[0]));
+  assert.match(readFileSync(resolve('.gitattributes'), 'utf8'), /^licenses\/Luker-AGPL-3\.0\.txt text eol=lf\r?$/m);
   // SHA-256 independently checked against GNU's official agpl-3.0.txt.
   assert.equal(createHash('sha256').update(license).digest('hex'), '0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0');
   const doc = readFileSync(resolve('docs/PROMPT-SOURCES.md'), 'utf8');
@@ -404,4 +405,20 @@ test('CI checker is included by source ignore policy and only exact installer UR
   assert.deepEqual(contentCategories(Buffer.from(credentialUrl), 'test/deploy-install-safety.test.ts', true), []);
   assert.deepEqual(contentCategories(Buffer.from(credentialUrl), 'src/not-a-fixture.ts', true), ['credential-url']);
   assert.deepEqual(contentCategories(Buffer.from(credentialUrl.replace('example.invalid', 'unexpected.invalid')), 'test/deploy-install-safety.test.ts', true), ['credential-url']);
+});
+
+
+test('verified license bytes survive an autocrlf-enabled checkout unchanged', t => {
+ const {dir, put, git} = fixture(t);
+ const path = 'licenses/Luker-AGPL-3.0.txt';
+ const bytes = readFileSync(resolve(path));
+ put('.gitattributes', 'licenses/Luker-AGPL-3.0.txt text eol=lf\n');
+ put(path, bytes);
+ git('config', 'core.autocrlf', 'true');
+ git('add', '--', '.gitattributes', path);
+ git('commit', '-qm', 'Synthetic verified license checkout');
+ rmSync(join(dir, path));
+ git('checkout', '--', path);
+ assert.deepEqual(readFileSync(join(dir, path)), bytes);
+ assert.equal(createHash('sha256').update(readFileSync(join(dir, path))).digest('hex'), '0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0');
 });
