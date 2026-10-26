@@ -1,3 +1,4 @@
+import {mergedPrepView} from './merged-prep-view.ts';
 import { classifyModelFailure } from "./model-failure.ts";
 import type { BranchEntryLike } from "./assemble.ts";
 import { projectTurnPerformance, TURN_PERFORMANCE_ENTRY_TYPE, type TurnPerformance } from "./performance.ts";
@@ -235,14 +236,17 @@ function diagnosticFor(branch: BranchEntryLike[], index: number, entry: BranchEn
  const ecologyReport = ecologyReports.at(-1);
  const existingEcology = recordOf(prep?.literaryEcology);
  const existingEcologySummary = `读取已有生态快照：第 ${number(existingEcology?.round)} 轮 · ${Array.isArray(existingEcology?.actors) ? existingEcology.actors.length : 0} 人物 · ${Array.isArray(existingEcology?.occurrences) ? existingEcology.occurrences.length : 0} 事件；不等同拍后推进`;
+	const mergedPrep = mergedPrepView(prep ?? {}, performance?.phases);
 	const stages: TurnDiagnosticStage[] = [
   ...(authorMode ? [stage("ecology-evidence", "拍前生态专家（仅报告）", undefined, ecologyReport?.status === "success" ? "success" : ecologyReport ? "failed" : "skipped", ecologyReport?.status === "success" ? "生态证据岗位已执行；报告不是人物／场所状态提交" : ecologyReport ? "生态证据岗位未成功" : "本模式未调用生态证据专家")] : []),
 		stage("continuity", "文学连续性", prepStatus.continuity, prep?.literaryContinuity ? "success" : "skipped", prep?.literaryContinuity ? "连续性工件已生成" : "本拍未触发", safeFields(recordOf(prep?.literaryContinuity), ["positions", "ongoingActions", "promisesAndDeadlines", "unresolvedPlayerChoices", "uncertainties"])),
 		stage("plot-adaptation", "生态剧情适配", prepStatus.plotAdaptation, prep?.plotAdaptation ? "success" : "skipped", prep?.plotAdaptation ? "卡级语法已将生态候选变形成当前事件" : prepStatus.plotAdaptation === "degraded" ? "调用或解析失败，正文按原流程继续" : "生态关闭或本拍未运行", safeFields(recordOf(prep?.plotAdaptation), ["cardGrammar", "selected", "reserves"])),
-		stage("director", "Stitches 导演", prepStatus.director, prep?.literaryDirectionData ? "success" : typeof prep?.literaryDirection === "string" ? "reused" : "skipped", prep?.literaryDirectionData ? "导演工件已生成" : typeof prep?.literaryDirection === "string" ? "沿用旧导演工件" : "本拍未运行", safeFields(recordOf(prep?.literaryDirectionData), ["scenePressure", "characterInitiatives", "personalThreads", "candidateBeats", "relationshipLimit", "playerStop"])),
+		stage("director", mergedPrep?.label ?? "文学导演", mergedPrep?.status ?? prepStatus.director, prep?.literaryDirectionData ? "success" : typeof prep?.literaryDirection === "string" ? "reused" : "skipped", mergedPrep ? mergedPrep.summary : prep?.literaryDirectionData ? "导演工件已生成" : typeof prep?.literaryDirection === "string" ? "沿用旧导演工件" : "本拍未运行", safeFields(recordOf(prep?.literaryDirectionData), ["scenePressure", "characterInitiatives", "personalThreads", "candidateBeats", "relationshipLimit", "playerStop"])),
 		stage("scene-conductor", "场面编排", prepStatus.sceneConductor, prep?.sceneConductor ? "success" : "skipped", prep?.sceneConductor ? "角色动作、信息边界与玩家停点已编排" : prepStatus.sceneConductor === "degraded" ? "调用或解析失败，主演按导演方向继续" : "本拍未运行", safeFields(recordOf(prep?.sceneConductor), ["sceneObjective", "turnOrder", "pressureShift", "playerStop"])),
 		stage("ecology-arrival", "生态抵达", prepStatus.ecologyArrival, prep?.literaryEcology ? "success" : "skipped", authorMode ? existingEcologySummary : prepStatus.ecologyArrival === "degraded" ? "候选失败或门禁拒绝，沿用上一快照" : prep?.literaryEcology ? "生态候选已交给导演" : "生态未运行", safeFields(recordOf(prep?.literaryEcology), ["round", "digest"])),
+		...(!mergedPrep ? [
 		stage("memory-recall", "剧情记忆召回", prepStatus.memoryRecall, memoryRecall?.results ? "success" : prepStatus.memoryRecall === "degraded" ? "degraded" : "skipped", prepStatus.memoryRecall === "degraded" ? "召回失败或超时，按摘要与状态继续" : memoryRecall?.results ? `命中 ${number(memoryRecall.results)} 条历史记忆` : "本拍未触发历史回照", safeFields(memoryRecall, ["triggered", "results", "queryChars", "mode", "arcs"])),
+		] : []),
 		stage("writer", "主演正文", undefined, authorFailed ? "failed" : workflowStats ? "success" : "failed", authorFailed ? authorError || "正文未定稿，已保留半稿" : workflowStats ? `${workflowStats.appends || workflowStats.writes} 个稿段 · ${workflowStats.rounds} 轮` : "缺少主演工作流工件", workflowStats),
 		stage("ledger", "角色账本", undefined, ledgerStatus, ledgerSummary, safeFields(scribeDiagnostic, ["kind", "reason", "error"])),
 		stage("world-facts", "拍后事实信封", undefined, factStatus, factStatus === "success" ? "已提取带证据事实" : factStatus === "failed" ? worldAuditSummary : authorFailed ? "正文未定稿，本次未执行正常拍后世界结算" : "世界链未运行", worldAudit?.data),
@@ -287,7 +291,7 @@ function failedDebugDiagnostic(entry: BranchEntryLike): TurnDiagnosticView | und
 	const stages: TurnDiagnosticStage[] = [
 		stage("continuity", "文学连续性", undefined, hasPrepFailure ? "degraded" : "skipped", hasPrepFailure ? "拍前旁路失败或超时" : "本拍未产生工件"),
 		stage("plot-adaptation", "生态剧情适配", undefined, hasPrepFailure ? "degraded" : "skipped", hasPrepFailure ? "拍前旁路失败或超时" : "本拍未运行"),
-		stage("director", "Stitches 导演", undefined, hasPrepFailure ? "degraded" : "skipped", hasPrepFailure ? "拍前旁路失败或超时" : "本拍未运行"),
+		stage("director", "文学导演", undefined, hasPrepFailure ? "degraded" : "skipped", hasPrepFailure ? "拍前旁路失败或超时" : "本拍未运行"),
 		stage("scene-conductor", "场面编排", undefined, "skipped", "主演未进入可用正文工作流"),
 		stage("ecology-arrival", "生态抵达", undefined, hasPrepFailure ? "degraded" : "skipped", hasPrepFailure ? "拍前旁路失败或超时" : "本拍未运行"),
 		stage("memory-recall", "剧情记忆召回", undefined, activities.some((item) => item.includes("记忆召回") && /失败|超时/.test(item)) ? "degraded" : "skipped", "本拍失败，未形成正文输入结算"),

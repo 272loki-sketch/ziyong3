@@ -1,3 +1,5 @@
+import { loadStageConfig } from "../src/stage/materials.ts";
+import { resolveConfigPath } from "../src/paths.ts";
 import {RequestJournal} from "../src/stage/request-journal.ts";
 import { selectDatabasePluginWorldbookEntries, type DatabasePluginPreparedPrompt, type DatabasePluginWorldbookEntry } from '../src/stage/database-plugin-prompt.ts';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, chmodSync } from "node:fs";
@@ -85,33 +87,56 @@ export class DatabasePluginHttp {
  readonly defaults: DatabasePluginConfig={version:1,enabled:false,recentHistoryMessages:12,injectionMaxChars:24000};
  readonly cwd:string; readonly host:DatabasePluginHost;
  constructor(cwd:string,host:DatabasePluginHost){this.cwd=cwd;this.host=host;this.store=new DatabasePluginStore(cwd);this.sources=new DatabasePluginSourceStore({cwd});this.root=join(cwd,".liyuan-database-plugin");}
- config():DatabasePluginConfig {try{const r=JSON.parse(readFileSync(join(this.root,"config.json"),"utf8"));return {...this.defaults,...r,enabled:r.enabled===true};}catch{return {...this.defaults};}}
+ private storedConfig():DatabasePluginConfig {try{const r=JSON.parse(readFileSync(join(this.root,"config.json"),"utf8"));return {...this.defaults,...r,enabled:r.enabled===true};}catch{return {...this.defaults};}}
+ /** Settings' literaryDirector is the sole recall/plot owner; legacy standalone hosts retain their config. */
+ directorModel(){
+  if(!existsSync(resolveConfigPath(this.cwd)))return undefined;
+  const requested=loadStageConfig(this.cwd).stepModels?.literaryDirector;
+  if(requested)return {...requested};
+  const agent=loadAgentConfig(this.cwd).config;
+  return agent.defaultProvider&&agent.defaultModel?{provider:agent.defaultProvider,id:agent.defaultModel}:undefined;
+ }
+ config():DatabasePluginConfig {const stored=this.storedConfig(),director=this.directorModel();return director?{...stored,recallModel:director}:stored;}
+ syncDirectorModel():boolean {
+  const director=this.directorModel(),stored=this.storedConfig().recallModel;
+  if(!director||(stored?.provider===director.provider&&stored.id===director.id))return false;
+  this.setConfig({recallModel:director});return true;
+ }
  sourceStatus(){try{const active=JSON.parse(readFileSync(this.sources.activePointerPath,"utf8")).current;return {ref:active.ref,sha256:active.sha256,bytes:active.bytes};}catch{return {ref:this.sources.config.ref,sha256:this.sources.config.expectedSha256,bytes:0};}}
  onSourceChanged:(()=>Promise<void>)|undefined;
  onConfigChanged:(()=>Promise<void>)|undefined;
  setConfig(p:Partial<DatabasePluginConfig>):DatabasePluginConfig {if(this.host.isStreaming())throw new Error("生成中不能切换记忆后端");const c=this.config();const next={...c,enabled:typeof p.enabled==="boolean"?p.enabled:c.enabled,recentHistoryMessages:Math.max(6,Math.min(40,Number(p.recentHistoryMessages)||c.recentHistoryMessages)),injectionMaxChars:Math.max(2000,Math.min(60000,Number(p.injectionMaxChars)||c.injectionMaxChars))};for(const role of ["fillModel","recallModel"] as const)if(Object.prototype.hasOwnProperty.call(p,role)){
- const value=p[role];if(!value)delete next[role];else{const provider=loadAgentConfig(this.cwd).config.providers[value.provider];if(!provider?.models?.some(m=>m.id===value.id))throw new Error("数据库模型必须来自梨园当前已启用连接");next[role]={provider:value.provider,id:value.id};}
+ const value=p[role];const director=role==='recallModel'?this.directorModel():undefined;
+ if(director&&(!value||value.provider!==director.provider||value.id!==director.id))throw new Error('召回／剧情推进模型统一跟随设置中的文学导演，请在模型插头中修改');
+ if(!value)delete next[role];else{const provider=loadAgentConfig(this.cwd).config.providers[value.provider];if(!provider?.models?.some(m=>m.id===value.id))throw new Error("数据库模型必须来自梨园当前已启用连接");next[role]={provider:value.provider,id:value.id};}
  }if(next.enabled)this.sources.readCurrentPinnedJS();mkdirSync(this.root,{recursive:true,mode:0o700});const f=join(this.root,"config.json"),tmp=f+"."+randomUUID()+".tmp";writeFileSync(tmp,JSON.stringify(next),{mode:0o600});renameSync(tmp,f);chmodSync(f,0o600);void this.onConfigChanged?.();return next;}
  currentContext():DatabasePluginContext {const c=this.host.context();if(!this.boundSourceEntryId)return c;const at=c.chat.findIndex(m=>m.__liyuanEntryId===this.boundSourceEntryId);if(at<0)throw new Error("待恢复的记忆来源已不在当前分支");const end=c.visibleEntryIds.indexOf(this.boundSourceEntryId);return {...c,sourceEntryId:this.boundSourceEntryId,chat:c.chat.slice(0,at+1),visibleEntryIds:c.visibleEntryIds.slice(0,end+1)};}
  scopeKey(c:Pick<DatabasePluginContext,"scope">):string{return createHash("sha256").update(JSON.stringify(c.scope)).digest("hex").slice(0,24);}
  managedPresets(){return managedDatabasePluginPresets(this.cwd,this.config());}
- async context(){const c=this.currentContext();const state=await this.store.readState(c.scope,new Set(c.visibleEntryIds));const s=state.snapshot?.state;const book=`Liyuan-ACU-${this.scopeKey(c)}`;return {...c,managedModels:{presets:this.managedPresets(),revision:databasePluginModelRevision(this.managedPresets())},scopeKey:this.scopeKey(c),revision:state.globalRevision,chat:c.chat.map(m=>({...m,...(s?.messages[String(m.__liyuanEntryId)]??{})})),chatMetadata:s?.chatMetadata??{},extensionSettings:publicDatabasePluginSettings(s?.extensionSettings??{}),worldbooks:s?.worldbooks??{[book]:{entries:[]}},readonlyBooks:c.readonlyBooks??{},primaryBook:book,embeddingModel:loadMemoryConfig(this.cwd).cloudEmbed.model,embeddingConfigured:!!this.host.embed||loadMemoryConfig(this.cwd).embedMode==="cloud"&&[loadMemoryConfig(this.cwd).cloudEmbed.model,loadMemoryConfig(this.cwd).cloudEmbed.baseUrl,loadMemoryConfig(this.cwd).cloudEmbed.apiKey].every(Boolean)};}
- assertBinding(body:any){const c=this.currentContext();if(body?.scopeKey!==this.scopeKey(c)||body?.sourceEntryId!==c.sourceEntryId)throw Object.assign(new Error("会话/卡/分支已变化，拒绝迟到的插件写入"),{status:409});return c;}
+ async context(){const c=this.currentContext();const state=await this.store.readState(c.scope,new Set(c.visibleEntryIds));const s=state.snapshot?.state;const book=`Liyuan-ACU-${this.scopeKey(c)}`;return {...c,managedModels:{presets:this.managedPresets(),revision:databasePluginModelRevision(this.managedPresets()),...(this.directorModel()?{recallModelSource:'literaryDirector'}:{})},scopeKey:this.scopeKey(c),revision:state.globalRevision,chat:c.chat.map(m=>({...m,...(s?.messages[String(m.__liyuanEntryId)]??{})})),chatMetadata:s?.chatMetadata??{},extensionSettings:publicDatabasePluginSettings(s?.extensionSettings??{}),worldbooks:s?.worldbooks??{[book]:{entries:[]}},readonlyBooks:c.readonlyBooks??{},primaryBook:book,embeddingModel:loadMemoryConfig(this.cwd).cloudEmbed.model,embeddingConfigured:!!this.host.embed||loadMemoryConfig(this.cwd).embedMode==="cloud"&&[loadMemoryConfig(this.cwd).cloudEmbed.model,loadMemoryConfig(this.cwd).cloudEmbed.baseUrl,loadMemoryConfig(this.cwd).cloudEmbed.apiKey].every(Boolean)};}
+  assertBinding(body:any):DatabasePluginContext;
+  assertBinding(body:any,identityOnly:true):Pick<DatabasePluginContext,"scope"|"sourceEntryId">;
+  assertBinding(body:any,identityOnly=false){
+   // Identity polling must not reload cards/lorebooks. Recovery still validates the bound ancestor.
+   const binding=identityOnly?this.host.binding?.():undefined;
+   const c=binding&&(!this.boundSourceEntryId||binding.sourceEntryId===this.boundSourceEntryId)?binding:this.currentContext();
+   if(body?.scopeKey!==this.scopeKey(c)||body?.sourceEntryId!==c.sourceEntryId)throw Object.assign(new Error("会话/卡/分支已变化，拒绝迟到的插件写入"),{status:409});return c;
+  }
  private fileRef(source:string,name:string):string{return 'host-ref-'+createHash('sha256').update(source+'\0'+name).digest('hex')+'.json';}
- async putObject(body:any){const c=this.assertBinding(body),name=pluginObjectName(body.name);const bytes=Buffer.from(body.data??'','base64');const sha=createHash('sha256').update(bytes).digest('hex'),object='immutable-'+sha+'.json';await this.store.putFile(c.scope,object,body.data);this.assertBinding(body);await this.store.putFile(c.scope,this.fileRef(c.sourceEntryId,name),Buffer.from(JSON.stringify({sourceEntryId:c.sourceEntryId,name,object,sha256:sha})).toString('base64'));return {name,path:'user/files/'+name,sha256:sha,size:bytes.length};}
+  async putObject(body:any){const c=this.assertBinding(body),name=pluginObjectName(body.name);const bytes=Buffer.from(body.data??'','base64');const sha=createHash('sha256').update(bytes).digest('hex'),object='immutable-'+sha+'.json';await this.store.putFile(c.scope,object,body.data);this.assertBinding(body,true);await this.store.putFile(c.scope,this.fileRef(c.sourceEntryId,name),Buffer.from(JSON.stringify({sourceEntryId:c.sourceEntryId,name,object,sha256:sha})).toString('base64'));return {name,path:'user/files/'+name,sha256:sha,size:bytes.length};}
  async readObject(nameInput:unknown){const c=this.currentContext(),name=pluginObjectName(nameInput);const sources=[...new Set([...c.visibleEntryIds,c.sourceEntryId])].reverse();for(const source of sources){const ref=await this.store.readFile(c.scope,this.fileRef(source,name));if(!ref)continue;const pointer=JSON.parse(ref.data.toString());if(pointer.sourceEntryId!==source||pointer.name!==name)throw new Error('插件对象来源校验失败');if(pointer.deleted)return null;if(!/^immutable-[0-9a-f]{64}\.json$/.test(pointer.object)||!/^[0-9a-f]{64}$/.test(pointer.sha256))throw new Error('插件对象指针无效');const object=await this.store.readFile(c.scope,pointer.object);if(!object||object.sha256!==pointer.sha256)throw new Error('插件对象校验失败');return {...object,name,path:'user/files/'+name};}return null;}
  async deleteObject(body:any){const c=this.assertBinding(body),name=pluginObjectName(body.name??body.path);const existing=await this.readObject(name);await this.store.putFile(c.scope,this.fileRef(c.sourceEntryId,name),Buffer.from(JSON.stringify({sourceEntryId:c.sourceEntryId,name,deleted:true})).toString('base64'));return !!existing;}
  async listMemory(){const c=this.currentContext(),r=await this.store.readState(c.scope,new Set(c.visibleEntryIds));return Object.values(r.snapshot?.state.worldbooks??{}).flatMap(b=>b.entries).map((e:any)=>({id:String(e.uid),text:String(e.content??""),textLen:String(e.content??"").length,meta:{title:String(e.comment??"数据库条目"),source:"database-plugin"},createdAt:r.snapshot?.createdAt??""}));}
  async addMemory(text:string,title?:string){if(text.trim().length<8)throw new Error("记忆文字过短");const c=await this.context(),worldbooks=JSON.parse(JSON.stringify(c.worldbooks));const entries=worldbooks[c.primaryBook].entries as any[];const uid=entries.reduce((n,e)=>Math.max(n,Number(e.uid)||0),0)+1;entries.push({uid,comment:`Liyuan-Manual-${title||uid}`,content:text,enabled:true,type:"constant",constant:true,keys:[],source:"manual"});await this.save({scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId,revision:c.revision,state:{messages:Object.fromEntries(c.chat.map(m=>[String(m.__liyuanEntryId),Object.fromEntries(Object.entries(m).filter(([k])=>/^TavernDB_/.test(k)))])),chatMetadata:c.chatMetadata,extensionSettings:c.extensionSettings,worldbooks}});return {added:1,total:entries.length,chunks:1};}
  async deleteMemory(id:string){const c=await this.context(),worldbooks=JSON.parse(JSON.stringify(c.worldbooks));let deleted=false;for(const book of Object.values(worldbooks) as any[])book.entries=book.entries.filter((e:any)=>{if(String(e.uid)!==id)return true;if(!String(e.comment??"").startsWith("Liyuan-Manual-"))throw new Error("数据库生成条目请在原管理台删除对应表行，避免被索引重新生成");deleted=true;return false});if(deleted)await this.save({scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId,revision:c.revision,state:{messages:Object.fromEntries(c.chat.map(m=>[String(m.__liyuanEntryId),Object.fromEntries(Object.entries(m).filter(([k])=>/^TavernDB_/.test(k)))])),chatMetadata:c.chatMetadata,extensionSettings:c.extensionSettings,worldbooks}});return deleted;}
- async save(body:any){const c=this.assertBinding(body);const visible=new Set(c.visibleEntryIds);for(const id of Object.keys(body?.state?.messages??{}))if(!visible.has(id))throw Object.assign(new Error("插件消息扩展来源不在当前祖先链"),{status:409});const previous=await this.store.readState(c.scope,new Set(c.visibleEntryIds));this.assertBinding(body);body.state.extensionSettings=preserveDatabasePluginSecrets(body.state.extensionSettings,previous.snapshot?.state.extensionSettings);return this.store.saveState(c.scope,c.sourceEntryId,body.revision,body.state,()=>{this.assertBinding(body)});}
+  async save(body:any){const c=this.assertBinding(body);const visible=new Set(c.visibleEntryIds);for(const id of Object.keys(body?.state?.messages??{}))if(!visible.has(id))throw Object.assign(new Error("插件消息扩展来源不在当前祖先链"),{status:409});const previous=await this.store.readState(c.scope,new Set(c.visibleEntryIds));this.assertBinding(body,true);body.state.extensionSettings=preserveDatabasePluginSecrets(body.state.extensionSettings,previous.snapshot?.state.extensionSettings);return this.store.saveState(c.scope,c.sourceEntryId,body.revision,body.state,()=>{this.assertBinding(body,true)});}
  async prompt(userInput:string):Promise<DatabasePluginPreparedPrompt>{const c=this.currentContext(),binding={scopeKey:this.scopeKey(c),sourceEntryId:c.sourceEntryId};const r=await this.store.readState(c.scope,new Set(c.visibleEntryIds));this.assertBinding(binding);const worldbookEntries=Object.values(r.snapshot?.state.worldbooks??{}).flatMap(b=>b.entries).map(e=>{if(!e||typeof e!=='object'||Array.isArray(e)||typeof e.content!=='string')throw new Error('原数据库世界书条目不是有效宿主对象');return e as unknown as DatabasePluginWorldbookEntry;});return {userInput,worldbookEntries};}
  // Diagnostic/tool view uses native key activation only, never the disabled
  // overview, a second AM selector, stripped wrappers or a host character cap.
  async injection(userText:string){const c=this.currentContext();const prepared=await this.prompt(userText);return selectDatabasePluginWorldbookEntries(prepared.worldbookEntries,c.chat.slice(0,-1).map(m=>String(m.mes??'')),userText).map(e=>({tag:String(e.comment??'数据库世界书'),kind:'digest' as const,text:e.content}));}
  boundRequestController(req:IncomingMessage,res:ServerResponse,body:any){
  const controller=new AbortController();const abort=()=>controller.abort();req.once('aborted',abort);res.once('close',abort);
- const timer=setInterval(()=>{try{this.assertBinding(body)}catch{abort()}},200);timer.unref();
+  const timer=setInterval(()=>{try{this.assertBinding(body,true)}catch{abort()}},200);timer.unref();
  return {controller,release:()=>{clearInterval(timer);req.off('aborted',abort);res.off('close',abort)}};
  }
  async handle(req:IncomingMessage,res:ServerResponse):Promise<boolean>{const url=new URL(req.url??'/',"http://localhost");const internal=req.headers['x-liyuan-database-host']===this.internalToken;
@@ -134,21 +159,21 @@ export class DatabasePluginHttp {
  if(path==='/context'){send(200,await this.context());return true;}
  if(path==='/state'&&req.method==='POST'){if(!internal&&this.host.isStreaming())throw new Error('生成期间原插件管理台保持只读，稍后再保存');const result=await this.save(body);send(200,{globalRevision:result.globalRevision,visibleRevision:result.visibleRevision,sourceEntryId:result.snapshot.sourceEntryId,savedAt:result.snapshot.createdAt});return true;}
  if(path==='/completion-status'&&req.method==='POST'){
- const context=this.assertBinding(body),state=await this.store.readState(context.scope,new Set(context.visibleEntryIds));this.assertBinding(body);const task=this.boundRequestController(req,res,body);try{const result=await probeDatabasePluginModels(this.cwd,body.payload??body,{auth:this.host.modelAuth,settings:(state.snapshot?.state.extensionSettings??{}) as Record<string,any>,guard:()=>this.assertBinding(body),signal:task.controller.signal});this.assertBinding(body);send(200,result);return true;}finally{task.release()}
+  const context=this.assertBinding(body),state=await this.store.readState(context.scope,new Set(context.visibleEntryIds));this.assertBinding(body,true);const task=this.boundRequestController(req,res,body);try{const result=await probeDatabasePluginModels(this.cwd,body.payload??body,{auth:this.host.modelAuth,settings:(state.snapshot?.state.extensionSettings??{}) as Record<string,any>,guard:()=>this.assertBinding(body,true),signal:task.controller.signal});this.assertBinding(body,true);send(200,result);return true;}finally{task.release()}
  }
  if(path==='/completion'&&req.method==='POST'){
  if(!internal&&this.host.isStreaming())throw new Error('正文生成期间数据库管理台不能手动调用模型，稍后再操作');
  const context=this.assertBinding(body),state=await this.store.readState(context.scope,new Set(context.visibleEntryIds));const payload=body.payload??body;
  const task=this.boundRequestController(req,res,body),controller=task.controller;
- try{this.assertBinding(body);const result=await requestDatabasePluginCompletion(this.cwd,payload,(state.snapshot?.state.extensionSettings??{}) as Record<string,any>,{auth:this.host.modelAuth,complete:this.host.complete,generate:this.host.generate},controller.signal,()=>this.assertBinding(body));
- this.assertBinding(body);if(payload.stream)send(200,databasePluginChatSse(result),'text/event-stream; charset=utf-8');else send(200,result);return true;}finally{task.release()}
+  try{this.assertBinding(body,true);const result=await requestDatabasePluginCompletion(this.cwd,payload,(state.snapshot?.state.extensionSettings??{}) as Record<string,any>,{auth:this.host.modelAuth,complete:this.host.complete,generate:this.host.generate},controller.signal,()=>this.assertBinding(body,true));
+  this.assertBinding(body,true);if(payload.stream)send(200,databasePluginChatSse(result),'text/event-stream; charset=utf-8');else send(200,result);return true;}finally{task.release()}
  }
  if(path==='/generate'&&req.method==='POST'){
   if(!internal&&this.host.isStreaming())throw new Error('正文生成期间数据库管理台不能手动调用模型，稍后再操作');
-  this.assertBinding(body);
+   this.assertBinding(body,true);
   if(!Array.isArray(body.prompts)||body.prompts.length>100||body.prompts.reduce((n:number,p:any)=>n+String(p.content??'').length,0)>240000)throw new Error('无效插件模型材料');
   const task=this.boundRequestController(req,res,body);
-  try{const result=await this.host.generate(body.prompts,task.controller.signal,{purpose:body.purpose==="recall"?"recall":"fill",modelRef:body.purpose==="recall"?this.config().recallModel:this.config().fillModel,validateBinding:()=>this.assertBinding(body)});this.assertBinding(body);send(200,{text:result});return true;}finally{task.release()}
+   try{const result=await this.host.generate(body.prompts,task.controller.signal,{purpose:body.purpose==="recall"?"recall":"fill",modelRef:body.purpose==="recall"?this.config().recallModel:this.config().fillModel,validateBinding:()=>this.assertBinding(body,true)});this.assertBinding(body,true);send(200,{text:result});return true;}finally{task.release()}
  }
 
  if(path==='/external'&&req.method==='POST'){

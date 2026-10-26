@@ -112,3 +112,13 @@ test("cancelled pending read never delivers late text and a fresh request can us
  assert.equal(nextChild.signal.aborted, true);
  assert.equal(parent.signal.aborted, false);
 });
+
+for (const scope of ["analysis", "generation"] as const) test(`parent ${scope} deadline retains its cause instead of becoming writer cancellation`, async () => {
+ const { LocalRequestTimeoutError } = await import("../src/request-budget.ts");
+ const { classifyModelFailure } = await import("../src/stage/model-failure.ts");
+ const parent = new AbortController(), child = new AbortController(), f = stalledStream();
+ const iterator = streamWithTimeout(f.source, 1000, parent.signal, child); await iterator.next(); const pending = iterator.next();
+ const cause = new LocalRequestTimeoutError(scope, 20, scope === "analysis" ? "合成导演" : "整拍总体预算"); parent.abort(cause);
+ await assert.rejects(pending, e => e === cause); assert.equal(child.signal.reason, cause);
+ assert.equal(classifyModelFailure(cause).kind, "timeout");
+});

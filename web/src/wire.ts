@@ -6,6 +6,7 @@ import type {
 import type { GenerationMode } from "./generation-mode.ts";
 
 export type {
+	LedgerStatus,
 	AssistantModelInfo,
 	AssistantMsg,
 	AssistantSessionInfo,

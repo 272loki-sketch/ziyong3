@@ -1,3 +1,5 @@
+import { ParallelSaves } from "./ParallelSaves.tsx";
+import { scopedUrl } from "../workspace.ts";
 /**
  * 角色卡面板（右栏）：卡库与详情一体。
  * 点卡即切换并进详情；若卡含内嵌世界书，弹窗询问是否另存为独立世界书并挂载（ST 式配套导入）。
@@ -20,7 +22,7 @@ import { bumpWatchPanels, ConfirmButton, Field, PanelStatus, SearchInput, useAct
 type CardSort = "recent" | "name" | "fav";
 type CardView = "grid" | "list";
 
-const cardImgUrl = (path: string) => `/api/cards/image?path=${encodeURIComponent(path)}`;
+const cardImgUrl = (path: string) => scopedUrl(`/api/cards/image?path=${encodeURIComponent(path)}`);
 
 /** 刚导入、尚未回答「是否挂载内嵌世界书」的卡路径（再导入会重新标记） */
 const LORE_PENDING_KEY = "liyuan.cards.lorePending";
@@ -324,7 +326,7 @@ function CardDetail({
 		const url = `/api/card/export?format=${format}&lore=active`;
 		// 用隐藏 a 触发下载（带 cookie/同源）
 		const a = document.createElement("a");
-		a.href = url;
+		a.href = scopedUrl(url);
 		a.download = "";
 		a.rel = "noopener";
 		document.body.appendChild(a);
@@ -531,6 +533,7 @@ interface LorePrompt {
 }
 
 export function CardPanel({
+ prepareWorkspaceSwitch = () => true,
 	toast,
 	/** 点卡/换卡后离开主页进入对话（学 ST） */
 	onEnterChat,
@@ -541,7 +544,8 @@ export function CardPanel({
 	/** 卡皮肤开关变更后通知 App 重拉显示规则 */
 	onFrontChange,
 }: {
-	toast: (level: "info" | "warning" | "error", text: string) => void;
+	prepareWorkspaceSwitch?:()=>boolean;
+ toast: (level: "info" | "warning" | "error", text: string) => void;
 	onEnterChat?: () => void;
 	onGoHome?: () => void;
 	active?: boolean;
@@ -839,6 +843,7 @@ export function CardPanel({
 		>
 			{loreModal}
 			{deleteModal}
+   <ParallelSaves prepare={prepareWorkspaceSwitch} toast={toast} card={detail?currentPath??lib.data?.current:undefined}/>
 			<div className="card-lib-pane" hidden={detail} style={detail ? { display: "none" } : undefined}>
 				<PanelStatus loading={lib.loading} error={lib.error} hasData={!!lib.data} />
 				{lib.data && (

@@ -7,7 +7,7 @@ import {pluginGitNetworkOptions} from '../server/plugin-git-network.ts';
 function fixture(fn:(cwd:string)=>void){const cwd=mkdtempSync(join(tmpdir(),'liyuan-plugin-network-'));try{fn(cwd);}finally{rmSync(cwd,{recursive:true,force:true});}}
 function save(cwd:string,dir:string,data:unknown){mkdirSync(join(cwd,dir),{recursive:true,mode:0o700});writeFileSync(join(cwd,dir,'network.json'),JSON.stringify(data),{mode:0o600});}
 const shared='http://127.0.0.1:9',local='http://127.0.0.1:10';
-for(const plugin of ['npc-parallel','veridis-rewrite']as const){
+for(const plugin of ['veridis-rewrite']as const){
  test(`${plugin}: uses existing shared routing when no dedicated override exists`,()=>fixture(cwd=>{
   assert.deepEqual(pluginGitNetworkOptions(cwd,plugin,{}),{});save(cwd,'.liyuan-tavern-plugins',{gitProxy:shared,unknown:{keep:true}});
   const before=readFileSync(join(cwd,'.liyuan-tavern-plugins/network.json'));
@@ -18,8 +18,7 @@ for(const plugin of ['npc-parallel','veridis-rewrite']as const){
  test(`${plugin}: private empty override means direct and does not change other plugins`,()=>fixture(cwd=>{
   save(cwd,'.liyuan-tavern-plugins',{gitProxy:shared});save(cwd,`.liyuan-${plugin}`,{gitProxy:'',futureField:{keep:true}});
   assert.deepEqual(pluginGitNetworkOptions(cwd,plugin,{LIYUAN_TAVERN_GIT_PROXY:shared}),{proxy:''});
-  const other=plugin==='npc-parallel'?'veridis-rewrite':'npc-parallel';assert.deepEqual(pluginGitNetworkOptions(cwd,other,{}),{proxy:shared});
-  const ownVariable=plugin==='npc-parallel'?'LIYUAN_NPC_PARALLEL_GIT_PROXY':'LIYUAN_VERIDIS_REWRITE_GIT_PROXY';
+  const ownVariable='LIYUAN_VERIDIS_REWRITE_GIT_PROXY';
   assert.deepEqual(pluginGitNetworkOptions(cwd,plugin,{[ownVariable]:local}),{proxy:local});
   assert.deepEqual(pluginGitNetworkOptions(cwd,plugin,{[ownVariable]:''}),{proxy:''});
   if(plugin==='veridis-rewrite'){

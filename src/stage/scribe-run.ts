@@ -11,6 +11,7 @@
  * 纯函数 + 注入依赖，零 pi 依赖、可单测。
  */
 
+import { isProviderContentRejection } from "./model-failure.ts";
 import { applyPatch, canonicalizeCharacterKeys, saveState } from "../state.ts";
 import { buildScribeTurnPrompt, parseScribeResult } from "../scribe.ts";
 import type { WorldState } from "../types.ts";
@@ -34,6 +35,8 @@ export interface ScribeRunDeps {
 }
 
 export interface ScribeRunInput {
+	trustedNarrative?: boolean;
+	strictPatch?: boolean;
 	/** 本拍开演前的账本（= f(分支)） */
 	state: WorldState;
 	userText: string;
@@ -51,14 +54,14 @@ export type ScribeRunOutcome =
 
 /**
  * 一拍记账。调用方保证：只对干净收笔的台上拍调用（中断半拍/戏外轮不记账）。
- * 任何失败都只跳过本拍记账，不影响正文——账本滞后一拍可由下拍补上。
+ * 失败保留已保存正文及旧账本；宿主保持 pending，供应商内容拒绝不自动重试。
  */
 export async function runScribeTurn(deps: ScribeRunDeps, input: ScribeRunInput): Promise<ScribeRunOutcome> {
 	const { state, userText, assistantText, charName, userName } = input;
 	if (!assistantText.trim()) return { kind: "skipped", reason: "no-text" };
 
 	const leafBefore = deps.getLeafId();
-	const prompt = buildScribeTurnPrompt({ state, userText, assistantText, charName, userName, identityHints: deps.identityHints });
+	const prompt = buildScribeTurnPrompt({ state, userText, assistantText, charName, userName, identityHints: deps.identityHints, trustedNarrative: input.trustedNarrative });
 	const resp = await deps.sideText(prompt.systemPrompt, prompt.userText);
 	// R9 叶守卫：调用期间树动过（swipe/rewind/切线）→ 整体丢弃
 	if (!(deps.isLeafStable?.(leafBefore) ?? (deps.getLeafId() === leafBefore))) {
@@ -68,8 +71,11 @@ export async function runScribeTurn(deps: ScribeRunDeps, input: ScribeRunInput):
 
 	if (typeof resp !== "string") return { kind: "failed", error: resp.error };
 
-	const parsed = parseScribeResult(resp);
+	if (isProviderContentRejection(resp)) return { kind: "failed", error: `场记请求被供应商安全策略拒绝：${resp.trim().slice(0, 240)}` };
+
+	const parsed = parseScribeResult(resp, {strictPatch: input.strictPatch});
 	if (!parsed) {
+		if (input.strictPatch) return { kind: "failed", error: "场记账本补丁 JSON 无法解析，原账本保留" };
 		// 短响应直接给全文（多半是格式跑偏）；长响应给尾部（多半是 maxTokens 截断）
 		const flat = resp.trim().replace(/\s+/g, " ");
 		const detail = flat.length <= 400 ? flat : `…${flat.slice(-160)}`;
@@ -80,6 +86,7 @@ export async function runScribeTurn(deps: ScribeRunDeps, input: ScribeRunInput):
 
 	const knownNames = [charName, userName, ...Object.keys(state.characters)];
 	const result = applyPatch(state, protectKnownCharacterIdentity(canonicalizeCharacterKeys(parsed.patch, knownNames), deps.identityHints));
+	if (input.strictPatch && (result.warnings.length || !result.applied.length)) return { kind: "failed", error: "场记补丁 JSON/schema 无效，未修改账本" };
 	deps.appendStateEntry(result.state);
 	if (deps.stateFile) {
 		try {

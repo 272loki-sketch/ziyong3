@@ -9,3 +9,17 @@ export function abortable<T>(work: PromiseLike<T>, signal?: AbortSignal): Promis
 		pending.then(value => { signal.removeEventListener("abort", stop); if (signal.aborted) stop(); else resolve(value); }, error => { signal.removeEventListener("abort", stop); reject(error); });
 	});
 }
+
+/** Drain with cancellation without waiting for an uncooperative producer's return(). */
+export async function* abortableEvents<T>(source: AsyncIterable<T>, signal?: AbortSignal): AsyncGenerator<T> {
+ const iterator = source[Symbol.asyncIterator]();
+ try {
+  while (true) {
+   const next = await abortable(iterator.next(), signal);
+   if (next.done) return;
+   yield next.value;
+  }
+ } finally {
+  try { void Promise.resolve(iterator.return?.()).catch(() => undefined); } catch { /* best effort */ }
+ }
+}

@@ -80,3 +80,23 @@ test("模型插头：查找层不暴露失鉴权模型时回退总插头", () =>
 	assert.equal(resolved.model, primary);
 	assert.equal(resolved.fallback, true);
 });
+
+test("manual side requests relocate a renamed channel by model id without falling back to a different model", async () => {
+ const { findAvailableModelById } = await import("../src/model-routing.ts");
+ const primary={provider:"current",id:"another-writer"};
+ const flash={provider:"renamed",id:"fixture-flash"};
+ const models=[primary,flash];
+ const result=resolveStepModel("worldProfile",{worldProfile:{provider:"old-name",id:flash.id}},primary,(provider,id)=>models.find(m=>m.provider===provider&&m.id===id),id=>findAvailableModelById(models,id,primary.provider));
+ assert.equal(result.model,flash);assert.equal(result.fallback,false);
+ assert.equal(findAvailableModelById([flash,{...flash,provider:"ambiguous"}],flash.id,primary.provider),undefined);
+ assert.equal(findAvailableModelById([flash,{...flash,provider:"current"}],flash.id,primary.provider)?.provider,"current");
+});
+
+test("worldProfile explicit missing model fails closed instead of silently paying for the primary writer",()=>{
+ const primary={provider:"live",id:"writer"};
+ const ref={provider:"deleted",id:"missing-profile"};
+ const result=resolveStepModel("worldProfile",{worldProfile:ref},primary,()=>undefined,()=>undefined);
+ assert.equal(result.model,undefined);assert.equal(result.fallback,false);assert.deepEqual(result.requested,ref);
+ const found={provider:"live",id:"profile"};
+ assert.equal(resolveStepModel("worldProfile",{worldProfile:{provider:"old",id:"profile"}},undefined,()=>undefined,()=>found).model,found);
+});

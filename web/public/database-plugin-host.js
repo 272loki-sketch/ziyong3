@@ -1,7 +1,7 @@
 /* Liyuan host adapter. The upstream database script is loaded unchanged from a verified private cache. */
 const nativeFetch=window.fetch.bind(window);
 let data=null,ctx=null,books={},revision=0,saving=Promise.resolve(),upstreamReady=false;
-const listeners=new Map(),phaseErrors=[];let generationCapture=null,generationPurpose='fill';let readonlyBooks={};
+const listeners=new Map(),phaseErrors=[];let generationCapture=null,generationPurpose='fill';let readonlyBooks={};let recallDirector=null,directorRequests=0,directorOutput='';
 const parentWindow=window.parent;
 // Presentation is opt-in: the server's background browser must not open a management window.
 const managerMode=new URLSearchParams(location.search).get('view')==='manager';
@@ -73,16 +73,55 @@ const bookRead=async name=>plain(getEntries(name));
 async function bookSet(name,entries){if(readonlyBooks[name])throw new Error("原卡与挂载世界书在数据库宿主中只读");const all=getEntries(name);for(const patch of entries){const entry=all.find(e=>e.uid===patch.uid);if(!entry)throw new Error('世界书条目已变化');Object.assign(entry,plain(patch));}await save();}
 async function bookCreate(name,entries){if(readonlyBooks[name])throw new Error("数据库不得改写原卡世界书");const all=getEntries(name),ids=[];for(const entry of entries){const uid=all.reduce((n,e)=>Math.max(n,Number(e.uid)||0),0)+1;all.push({...plain(entry),uid});ids.push(uid);}await save();return ids;}
 const bookNames=()=>({primary:data.primaryBook,additional:(data.characterBookNames??[]).filter(name=>Object.hasOwn(readonlyBooks,name))});
-async function generateRaw(params){const prompts=(params.ordered_prompts||params.messages||[]).map(p=>({role:String(p.role||'user').toLowerCase(),content:String(p.content??'')}));return (await request('/generate',{prompts,purpose:generationPurpose})).text;}
+// Per-before transport context only: never persisted into settings, books or story.
+function mergeRecallMessages(messages){
+ if(!recallDirector||generationPurpose!=='recall'||!Array.isArray(messages)||!messages.length)return messages;
+ const merged=[...messages,{role:'system',content:recallDirector.systemPrompt},{role:'user',content:'本拍导演参考资料（候选不是已发生事实）：\n'+recallDirector.userText}];
+ // Do not break a native request already near its existing host transport limits.
+ if(merged.length>100||merged.reduce((size,message)=>size+String(message.content??'').length,0)>240000)return messages;
+ directorRequests++;return merged;
+}
+function takeDirectorOutput(text){
+ if(!recallDirector||generationPurpose!=='recall'||typeof text!=='string')return text;
+ // Strip only our trailing transport envelope before the original plugin parses its reply.
+ const open='<liyuan_literary_direction>',close='</liyuan_literary_direction>';
+ const start=text.lastIndexOf(open),end=text.lastIndexOf(close);
+ if(start<0||end<start||text.slice(end+close.length).trim())return text;
+ const json=text.slice(start+open.length,end).trim();
+ try{const value=JSON.parse(json);if(value&&typeof value==='object'&&!Array.isArray(value))directorOutput=json;}catch{}
+ return text.slice(0,start);
+}
+function takeDirectorReply(reply){
+ if(typeof reply?.choices?.[0]?.message?.content==='string')reply.choices[0].message.content=takeDirectorOutput(reply.choices[0].message.content);
+ else if(typeof reply?.content==='string')reply.content=takeDirectorOutput(reply.content);
+ else if(typeof reply?.text==='string')reply.text=takeDirectorOutput(reply.text);
+ return reply;
+}
+async function takeDirectorResponse(response){
+ if(!recallDirector||generationPurpose!=='recall'||!response.ok)return response;
+ const raw=await response.clone().text();let body;
+ try{body=JSON.stringify(takeDirectorReply(JSON.parse(raw)));}catch{
+  const lines=raw.split('\n');let text='';
+  for(const line of lines){if(!line.startsWith('data:'))continue;try{const value=JSON.parse(line.slice(5).trim());text+=value.choices?.[0]?.delta?.content??'';}catch{}}
+  const native=takeDirectorOutput(text);if(native===text)return response;
+  let offset=0;
+  body=lines.map(line=>{if(!line.startsWith('data:'))return line;try{const value=JSON.parse(line.slice(5).trim()),delta=value.choices?.[0]?.delta;if(typeof delta?.content==='string'){const start=offset;offset+=delta.content.length;delta.content=delta.content.slice(0,Math.max(0,native.length-start));}return 'data: '+JSON.stringify(value);}catch{return line;}}).join('\n');
+ }
+ const headers=new Headers(response.headers);headers.delete('content-length');headers.delete('content-encoding');
+ return new Response(body,{status:response.status,statusText:response.statusText,headers});
+}
+async function generateRaw(params){const prompts=(params.ordered_prompts||params.messages||[]).map(p=>({role:String(p.role||'user').toLowerCase(),content:String(p.content??'')}));const result=await request('/generate',{prompts:mergeRecallMessages(prompts),purpose:generationPurpose});return takeDirectorOutput(result.text);}
+
 window.fetch=async(input,init={})=>{const address=typeof input==='string'?input:input instanceof URL?input.toString():input.url;const url=new URL(address,location.href);let payload={};try{payload=JSON.parse(init.body||'{}')}catch{};
- if(url.origin!==location.origin&&String(init.method||'GET').toUpperCase()==='POST'){const r=await request('/external',{url:url.href,payload});return new Response(JSON.stringify(r),{status:200,headers:{'content-type':'application/json'}});}
+ if(url.origin!==location.origin&&String(init.method||'GET').toUpperCase()==='POST'){if(Array.isArray(payload.messages))payload={...payload,messages:mergeRecallMessages(payload.messages)};const r=await request('/external',{url:url.href,payload});takeDirectorReply(r);return new Response(JSON.stringify(r),{status:200,headers:{'content-type':'application/json'}});}
  if(url.origin===location.origin){
   if(url.pathname==='/api/backends/chat-completions/status'||url.pathname==='/api/backends/chat-completions/generate'){
    const path=url.pathname.endsWith('/status')?'/completion-status':'/completion';
+   if(path==='/completion'&&Array.isArray(payload.messages))payload={...payload,messages:mergeRecallMessages(payload.messages)};
    try{
     const response=await nativeFetch('/api/database-plugin'+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({scopeKey:data.scopeKey,sourceEntryId:data.sourceEntryId,payload}),signal:init.signal});
     if(!response.ok){const error=await response.clone().json().catch(()=>({}));phaseErrors.push(String(error.error||'数据库模型请求失败（HTTP '+response.status+'）').slice(0,300));}
-    return response;
+    return await takeDirectorResponse(response);
    }catch(error){phaseErrors.push(String(error.message||error).slice(0,300));throw error;}
   }
   if(url.pathname==='/api/database-plugin/embeddings'){const r=await request('/embeddings',payload);return new Response(JSON.stringify(r),{status:200,headers:{'content-type':'application/json'}});}
@@ -108,11 +147,22 @@ function installContext(next){data=next;revision=next.revision;books=next.worldb
   const makePreset=p=>({name:p.name,apiMode:'custom',apiConfig:{url:new URL(p.url,location.origin).href,apiKey:'host-managed',model:p.model,max_tokens:p.maxTokens,maxTokens:p.maxTokens,temperature:1},tavernProfile:''});
   const presets=managed.presets.map(makePreset),names=new Set(presets.map(p=>p.name));
   profile.apiPresets=[...(Array.isArray(profile.apiPresets)?profile.apiPresets:[]).filter(p=>!names.has(p.name)),...presets];
+  const fill=managed.presets.find(p=>p.purpose==='fill'),recall=managed.presets.find(p=>p.purpose==='recall');
+  const fillRevision=JSON.stringify(fill?[fill.provider,fill.model,fill.url,fill.maxTokens]:null);
+  // Seed the per-role marker for old profiles without resetting their fill selections on a recall-only edit.
+  if(profile.__liyuanFillModelBindingRevision===undefined&&profile.__liyuanModelBindingRevision)profile.__liyuanFillModelBindingRevision=fillRevision;
   if(profile.__liyuanModelBindingRevision!==managed.revision){
-   const fill=managed.presets.find(p=>p.purpose==='fill'),recall=managed.presets.find(p=>p.purpose==='recall');
-   if(fill){profile.tableApiPreset=fill.name;profile.tableApiPresetOverridesByName=Object.fromEntries(Object.keys(profile.tableApiPresetOverridesByName||{}).map(key=>[key,fill.name]));profile.defaultApiPresetName=fill.name;profile.apiMode='custom';profile.apiConfig=makePreset(fill).apiConfig;profile.apiPresetBindingsByChat={...(profile.apiPresetBindingsByChat||{}),[ctx.chatId]:{presetName:fill.name,updatedAt:Date.now()}};}
+   if(fill&&profile.__liyuanFillModelBindingRevision!==fillRevision){profile.tableApiPreset=fill.name;profile.tableApiPresetOverridesByName=Object.fromEntries(Object.keys(profile.tableApiPresetOverridesByName||{}).map(key=>[key,fill.name]));profile.defaultApiPresetName=fill.name;profile.apiMode='custom';profile.apiConfig=makePreset(fill).apiConfig;profile.apiPresetBindingsByChat={...(profile.apiPresetBindingsByChat||{}),[ctx.chatId]:{presetName:fill.name,updatedAt:Date.now()}};}
    if(recall){globalMeta.vectorMemoryConfigGlobal??={};globalMeta.vectorMemoryConfigGlobal.keywordApiPreset=recall.name;}
    profile.__liyuanModelBindingRevision=managed.revision;
+  }
+  profile.__liyuanFillModelBindingRevision=fillRevision;
+  if(managed.recallModelSource==='literaryDirector'&&recall){
+   // The settings role owns native recall/plot API selection, not task prompts or switches.
+   profile.plotApiPreset=recall.name;
+   profile.plotTaskApiPresetOverridesById=Object.fromEntries(Object.keys(profile.plotTaskApiPresetOverridesById??{}).map(key=>[key,recall.name]));
+   for(const task of profile.plotSettings?.plotTasks??profile.plotSettings?.tasks??[])if(task&&Object.hasOwn(task,'taskApiPreset'))task.taskApiPreset=recall.name;
+   globalMeta.vectorMemoryConfigGlobal??={};globalMeta.vectorMemoryConfigGlobal.keywordApiPreset=recall.name;
   }
   // One-time correction of the old host's forced-off native recall hook.
   // Keep every original task, prompt/template and subsequent user choice.
@@ -131,7 +181,7 @@ function installContext(next){data=next;revision=next.revision;books=next.worldb
  if(!scoped.fillModeByIsolationKey?.['']){scoped.fillModeByIsolationKey={...(scoped.fillModeByIsolationKey??{}),'':{mode:globalMeta.formFillPreferencesGlobal?.selectedMode??'classic',recordedAt:Date.now()}};ctx.chatMetadata.TavernDB_ACU_ScopedConfig__chatId=ctx.chatId;}
 
 window.SillyTavern={getContext:()=>ctx};window.getContext=()=>ctx;window.getRequestHeaders=ctx.getRequestHeaders;window.saveSettingsDebounced=ctx.saveSettingsDebounced;
- window.TavernHelper={getChatMessages:async range=>ctx.chat.map((m,i)=>({...plain(m),role:m.is_user?'user':'assistant',message:m.mes,message_id:i})),getLastMessageId:()=>ctx.chat.length-1,getCurrentCharPrimaryLorebook:async()=>data.primaryBook,getCharWorldbookNames:bookNames,getGlobalWorldbookNames:()=>[...(data.globalBookNames??[])],getCharLorebooks:async()=>bookNames(),getLorebooks:async()=>[...Object.keys(books),...Object.keys(readonlyBooks)],getWorldbookNames:async()=>[...Object.keys(books),...Object.keys(readonlyBooks)],getLorebookEntries:bookRead,getWorldbook:bookRead,setLorebookEntries:bookSet,replaceWorldbook:async(name,entries)=>{if(readonlyBooks[name])throw new Error('原世界书只读');getEntries(name);books[name].entries=plain(entries);await save()},createLorebookEntries:bookCreate,deleteLorebookEntries:async(name,ids)=>{if(readonlyBooks[name])throw new Error('原世界书只读');books[name].entries=getEntries(name).filter(e=>!ids.includes(e.uid));await save()},getVariables:()=>({}),replaceVariables:()=>{},getAllVariables:()=>({}),generateRaw,generate:async params=>{generationCapture={userInput:String(params?.user_input??params?.prompt??params?.injects?.[0]?.content??'')};return '';},stopAllGeneration:ctx.stopGeneration,triggerSlash:async command=>{if(!/^\/(?:echo|flushvar|setvar|addvar)\b/.test(command))throw new Error('插件不得使用斜杠指令改写梨园正文');return ''},getTavernHelperVersion:()=> '4.0.0',setChatMessages:async messages=>{for(const patch of messages){const current=ctx.chat[patch.message_id];if(!current)throw new Error('楼层不在当前分支');for(const [key,value]of Object.entries(patch.data??patch))if(/^TavernDB_/.test(key))current[key]=plain(value);}await save()}};
+ window.TavernHelper={getChatMessages:async range=>ctx.chat.map((m,i)=>({...plain(m),role:m.is_user?'user':'assistant',message:m.mes,message_id:i})),getLastMessageId:()=>ctx.chat.length-1,getCurrentCharPrimaryLorebook:async()=>data.primaryBook,getCharWorldbookNames:bookNames,getGlobalWorldbookNames:()=>[...(data.globalBookNames??[])],getCharLorebooks:async()=>bookNames(),getLorebooks:async()=>[...Object.keys(books),...Object.keys(readonlyBooks)],getWorldbookNames:async()=>[...Object.keys(books),...Object.keys(readonlyBooks)],getLorebookEntries:bookRead,getWorldbook:bookRead,setLorebookEntries:bookSet,replaceWorldbook:async(name,entries)=>{if(readonlyBooks[name])throw new Error('原世界书只读');getEntries(name);books[name].entries=plain(entries);await save()},createLorebookEntries:bookCreate,deleteLorebookEntries:async(name,ids)=>{if(readonlyBooks[name])throw new Error('原世界书只读');books[name].entries=getEntries(name).filter(e=>!ids.includes(e.uid));await save()},getVariables:()=>({}),replaceVariables:()=>{},getAllVariables:()=>({}),generateRaw,generate:async params=>{generationCapture={userInput:String(params?.user_input??params?.prompt??params?.injects?.[0]?.content??''),nativePlotWriteback:params?._qrf_processed_by_hook===true};return '';},stopAllGeneration:ctx.stopGeneration,triggerSlash:async command=>{if(!/^\/(?:echo|flushvar|setvar|addvar)\b/.test(command))throw new Error('插件不得使用斜杠指令改写梨园正文');return ''},getTavernHelperVersion:()=> '4.0.0',setChatMessages:async messages=>{for(const patch of messages){const current=ctx.chat[patch.message_id];if(!current)throw new Error('楼层不在当前分支');for(const [key,value]of Object.entries(patch.data??patch))if(/^TavernDB_/.test(key))current[key]=plain(value);}await save()}};
   window.ACU_SQL_WASM_URL_ACU=location.origin+'/api/database-plugin/vendor/';window.toastr={success:message=>feedback('info',message),info:message=>feedback('info',message),warning:message=>{phaseErrors.push(String(message).slice(0,300));feedback('warning',message);},error:message=>{phaseErrors.push(String(message).slice(0,300));feedback('error',message);},clear:()=>{},options:{}};
 }
 async function loadScript(src){
@@ -153,15 +203,17 @@ window.LiyuanDatabasePluginHost={
   async refreshTables(){if(pendingSaves)throw new Error('正在保存，请等待保存完成再刷新');const api=window.AutoCardUpdaterV2API;if(typeof api?.refreshVisualizer!=='function')throw new Error('原实时表格刷新接口不可用，请重新加载管理台');feedback('pending','正在读取已保存的实时表格…');await this.sync();await api.refreshVisualizer();await this.flush();feedback('info','实时表格已刷新；未保存的编辑草稿由原插件冲突保护处理');return true;},
  diagnostics:()=>({listeners:[...listeners.keys()],metadata:ctx.chatMetadata}),
    async sync(){await this.flush();const next=await request('/context');if(next.scopeKey!==data.scopeKey||next.sourceEntryId!==data.sourceEntryId)throw new Error('插件会话/分支需重新载入');const oldLength=ctx.chat.length;ctx.chat.splice(0,ctx.chat.length,...plain(next.chat));syncSettings(ctx.chatMetadata,plain(next.chatMetadata));syncSettings(ctx.extensionSettings,next.extensionSettings);books=next.worldbooks;readonlyBooks=next.readonlyBooks??{};data=next;revision=next.revision;lastSavedState=null;await window.AutoCardUpdaterAPI?.refreshDataAndWorldbook?.();return {previousLength:oldLength,currentLength:ctx.chat.length};},
- async before(userText){phaseErrors.length=0;await this.sync();generationCapture=null;generationPurpose='recall';
+ async before(userText,director){phaseErrors.length=0;await this.sync();generationCapture=null;directorRequests=0;directorOutput='';
+  if(director&&(typeof director.systemPrompt!=='string'||typeof director.userText!=='string'))throw new Error('合并文学导演资料无效');
+  recallDirector=director??null;generationPurpose='recall';
   document.getElementById('send_textarea').value=userText;
   try{document.getElementById('send_but').dispatchEvent(new Event('click',{bubbles:true}));await eventSource.emit('MESSAGE_SENT',ctx.chat.length-1);await eventSource.emit('GENERATION_STARTED','normal',{automatic_trigger:false},false);
    // The unchanged plugin wraps this function. Capture the actual writeback,
    // not our own reimplementation of its template or AM selection.
     await window.TavernHelper.generate({user_input:userText,automatic_trigger:false});await this.flush();
    if(!generationCapture){const detail=[...new Set(phaseErrors)].slice(-3).join('；');throw new Error('原数据库插件未完成发送前处理；本轮尚未交给正文模型'+(detail?'。原因：'+detail:''));}
-   return {sourceEntryId:data.sourceEntryId,userInput:generationCapture.userInput,errors:[...phaseErrors]};
-  }finally{generationPurpose='fill';document.getElementById('send_textarea').value='';}
+   return {sourceEntryId:data.sourceEntryId,userInput:generationCapture.userInput,literaryDirectorHandled:!!recallDirector&&directorRequests>0&&!!directorOutput&&generationCapture.nativePlotWriteback,literaryDirection:directorOutput||undefined,errors:[...phaseErrors]};
+  }finally{recallDirector=null;directorRequests=0;directorOutput='';generationPurpose='fill';document.getElementById('send_textarea').value='';}
  },
    async after(){
     phaseErrors.length=0;await this.sync();const api=window.AutoCardUpdaterAPI;
@@ -183,9 +235,11 @@ window.LiyuanDatabasePluginHost={
      if(scheduled.length!==1)throw new Error('原插件拍后任务未能绑定，填表完成状态未确认');
      await scheduled[0];
      const failed=api.getRecentPerformanceSpans().find(s=>!previousSpans.has(s.id)&&s.name==='auto-update-execute'&&s.metrics?.success===false);
-     if(failed)throw new Error('原插件自动分组填表失败，保留待恢复状态');
+      if(failed){const detail=[...new Set(phaseErrors)].slice(-3).join('；');throw new Error('原插件自动分组填表失败，保留待恢复状态'+(detail?'。原因：'+detail:''));}
     }
-    await this.flush();await api.refreshDataAndWorldbook?.();await api.syncWorldbookEntries?.();await this.flush();
+     // sync() repairs existing frames; the joined native pipeline synchronizes new ones.
+     // A second refresh/sync here rebuilds the same derived book again.
+     await this.flush();
     return {success:true,sourceEntryId:data.sourceEntryId,errors:[...phaseErrors]};
    },
  tables:()=>window.AutoCardUpdaterAPI?.exportTableAsJson?.()??{},
@@ -207,8 +261,17 @@ try {
  let initialized=false;
  for(let attempt=0;attempt<100;attempt++){
   if(window.AutoCardUpdaterAPI?.triggerUpdate&&window.AutoCardUpdaterV2API){
-   await eventSource.emit('CHAT_CHANGED',ctx.chatId);
-    if(!managerMode){await new Promise(r=>setTimeout(r,1800));await window.AutoCardUpdaterAPI.refreshDataAndWorldbook?.();}
+    // The pinned CHAT_CHANGED listener schedules its hydration after 1200ms.
+    // Join it instead of sleeping 1800ms and starting a competing rebuild.
+    const scheduled=[],setTimer=window.setTimeout;
+    window.setTimeout=(callback,delay,...args)=>{
+     if(delay!==1200)return setTimer.call(window,callback,delay,...args);
+     let resolve,reject;scheduled.push(new Promise((yes,no)=>{resolve=yes;reject=no;}));
+     return setTimer.call(window,()=>{Promise.resolve().then(()=>callback(...args)).then(resolve,reject);},delay);
+    };
+    try{await eventSource.emit('CHAT_CHANGED',ctx.chatId);}finally{window.setTimeout=setTimer;}
+    if(scheduled.length!==1)throw new Error('原插件会话载入任务未能绑定');
+    await scheduled[0];await window.LiyuanDatabasePluginHost.flush();
    initialized=true;
    break;
   }

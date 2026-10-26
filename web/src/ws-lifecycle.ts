@@ -1,3 +1,4 @@
+import { validPlotChoice, type PlotChoiceInput } from "../../src/plot-options/types.ts";
 import { isGenerationMode, resolveGenerationMode, type GenerationMode } from "./generation-mode.ts";
 
 export const WS_RETRY_INITIAL_MS = 1_500;
@@ -103,7 +104,7 @@ export function shouldQueueFrame(type: string): boolean {
 
 type ReliablePromptBase = { text: string; sessionId: string; messageId: string };
 export type ReliablePrompt =
-	| ({ type: "prompt"; generationMode?: GenerationMode } & ReliablePromptBase)
+	| ({ type: "prompt"; generationMode?: GenerationMode; plotChoice?: PlotChoiceInput } & ReliablePromptBase)
 	| ({ type: "assistant_prompt" } & ReliablePromptBase);
 export type OutboxItem = { frame: ReliablePrompt; createdAt: number; state: "pending" | "rejected"; dispatched?: boolean; reason?: string };
 export type SendResult = { accepted: true; messageId?: string; sessionId?: string; queued?: boolean } | { accepted: false; reason: string; messageId?: string };
@@ -119,7 +120,8 @@ export const shouldRetryUnacknowledged = (type: ReliablePrompt["type"]): boolean
 
 function normalizeReliablePrompt(frame: ReliablePrompt): ReliablePrompt {
 	if (frame.type === "assistant_prompt") return { type: frame.type, text: frame.text, sessionId: frame.sessionId, messageId: frame.messageId };
-	const { generationMode, ...base } = frame;
+	const { generationMode, plotChoice, ...plain } = frame;
+	const base = isCommandPrompt(frame.text) ? plain : { ...plain, ...(plotChoice ? { plotChoice } : {}) };
 	return isCommandPrompt(frame.text) ? base : { ...base, generationMode: resolveGenerationMode(generationMode) };
 }
 
@@ -149,12 +151,13 @@ export class PromptOutbox {
 					typeof f.sessionId !== "string" || !f.sessionId || f.sessionId.length > 256 ||
 					typeof f.messageId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(f.messageId) || ids.has(f.messageId) ||
 					(f.generationMode !== undefined && (f.type !== "prompt" || isCommandPrompt(f.text) || !isGenerationMode(f.generationMode))) ||
+					(f.plotChoice !== undefined && (f.type !== "prompt" || isCommandPrompt(f.text) || !validPlotChoice(f.plotChoice))) ||
 					!Number.isFinite(item.createdAt) || !["pending", "rejected"].includes(item.state) || (item.dispatched !== undefined && typeof item.dispatched !== "boolean")) throw new Error("invalid item");
 				ids.add(f.messageId);
 				const legacyUncertainAssistant = f.type === "assistant_prompt" && item.state === "pending" && item.dispatched === undefined;
 				const dispatchedAssistant = f.type === "assistant_prompt" && item.state === "pending" && item.dispatched === true;
 				const decodedFrame: ReliablePrompt = f.type === "prompt"
-					? { type: f.type, text: f.text, sessionId: f.sessionId, messageId: f.messageId, ...(isGenerationMode(f.generationMode) ? { generationMode: f.generationMode } : {}) }
+					? { type: f.type, text: f.text, sessionId: f.sessionId, messageId: f.messageId, ...(isGenerationMode(f.generationMode) ? { generationMode: f.generationMode } : {}), ...(f.plotChoice ? { plotChoice: f.plotChoice } : {}) }
 					: { type: f.type, text: f.text, sessionId: f.sessionId, messageId: f.messageId };
 				// Legacy prose drafts predate the field; use the documented director default.
 				const restoredFrame = normalizeReliablePrompt(decodedFrame);
@@ -177,9 +180,10 @@ export class PromptOutbox {
 	enqueue(frame: ReliablePrompt, online: boolean): SendResult {
 		if (this.#unreadable) return { accepted: false, reason: this.error! };
 		if (!frame.sessionId || frame.sessionId.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(frame.messageId)) return { accepted: false, reason: "会话目标或消息 ID 无效，输入未发送" };
+		if (frame.type === "prompt" && frame.plotChoice !== undefined && (!validPlotChoice(frame.plotChoice) || isCommandPrompt(frame.text))) return { accepted: false, reason: "剧情方向绑定无效，草稿未发送" };
 		const savedFrame = normalizeReliablePrompt(frame);
 		const sameId = this.#items.find((item) => item.frame.messageId === savedFrame.messageId);
-		if (sameId && (sameId.frame.type !== savedFrame.type || sameId.frame.sessionId !== savedFrame.sessionId || sameId.frame.text !== savedFrame.text || reliablePromptMode(sameId.frame) !== reliablePromptMode(savedFrame))) return { accepted: false, reason: "消息 ID 已绑定其他输入，草稿未发送" };
+		if (sameId && (sameId.frame.type !== savedFrame.type || sameId.frame.sessionId !== savedFrame.sessionId || sameId.frame.text !== savedFrame.text || reliablePromptMode(sameId.frame) !== reliablePromptMode(savedFrame) || JSON.stringify(sameId.frame.type === "prompt" ? sameId.frame.plotChoice : undefined) !== JSON.stringify(savedFrame.type === "prompt" ? savedFrame.plotChoice : undefined))) return { accepted: false, reason: "消息 ID 已绑定其他输入，草稿未发送" };
 		if (sameId?.state === "rejected") return { accepted: false, reason: sameId.reason || "该草稿已被拒绝，请确认目标后另行提交", messageId: sameId.frame.messageId };
 		const command = isCommandPrompt(savedFrame.text);
 		if (command && !online) {

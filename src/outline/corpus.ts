@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, w
 import { basename, extname, join } from "node:path";
 
 import { firstZipEntry } from "../ziplite.ts";
+import { classifyModelFailure, explicitProviderFailure } from "../stage/model-failure.ts";
 import type { OutlineResearchExtraction } from "./research.ts";
 import type { OutlineEngineDeps } from "./engine.ts";
 import { fetchKakuyomuWork, kakuyomuDocumentId, normalizeKakuyomuWorkUrl, type KakuyomuRequest } from "./kakuyomu.ts";
@@ -202,6 +203,13 @@ const safeModelError = (value: unknown, max = 300): string => {
 		.trim()
 		.slice(0, max) || "未知模型错误";
 };
+
+function permanentModelFailure(error: string): boolean {
+	// Bare refusal codes are authoritative only on the error channel, not in prose.
+	const failure = classifyModelFailure(error.trim() === "content_filter" ? "Provider finish_reason: content_filter" : error);
+	return ["auth", "model", "quota", "content-filter"].includes(failure.kind)
+		|| /缺少 workflow: novel-digest 的 Skill|(?:尚未配置|未配置).*模型|岗位.*不在当前启用连接|(?:missing|not configured|no available).*(?:model|config)|model.*not configured|no model configured/i.test(error);
+}
 
 const parseObject = (text: string): Record<string, unknown> | null => {
 	for (const candidate of [text.trim(), text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1], text.match(/\{[\s\S]*\}/)?.[0]]) {
@@ -768,10 +776,10 @@ export class CorpusEngine {
 			const summaryOf = (raw: string): string => {
 				const parsed = parseObject(raw);
 				const summary = parsed && cleanText(parsed.summary, 1500);
-				if (summary) return summary;
+				if (summary && !isFailedChunkSummary(summary)) return summary;
 				const match = raw.match(/"summary"\s*:\s*"((?:\\.|[^"\\])*)/s)?.[1];
-				if (match) { try { return JSON.parse(`"${match}"`).trim().slice(0, 1500); } catch {} }
-				return Array.isArray(parsed?.chapters) ? "（本块无摘要）" : "";
+				if (match) { try { const value = JSON.parse(`"${match}"`).trim().slice(0, 1500); return isFailedChunkSummary(value) ? "" : value; } catch {} }
+				return "";
 			};
 			const request = JSON.stringify({ task: "digest-map", doc_title: doc.title, chunk: { index: chunk.index, chapters: chunk.chapters, text: chunk.text.slice(0, CHUNK_CHARS) } });
 			let result = await this.#call(docId, skill, request, 4096);
@@ -811,7 +819,7 @@ export class CorpusEngine {
 		let pipeline = digest.pipeline;
 		if (pipeline && pipeline.version !== 1) throw new Error("不支持的 Corpus pipeline checkpoint 版本");
 		if (!pipeline || pipeline.inputHash !== inputHash) {
-			const legacyFinal = !pipeline && !!digest.synopsis;
+			const legacyFinal = !pipeline && !!cleanText(digest.synopsis);
 			if (pipeline) { digest.arcs = []; digest.synopsis = ""; digest.structure = { plotSpine: "", characterArcs: "", hooksAndPacing: "" }; }
 			pipeline = { version: 1, inputHash, ...(legacyFinal ? { finalComplete: true } : {}), extractions: {} };
 			digest.pipeline = pipeline;
@@ -819,17 +827,26 @@ export class CorpusEngine {
 		}
 
 		const phases = pipeline;
+		// Old final checkpoints could mark an empty JSON object as complete.
+		// Preserve independent extraction results, including valid empty arrays.
+		if (phases.finalComplete && !cleanText(digest.synopsis)) {
+			delete phases.finalComplete;
+			delete phases.materialized;
+			delete phases.onReadyComplete;
+			this.#checkpoint(doc, digest);
+		}
 		if (!this.#advance(doc, "reducing")) return;
 		for (let start = 0; start < chunks.length; start += ARC_CHUNK_BATCH) {
 			if (!this.#canContinue(doc)) return;
 			const end = Math.min(start + ARC_CHUNK_BATCH, chunks.length) - 1;
-			if (digest.arcs.some(arc => arc.chunkRange[0] === start && arc.chunkRange[1] === end && arc.summary)) continue;
+			if (digest.arcs.some(arc => arc.chunkRange[0] === start && arc.chunkRange[1] === end && cleanText(arc.summary))) continue;
 			const batch = digest.chunks.slice(start, end + 1).map(chunk => chunk.summary);
 			const title = batch.length < ARC_CHUNK_BATCH ? `收尾段（块 ${start}–${end}）` : `第 ${start / ARC_CHUNK_BATCH + 1} 段（块 ${start}–${end}）`;
 			const raw = await this.#call(docId, skill, JSON.stringify({ task: "digest-reduce-arc", doc_title: doc.title, arc_title: title, chunk_summaries: batch }), 4096);
 			if (!this.#isLive(doc)) return;
 			const summary = typeof raw === "string" ? textField(raw, "summary", 2000) : "";
 			if (summary) {
+				digest.arcs = digest.arcs.filter(arc => arc.chunkRange[0] !== start || arc.chunkRange[1] !== end);
 				digest.arcs.push({ title, chunkRange: [start, end], summary });
 				digest.arcs.sort((a, b) => a.chunkRange[0] - b.chunkRange[0]);
 				this.#checkpoint(doc, digest);
@@ -844,13 +861,14 @@ export class CorpusEngine {
 			let raw = await this.#call(docId, skill, user, 8192);
 			if (!this.#isLive(doc)) return;
 			let parsed = typeof raw === "string" ? parseObject(raw) : null;
-			if (!parsed && typeof raw === "string" && this.#canContinue(doc)) {
+			let synopsis = typeof raw === "string" ? textField(raw, "synopsis", 3000) : "";
+			if (!synopsis && typeof raw === "string" && this.#canContinue(doc)) {
 				raw = await this.#call(docId, skill, user, 8192);
 				if (!this.#isLive(doc)) return;
 				parsed = typeof raw === "string" ? parseObject(raw) : null;
+				synopsis = typeof raw === "string" ? textField(raw, "synopsis", 3000) : "";
 			}
-			const synopsis = typeof raw === "string" ? textField(raw, "synopsis", 3000) : "";
-			if (parsed || synopsis) {
+			if (synopsis) {
 				const structure = parsed?.structure && typeof parsed.structure === "object" && !Array.isArray(parsed.structure) ? parsed.structure as Record<string, unknown> : {};
 				digest.synopsis = synopsis;
 				digest.structure = { plotSpine: cleanText(structure.plotSpine, 2000), characterArcs: cleanText(structure.characterArcs, 2000), hooksAndPacing: cleanText(structure.hooksAndPacing, 2000) };
@@ -1013,7 +1031,7 @@ export class CorpusEngine {
 			const taskSignal = this.#signal(docId);
 			const signal = AbortSignal.any([taskSignal, AbortSignal.timeout(CorpusEngine.MODEL_CALL_TIMEOUT_MS)]);
 			console.log(`[corpus] 模型调用开始 doc=${docId} attempt=${attempt + 1}/${CorpusEngine.MODEL_MAX_RETRIES + 1}`);
-			let result: string | { error: string }, delay = 600 * Math.min(2 ** attempt, 8);
+			let result: string | { error: string };
 			try {
 				result = await withAbort(this.#deps.runSideModel("novelDigest", focusedSkill, user, { maxTokens, signal, forceNonStreaming: true }), signal);
 				console.log(`[corpus] 模型调用结束 doc=${docId} attempt=${attempt + 1} result=${typeof result === "string" ? "text" : "error"}`);
@@ -1021,13 +1039,21 @@ export class CorpusEngine {
 			} catch (error) {
 				const detail = safeModelError(error);
 				console.error(`[corpus] 模型调用异常 doc=${docId} attempt=${attempt + 1}: ${detail}`);
-				result = { error: `模型调用异常（${attempt + 1} 次尝试）：${detail}` }; delay = 500;
+				result = { error: safeModelError(error instanceof Error ? error.message : error) };
 			}
 			if (!this.#isLive(doc)) return { error: "消化任务已取消" };
+			if (typeof result === "string") {
+				const failure = explicitProviderFailure(result);
+				if (failure) result = { error: failure };
+			}
+			if (typeof result !== "string" && permanentModelFailure(result.error)) {
+				this.#fail(doc, safeModelError(result.error), false);
+				return result;
+			}
 			if (typeof result === "string" || !this.#canContinue(doc)) return result;
 			if (this.#usage(doc).attempts >= this.#maxCallsPerDoc) return { error: this.#budgetExceeded(doc) };
 			if (attempt === CorpusEngine.MODEL_MAX_RETRIES) return result;
-			await retryDelay(delay, AbortSignal.any([taskSignal, this.#jobs.get(docId)!.pauseController.signal]));
+			await retryDelay(5000, AbortSignal.any([taskSignal, this.#jobs.get(docId)!.pauseController.signal]));
 			if (!this.#canContinue(doc)) return { error: doc.error ?? "消化任务已暂停或取消" };
 		}
 		return { error: "调用异常已耗尽重试" };
@@ -1049,6 +1075,7 @@ export class CorpusEngine {
 
 	#fail(doc: CorpusDocument, message: string, automaticRetry = true): void {
 		if (!this.#canContinue(doc)) return;
+		if (permanentModelFailure(message)) automaticRetry = false;
 		if (automaticRetry && this.#usage(doc).attempts >= this.#maxCallsPerDoc) { this.#budgetExceeded(doc); return; }
 		const retries = doc._retries ?? 0;
 		if (automaticRetry && retries < CorpusEngine.DOC_MAX_RETRIES) {
@@ -1139,6 +1166,7 @@ function evidenceLocator(ids: string[], index: Map<string, { locator: string }>)
 	return [...new Set(ids.flatMap((id) => index.get(id)?.locator ?? []))].join("；").slice(0, 240);
 }
 
-function isFailedChunkSummary(summary: string): boolean {
-	return summary.startsWith("(本块摘要生成失败") || summary.startsWith("（本块摘要生成失败");
+function isFailedChunkSummary(summary: unknown): boolean {
+	const value = typeof summary === "string" ? summary.trim() : "";
+	return !value || value === "(本块无摘要)" || value === "（本块无摘要）" || value.startsWith("(本块摘要生成失败") || value.startsWith("（本块摘要生成失败");
 }

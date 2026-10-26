@@ -1,7 +1,7 @@
 /** 双模式的单一正文所有者。专家调用由主 Agent 发起，但固定阶段由收据门禁保证。 */
 import { RESEARCH_READS } from "../research/session.ts";
 import { AUTHOR_RECOVERY_CONTRACT, isAuthorTransportTimeout, parseAuthorRecoveryReceipt } from "./author-recovery.ts";
-import { isNativeToolsUnsupported } from "./model-failure.ts";
+import { explicitProviderFailure, isNativeToolsUnsupported } from "./model-failure.ts";
 import { applyDraftEdits } from "../draft.ts";
 import type { AssistantMsgLike, StageStreamEvent } from "./engine.ts";
 import type { StageTool } from "./tools.ts";
@@ -45,12 +45,12 @@ const tool = (name: string, description: string, properties: Record<string, unkn
 const FLOW_TOOLS: StageTool[] = [
 	tool("get_draft", "读取当前尚未定稿的稿件。"),
 	tool("consult_experts", "执行当前固定专家阶段。tasks 包含本阶段所有岗位各一次，返回报告，不修改正文。", { tasks: { type: "array", items: { type: "object", properties: { role: { type: "string" }, task: { type: "string" } }, required: ["role", "task"] } } }, ["tasks"]),
-	tool("begin_narrative", "开始正文通道；下一次普通文本一次交付完整正文及原始启用材料要求的适用附属格式，作为草稿。"),
-	tool("begin_revision", "开始修订通道；下一次普通文本一次交付完整正文及原始启用材料要求的适用附属格式，替换尚未定稿的完整草稿。"),
+	tool("begin_narrative", "开始正文通道；下一次普通文本按原始启用材料交付完整正文，作为草稿；原已返回附属内容保留，缺项由后台独立补充。"),
+	tool("begin_revision", "开始修订通道；下一次普通文本交付完整替换稿，保留适用的原附属内容；缺项由后台独立补充。"),
 	tool("apply_draft_edits", "定点修改尚未定稿的草稿。每项 old 必须唯一匹配；任何一项失败整批不套用。", { edits: { type: "array", items: { type: "object", properties: { old: { type: "string" }, new: { type: "string" } }, required: ["old", "new"] } } }, ["edits"]),
 	tool("finalize", "将当前草稿定稿。需固定阶段收据。专家审阅失败时只有明确 acceptDegraded=true 才可降级交付；不要求修订。", { acceptDegraded: { type: "boolean" } }),
 ];
-const AUTHOR_DELIVERY_CONTRACT = "【作者交付合同】普通文本是输出载体，不是仅交纯正文。进入正文或修订通道时，按当前启用的原始角色卡、预设和世界书，本轮一次交付完整正文及适用附属格式；标签、顺序和位置由原材料决定，不另设格式名单，不等待拍后检查或补交。本合同不改变准备阶段的报告、任务简报、定稿决策或输出恢复回执协议。";
+const AUTHOR_DELIVERY_CONTRACT = "【作者交付合同】按当前启用的原始角色卡、预设和世界书交付完整正文，标签、顺序和位置由原材料决定。正文及原已返回内容原样先交付；缺失附属格式由独立后台补充、完成即发布，不等生态，不改原稿或进入事实/MVU输入，不作正文完成门槛。本合同不改变准备、定稿决策或输出恢复回执协议。";
 const now = (text: string): Message => ({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
 const textOf = (msg: AssistantMsgLike | null): string => (msg?.content ?? []).filter(x => x.type === "text").map(x => x.text ?? "").join("");
 type AgentPhase = "evidence" | "ideas" | "ready" | "writing" | "review" | "decision" | "revision" | "finished";
@@ -64,7 +64,7 @@ export function narrativeNeedsCompletion(text:string,stopReason?:string):boolean
 }
 
 /** Conservative markup boundary, not a card schema or required-format check. */
-export function authorDraftHasUnclosedContainer(text: string): boolean {
+export function authorDraftHasUnclosedContainer(text: string, narrativeOnly = false): boolean {
  const ignoredHtml = /^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr|html|head|body|p|li|dt|dd|rt|rp|optgroup|option|colgroup|thead|tbody|tfoot|tr|td|th)$/i;
  // Mask examples first so neither their openings nor their closings affect markup.
  const masked = text.replace(/^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^[ \t]{0,3}\1[^\n]*(?:\n|$)|$(?![\s\S]))/gm, "")
@@ -88,7 +88,9 @@ export function authorDraftHasUnclosedContainer(text: string): boolean {
     if (parent >= 0) stack.length = parent;
    }
   }
-  return stack.length > 0;
+  // The same body containers are unwrapped by extractPureTextNarrative. Other
+  // containers belong to delivery formatting, not story completion.
+  return narrativeOnly ? stack.some(name => name === "content" || name === "main_output") : stack.length > 0;
 }
 
 export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult> {
@@ -115,7 +117,6 @@ export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult
             } catch { /* errors stay as original bounded text */ }
         }
     };
- let transportRetries = 0;
  const failedRecoveryReplies: Message[] = [];
 	let failedReview = false, completionAttempts = 0, completionPending = false, completionBuffer = "";
 	const mainThoughts: string[] = [];
@@ -126,7 +127,7 @@ export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult
 	const readNames = new Set(o.readTools.map(x => x.name));
 	const normalizeDraft = (text:string) => o.normalizeNarrative ? o.normalizeNarrative(text) : text;
  const completionReason = (text: string, stopReason?: string) => stopReason === "length" ? "provider-length" as const
-  : authorDraftHasUnclosedContainer(text) ? "unclosed-container" as const
+  : authorDraftHasUnclosedContainer(text, !!o.normalizeNarrative) ? "unclosed-container" as const
   : narrativeNeedsCompletion(normalizeDraft(text)) ? "unclosed-dialogue" as const : undefined;
 	const receipts = (stage: GenerationWorkflow["stages"][number]["stage"], status: GenerationWorkflow["stages"][number]["status"], calls: number) => workflow.stages.push({ stage, status, calls });
 	const exactEdits = (edits: unknown): boolean => Array.isArray(edits) && edits.length > 0 && edits.every(e => { if (!e || typeof e.old !== "string" || !e.old || typeof e.new !== "string") return false; const at = draft.indexOf(e.old); return at >= 0 && draft.indexOf(e.old, at + 1) < 0; });
@@ -187,12 +188,25 @@ export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult
 			}
 			} finally { void Promise.resolve(iterator.return?.()).catch(() => undefined); }
 			if (!message && !cancelled(o) && !failure) failure = "主演流未返回最终消息";
-			if (!text && message && !cancelled(o)) { text = textOf(message); if (narrative && text) o.onDelta?.(text, !priorDraft); }
 			if (!thought && message && !cancelled(o)) { thought = message.content.filter(x => x.type === "thinking").map(x => x.thinking ?? "").join(""); if (thought) o.onThinking?.(thought); }
 			if (message?.stopReason === "error") failure = message.errorMessage || "主演请求失败";
 			if (message?.stopReason === "aborted") failure = message.errorMessage || "主演请求中断";
+			if (message && !cancelled(o)) {
+				const terminalText = textOf(message);
+				// A tool-only terminal has no text authority; failed streams keep received partials.
+				if ((!failure && message.content.some(item => item.type === "text")) || !text) {
+					if (narrative && text !== terminalText) {
+						if (text) o.onResync?.(priorDraft + terminalText);
+						else if (terminalText) o.onDelta?.(terminalText, !priorDraft);
+					}
+					text = terminalText;
+				}
+			}
 		} catch (err) { failure = err instanceof Error ? err.message : String(err); }
 		if (thought) mainThoughts.push(thought);
+		// Some proxies return permanent refusals as successful text terminals.
+		const providerFailure = explicitProviderFailure(textOf(message)) ?? explicitProviderFailure(text);
+		if (providerFailure) { failure = providerFailure; text = ""; if (narrative) o.onResync?.(priorDraft); }
 		if (textualProtocol(text) || (message?.stopReason === "toolUse" && !message.content.some(item => item.type === "toolCall"))) { failure = "API返回文本化工具协议或空工具调用，未作为正文接收"; text = ""; if (narrative) o.onResync?.(priorDraft); }
 		if (narrative && (cancelled(o) || failure) && text.trim()) draft = priorDraft + text;
   const usage = message?.usage && typeof message.usage === "object" ? message.usage as Record<string, unknown> : undefined;
@@ -253,20 +267,20 @@ export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult
 
  async function requestWriting(tools: StageTool[] | undefined): Promise<Awaited<ReturnType<typeof request>> & { recovered?: boolean }> {
   let result = await request(tools, true);
-  if (!result.error || cancelled(o) || result.message?.stopReason === "aborted" || !isAuthorTransportTimeout(result.error) || transportRetries >= 1) return result;
-  // A partial draft must never be regenerated by replaying the writing request.
-  if (draft) {
-   if (!o.outputRecoveryPrompt) return result;
-   transportRetries++;
-   final = result.message ?? final;
-   beginCompletion(undefined, true);
-   const recovered = await recoverDraft();
-   return { message: final, text: "", ...(recovered ? { recovered: true } : { error: error ?? result.error }) };
+  for (let retries = 0; ; retries++) {
+   if (!result.error || cancelled(o) || result.message?.stopReason === "aborted" || explicitProviderFailure(result.error) || !isAuthorTransportTimeout(result.error)) return result;
+   // A partial draft must never be regenerated by replaying the writing request.
+   if (draft) {
+    if (!o.outputRecoveryPrompt) return result;
+    final = result.message ?? final;
+    beginCompletion(undefined, true);
+    const recovered = await recoverDraft();
+    return { message: final, text: "", ...(recovered ? { recovered: true } : { error: error ?? result.error }) };
+   }
+   if (retries >= 3) return result;
+   o.onActivity?.(`作者暂态传输超时且未收到正文：同一作者有界重试（${retries + 1}/3）`);
+   result = await request(tools, true);
   }
-  transportRetries++;
-  o.onActivity?.("作者暂态传输超时且未收到正文：同一作者有界重试一次");
-  result = await request(tools, true);
-  return result;
  }
 
 	async function batch(p: DirectorPhase, tasks: DirectorTask[]): Promise<string> {
@@ -314,10 +328,10 @@ export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult
 			}
 		}
 		phase = "writing";
-		convo.push(now("【正文通道】资料已就绪，本轮一次交付完整正文及原始启用材料要求的适用附属格式；标签、顺序和位置遵循原材料，不等待拍后补交。"));
+		convo.push(now("【正文通道】资料已就绪，按原始启用材料交付完整正文；原已返回内容保留，缺失附属格式由后台独立补充，不作为正文门槛。"));
 		const initial = await requestWriting(undefined); final = initial.message;
 		if (initial.error || cancelled(o)) { error = initial.error; return; }
-		if (!initial.recovered) draft = initial.text.trim(); if (!draft) { error = "主演未返回正文"; return; }
+		if (!initial.recovered) draft = initial.text; if (!draft.trim()) { error = "主演未返回正文"; return; }
    if (completionReason(draft, initial.message?.stopReason)) {
     if (!o.outputRecoveryPrompt) { error = "原稿仍被供应商截断或容器/对白未闭合；保留未完成原稿"; return; }
    if (initial.message) convo.push(initial.message);
@@ -379,7 +393,12 @@ export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult
 			const calls = (result.message?.content ?? []).filter(x => x.type === "toolCall");
 			if (calls.length === 0) {
 				if (writing && result.text.trim()) {
-					const revision: boolean = phase === "revision"; const rawDraft = revision ? revisionDraft + result.text.trim() : completionPending ? draft + completionBuffer + result.text : draft + result.text.trim(); draft = rawDraft; revisionDraft = ""; completionPending=false;completionBuffer="";
+					const revision: boolean = phase === "revision";
+					// A successful full replacement may repeat the entire tool-adjacent draft.
+					// Only exact equality establishes this case; different text remains a continuation.
+					const repeatedRevision = revision && result.message?.stopReason === "stop" && result.text === revisionDraft;
+					const rawDraft = revision ? repeatedRevision ? result.text : revisionDraft + result.text : completionPending ? draft + completionBuffer + result.text : draft + result.text; draft = rawDraft; revisionDraft = ""; completionPending=false;completionBuffer="";
+					if (revision) o.onResync?.(draft);
 					if(completionReason(draft,result.message?.stopReason)) {
       if (!o.outputRecoveryPrompt) { error = "原稿未完成且没有输出恢复协议；保留原稿，不接受裸全文接续"; break; }
 						if(completionAttempts++>=2){error="原稿仍以未闭合容器/对白或供应商截断结束；已保留未完成稿，不冒称定稿";break;}
@@ -388,7 +407,6 @@ export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult
 						phase="writing";completionBuffer="";continue;
 					}
 					receipts(revision ? "revision" : "draft", "success", 1);
-					if (revision) o.onResync?.(draft);
 					if (o.mode === "direct") { phase = "finished"; receipts("finalize", workflow.stages.some(x => x.status === "degraded") ? "degraded" : "success", 0); }
 					else { phase = revision ? "decision" : "review"; convo.push(result.message!); convo.push(now(protocol())); }
 				} else { if (result.message) convo.push(result.message); convo.push(now(protocol() || "当前正文通道未收到内容。")); }
@@ -427,8 +445,8 @@ export async function runAgentTurn(o: AgentTurnOptions): Promise<AgentTurnResult
 				else if (name === "consult_experts" && o.mode === "director" && isPhase("evidence", "ideas", "review")) {
 					const tasks = Array.isArray(args.tasks) ? args.tasks.map(raw => ({ role: String((raw as Record<string, unknown>)?.role ?? ""), task: String((raw as Record<string, unknown>)?.task ?? "").slice(0, 2000) })) as DirectorTask[] : [];
 					text = await batch(phase as DirectorPhase, tasks);
-				} else if (name === "begin_narrative" && isPhase("ready")) { phase = "writing"; text = "正文通道已开启。下一轮普通文本一次交付完整正文及原始启用材料要求的适用附属格式，作为草稿；标签、顺序和位置遵循原材料，不等待拍后补交。"; }
-				else if (name === "begin_revision" && phase === "decision") { revisionDraft = ""; phase = "revision"; text = "修订通道已开启。下一轮普通文本一次交付完整正文及原始启用材料要求的适用附属格式，替换尚未定稿的完整草稿；标签、顺序和位置遵循原材料，不等待拍后补交。"; }
+				} else if (name === "begin_narrative" && isPhase("ready")) { phase = "writing"; text = "正文通道已开启。下一轮普通文本按原始启用材料交付完整正文，作为草稿；原已返回内容保留，缺失附属格式由后台独立补充。"; }
+				else if (name === "begin_revision" && phase === "decision") { revisionDraft = ""; phase = "revision"; text = "修订通道已开启。下一轮普通文本交付完整替换稿，保留适用的原附属内容；缺失附属格式由后台独立补充。"; }
 				else if (name === "apply_draft_edits" && phase === "decision") {
 					transitionAccepted = true; // Always read the mutation receipt before deciding to finalize.
 					const edited = exactEdits(args.edits) ? applyDraftEdits(draft, args.edits as never) : { ok: false, text: undefined };

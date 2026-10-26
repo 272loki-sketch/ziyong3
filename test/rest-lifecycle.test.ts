@@ -37,6 +37,20 @@ function seed(cwd: string, storeId = "external", targetScope = scope): void {
 	}]);
 }
 
+test('REST supplementary regeneration requires exact bindings and never enters general settlement',()=>fixture(async(_cwd,host)=>{
+ const calls:string[][]=[];
+ host.retrySettlement=async()=>{throw Error('general recovery forbidden');};
+ host.regenerateSupplementary=async(...binding)=>{calls.push(binding);return {aborted:false};};
+ const body={expectedSessionId:'s',expectedSourceEntryId:'e',expectedReceiptHash:'hash'};
+ for(const payload of [{},{...body,expectedReceiptHash:''},{...body,story:'forbidden'}])assert.equal((await request(host,'POST','/api/turn/regenerate-supplementary',payload)).status,400);
+ host.isStreaming=()=>true;assert.equal((await request(host,'POST','/api/turn/regenerate-supplementary',body)).status,409);
+ assert.equal(calls.length,0);host.isStreaming=()=>false;
+ assert.equal((await request(host,'POST','/api/turn/regenerate-supplementary',body)).status,200);
+ assert.deepEqual(calls,[['s','e','hash']]);
+ host.regenerateSupplementary=async()=>({aborted:false,error:'stale receipt'});
+ assert.equal((await request(host,'POST','/api/turn/regenerate-supplementary',body)).status,409);
+}));
+
 test("REST Veridis-only retry requires exact bindings, rejects busy, and never calls general recovery", () => fixture(async (_cwd, host) => {
 	const calls: string[][] = [];
 	host.retrySettlement = async () => { throw Error("general recovery must not run"); };
@@ -146,4 +160,28 @@ test("REST Skill: invalid acknowledgement uses the existing error response and c
 		assert.equal(result.status, 400); assert.equal(typeof result.body.error, "string"); assert.equal(result.body.ok, undefined);
 	}
 	assert.equal((await getSkill(host)).source, "builtin");
+}));
+
+test("REST ledger confirmation requires explicit review and exact scope, rejects busy/stale without a model", () => fixture(async (_cwd, host) => {
+ const calls:any[]=[];host.retrySettlement=async()=>{throw Error("No model recovery allowed")};host.confirmLedger=(expected,patch)=>{calls.push({expected,patch});return{applied:[],warnings:[]}};
+ const expected={sessionId:"fixture",card:"card.json",sourceEntryId:"source",revision:"revision"};
+ for(const body of [{},{confirm:false,expected},{confirm:true},{confirm:true,expected:{...expected,sourceEntryId:""}},{confirm:true,expected,patch:[]}])assert.equal((await request(host,"POST","/api/state/confirm-ledger",body)).status,400);
+ assert.equal(calls.length,0);host.isStreaming=()=>true;assert.equal((await request(host,"POST","/api/state/confirm-ledger",{confirm:true,expected})).status,409);assert.equal(calls.length,0);host.isStreaming=()=>false;
+ assert.equal((await request(host,"POST","/api/state/confirm-ledger",{confirm:true,expected})).status,200);assert.deepEqual(calls,[{expected,patch:{}}]);
+ host.confirmLedger=()=>{throw Object.assign(new Error("正文版本已变化"),{statusCode:409})};assert.equal((await request(host,"POST","/api/state/confirm-ledger",{confirm:true,expected})).status,409);
+}));
+
+test("REST ledger-only retry is explicit, source-bound, busy guarded and never invokes general recovery",()=>fixture(async(_cwd,host)=>{
+ const calls:any[]=[];host.retrySettlement=async()=>{throw Error("General recovery forbidden")};host.confirmLedger=()=>{throw Error("Human confirmation forbidden")};host.retryLedger=async expected=>{calls.push(expected);return{aborted:false,ledgerUpdated:true,noChanges:false}};
+ const expected={sessionId:"fixture",card:"fixture.json",sourceEntryId:"source",revision:"revision"};for(const body of [{},{expected},{confirm:false,expected},{confirm:true},{confirm:true,expected:{...expected,revision:""}},{confirm:true,expected,patch:{location:"forbidden"}}])assert.equal((await request(host,"POST","/api/state/retry-ledger",body)).status,400);assert.equal(calls.length,0);
+ host.isStreaming=()=>true;assert.equal((await request(host,"POST","/api/state/retry-ledger",{confirm:true,expected})).status,409);host.isStreaming=()=>false;assert.equal(calls.length,0);
+ assert.deepEqual(await request(host,"POST","/api/state/retry-ledger",{confirm:true,expected}),{status:200,body:{aborted:false,ledgerUpdated:true,noChanges:false}});assert.deepEqual(calls,[expected]);host.retryLedger=async()=>({aborted:false,error:"explicit failure"});assert.equal((await request(host,"POST","/api/state/retry-ledger",{confirm:true,expected})).status,409);
+}));
+
+test('REST saved NPC admission requires explicit bound hashes, rejects busy and never calls general recovery',()=>fixture(async(_cwd,host)=>{
+ const calls:unknown[]=[];host.retrySettlement=async()=>{assert.fail('general recovery must not run')};host.retryNpcAdmission=async(session,source,hashes)=>{calls.push({session,source,hashes});return{aborted:false}};
+ const body={expectedSessionId:'synthetic-session',expectedSourceEntryId:'story',candidateHashes:['a'.repeat(64)]};
+ for(const invalid of [{},{...body,text:'untrusted'},{...body,candidateHashes:[]},{...body,candidateHashes:['bad']},{...body,candidateHashes:[...body.candidateHashes,...body.candidateHashes]}])assert.equal((await request(host,'POST','/api/turn/retry-npc-admission',invalid)).status,400);
+ assert.deepEqual(calls,[]);host.isStreaming=()=>true;assert.equal((await request(host,'POST','/api/turn/retry-npc-admission',body)).status,409);assert.deepEqual(calls,[]);
+ host.isStreaming=()=>false;assert.deepEqual(await request(host,'POST','/api/turn/retry-npc-admission',body),{status:200,body:{aborted:false}});assert.deepEqual(calls,[{session:body.expectedSessionId,source:body.expectedSourceEntryId,hashes:body.candidateHashes}]);
 }));

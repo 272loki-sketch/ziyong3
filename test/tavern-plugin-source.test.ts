@@ -298,3 +298,16 @@ test("same-commit legacy helper cache lacking original iframe logger is safely r
 	assert.deepEqual(readFileSync(source.resolveAsset("helper", "src/iframe/node_modules/log.js")!), readFileSync(join(repo, "src/iframe/node_modules/log.js")));
 	assert.equal(readdirSync(join(source.root, "versions/helper")).length, 2);
 }));
+
+// Serving verified bytes is distinct from caching verification or reopening a verified path.
+test("readAsset returns the verified original buffer once and detects a later tampered file", () => fixture(async ({ source }) => {
+	await source.install("helper");
+	const first = source.readAsset("helper", "dist/index.js");
+	assert.ok(first);
+	const original = Buffer.from(first.bytes);
+	writeFileSync(first.path, "export const fixtureVersion = 'tampered';\n");
+	assert.deepEqual(first.bytes, original, "a response uses the already-verified bytes, never the modified path");
+	assert.equal(source.readAsset("helper", "dist/index.js"), null);
+	assert.equal(source.verify("helper").ok, false);
+	assert.equal(source.readAsset("helper", "../state.json"), null);
+}));

@@ -143,7 +143,7 @@ test("busy manual HTTP update stages a verified candidate and does not close/cha
 	}
 }));
 
-test("busy internal generate requires a live turn signal, enforces per-source eight-call budget, and stays candidate-only", async () => withFixture(async ({ cwd, repo }) => {
+test("busy internal generate requires a live turn signal, records cumulative source requests without an eight-call ceiling, and stays candidate-only", async () => withFixture(async ({ cwd, repo }) => {
 	const context = syntheticTavernPluginContext();
 	let calls = 0;
 	const receivedSignals: AbortSignal[] = [];
@@ -193,15 +193,15 @@ test("busy internal generate requires a live turn signal, enforces per-source ei
 		}
 		assert.equal(calls, 8);
 		const ninth = await post(base, "/api/tavern-plugins/generate", payload, internalHeaders());
-		assert.notEqual(ninth.status, 200);
-		assert.equal(calls, 8, "the ninth same-source request must be rejected before model invocation");
+		assert.equal(ninth.status, 200);
+		assert.equal(calls, 9, "the ninth same-source request remains usable and accounted for");
 
 		context.sourceEntryId = "synthetic-next-source";
 		context.visibleEntryIds.push(context.sourceEntryId);
 		context.chat.push({ mes: "synthetic next source", name: "合成用户", is_user: true, is_system: false, __liyuanEntryId: context.sourceEntryId });
 		const nextSource = await post(base, "/api/tavern-plugins/generate", payload, internalHeaders());
 		assert.equal(nextSource.status, 200, "a distinct source entry gets its own budget");
-		assert.equal(calls, 9, "the eight-call cap is per source entry, not a global plugin lockout");
+		assert.equal(calls, 10, "the next source remains independent of previous request counts");
 		turn.abort();
 		assert.equal(receivedSignals.at(-1)?.aborted, true, "the internal model signal is joined to the turn cancellation signal");
 	} finally {
@@ -211,7 +211,7 @@ test("busy internal generate requires a live turn signal, enforces per-source ei
 }));
 
 test("send adapter preserves mixed blocks and original metadata when a template reorders/inserts messages", async () => {
-	const source = readFileSync(join(process.cwd(), "web/public/tavern-compat/host.js"), "utf8");
+	const source = readFileSync(join(process.cwd(), "web/public/tavern-compat/host-worldbooks.js"), "utf8");
 	const start = source.indexOf("async function generation(packet){");
 	const end = source.indexOf("\nasync function ", start + 1);
 	assert.ok(start >= 0 && end > start, "host.js generation adapter source must remain identifiable");

@@ -133,3 +133,12 @@ test("场记：宿主元数据感知守卫允许纯设置推进，但拒绝真�
 	assert.equal((await runScribeTurn(deps, baseInput)).kind, "stale");
 	assert.equal(deps.entries.length, 1);
 });
+
+test("场记：供应商安全拒绝不当成JSON、不落账、不复活错误对象后的补丁", async () => {
+ const refusal = "[ProxySystem Error] Request blocked due to safety settings. Finish Reason: PROHIBITED_CONTENT";
+ for (const reply of [refusal, refusal+'\n{"patch":{"location":"不应采用"}}']) {
+  const deps=makeDeps(reply),outcome=await runScribeTurn(deps,baseInput);
+  assert.equal(outcome.kind,"failed");if(outcome.kind==="failed"){assert.match(outcome.error,/安全策略拒绝/);assert.doesNotMatch(outcome.error,/不可解析/);}
+  assert.equal(deps.prompts.length,1);assert.equal(deps.entries.length,0);
+ }
+});

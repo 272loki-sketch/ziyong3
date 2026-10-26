@@ -9,36 +9,65 @@ import { TAVERN_CDN_ASSETS } from "./tavern-plugin-cdn.ts";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 // @ts-ignore Shared browser projection has no TypeScript declaration.
-import { mvuParsingProjection } from "../web/public/tavern-compat/mvu-adapter.js";
+import { mvuParsingProjection, mvuParseSource } from "../web/public/tavern-compat/mvu-adapter.js";
 import { TavernPluginHttp, type TavernPluginContext } from "./tavern-plugin-http.ts";
 import { TavernPluginSources, type TavernPluginCandidate } from "./tavern-plugin-source.ts";
 export interface TavernPreparedPrompt {systemPrompt:string;messages:unknown[];worldbookEntries?:Array<{source?:string;uid:number;entryKey?:string;comment:string;content:string;enabled:boolean}>;card?:string;retainedWorldbookIndices?:number[]}
+function untilAbort<T>(work:Promise<T>,signal?:AbortSignal):Promise<T>{
+ if(!signal)return work;
+ return new Promise<T>((resolve,reject)=>{
+  const onAbort=()=>{work.catch(()=>{});reject(new Error('插件任务已取消'));};
+  if(signal.aborted){onAbort();return;}
+  signal.addEventListener('abort',onAbort,{once:true});
+  work.then(value=>{signal.removeEventListener('abort',onAbort);resolve(value);},error=>{signal.removeEventListener('abort',onAbort);reject(error);});
+ });
+}
 export class TavernPluginRuntime {
- private browser:Browser|null=null;private page:Page|null=null;private key="";private queue:Promise<unknown>=Promise.resolve();private active=0;
+ private browser:Browser|null=null;private page:Page|null=null;private key="";private browserKey="";private queue:Promise<unknown>=Promise.resolve();private active=0;
+ // Bumped by close(): an ensure() that started earlier must not install its browser/page afterwards.
+ private epoch=0;
  readonly http:TavernPluginHttp;readonly origin:()=>string;
  constructor(http:TavernPluginHttp,origin:()=>string){this.http=http;this.origin=origin;}
  enabled(){this.http.sources.config();const plugins=this.http.sources.status().plugins;const invalid=plugins.find(p=>p.enabled&&!p.installed);if(invalid)throw new Error('已启用原插件不可用或完整性校验失败，未发送作者请求：'+invalid.name);return plugins.some(p=>p.enabled&&p.installed);}
  busy(){return this.active>0;}
- async close(invalidateTurn=true){if(invalidateTurn)this.http.turnSignal=undefined;const browser=this.browser;this.browser=null;this.page=null;this.key="";await browser?.close();}
+ async close(invalidateTurn=true){this.epoch++;if(invalidateTurn)this.http.turnSignal=undefined;await this.discard();}
+ private async discard(){const browser=this.browser;this.browser=null;this.page=null;this.key="";this.browserKey="";await browser?.close();}
   private async ensure(mvuRetry=false){
+   const epoch=this.epoch,stale=()=>{if(this.epoch!==epoch)throw new Error('插件任务已取消');};
   const binding=this.http.binding(),turnNonce=this.http.turnNonce,fingerprint=this.http.sources.status().plugins.map(p=>`${p.id}:${p.enabled}:${p.commit}`).join('|'),key=`${binding.scopeKey}:${binding.sourceEntryId}:${fingerprint}:${mvuStatus(this.http.assetsCwd).enabled}:${this.http.turnNonce}`;
-  if(this.page&&this.key===key)return this.page;await this.close(false);
+   // Reuse the browser process, not a realm whose native callbacks retain an old source/nonce.
+   const browserKey=`${binding.scopeKey}:${fingerprint}:${mvuStatus(this.http.assetsCwd).enabled}`;
+   if(this.page&&!this.page.isClosed()&&this.key===key)return this.page;
+   if(!this.browser?.isConnected()||this.browserKey!==browserKey)await this.discard();
+   else {const page=this.page;this.page=null;this.key="";await page?.context().close();}
+   stale();
   const binary=join(this.http.assetsCwd,".liyuan-database-plugin/browser/headless_shell"),libs=join(this.http.assetsCwd,".liyuan-database-plugin/browser-libs/lib64");
   const executablePath=process.env.LIYUAN_TAVERN_BROWSER_EXECUTABLE??process.env.LIYUAN_DATABASE_BROWSER_EXECUTABLE??(existsSync(binary)?binary:undefined);
-  this.browser=await chromium.launch({headless:true,...(executablePath?{executablePath}:{}),env:{...process.env,LD_LIBRARY_PATH:process.env.LIYUAN_TAVERN_BROWSER_LIBS??process.env.LIYUAN_DATABASE_BROWSER_LIBS??process.env.LD_LIBRARY_PATH??(existsSync(libs)?libs:'')},args:process.getuid?.()===0?['--no-sandbox']:[]});
-  const context=await this.browser.newContext({serviceWorkers:"block"});
+   // Private computation pages must not enter GPU frame-sink recovery when private ANGLE libraries are inaccessible.
+    if(!this.browser){
+     const launched=await chromium.launch({headless:true,...(executablePath?{executablePath}:{}),env:{...process.env,LD_LIBRARY_PATH:process.env.LIYUAN_TAVERN_BROWSER_LIBS??process.env.LIYUAN_DATABASE_BROWSER_LIBS??process.env.LD_LIBRARY_PATH??(existsSync(libs)?libs:'')},args:['--disable-gpu',...(process.getuid?.()===0?['--no-sandbox']:[])]});
+     // A close() (turn abort/deadline) during launch must not leave an orphan browser installed for the next turn.
+     if(this.epoch!==epoch){await launched.close().catch(()=>{});stale();}
+     this.browser=launched;
+    }
+   this.browserKey=browserKey;
+  const context=await this.browser.newContext({serviceWorkers:"block"});stale();
   await context.route('**/*',route=>{const req=route.request(),url=new URL(req.url());const mapped: string | undefined=({...TAVERN_CDN_ASSETS,...mvuAssetMap(this.http.assetsCwd)} as Record<string, string>)[url.href];if(mapped){const file=mapped.startsWith('/tavern-compat/mvu/')?mvuAsset(this.http.assetsCwd,mapped.split('/').at(-1)!):mapped.includes('/vendor/')?this.http.assetsCwd+'/.liyuan-tavern-plugins/vendor/'+mapped.split('/').at(-1):this.http.resolveOriginalAsset(mapped);if(!file)return route.abort();return route.fulfill({status:200,contentType:'text/javascript',body:readFileSync(file),headers:{'access-control-allow-origin':'*'}});}if(url.origin!==this.origin()||(!url.pathname.startsWith('/tavern-compat/')&&!url.pathname.startsWith('/api/tavern-plugins/')&&url.pathname!=='/tavern-plugin-host.html'&&url.pathname!=='/version'&&!url.pathname.startsWith('/scripts/extensions/third-party/JS-Slash-Runner/')))return route.abort('blockedbyclient');return route.continue({headers:{...req.headers(),'x-liyuan-tavern-host':this.http.internalToken,'x-liyuan-tavern-scope':binding.scopeKey,'x-liyuan-tavern-source':binding.sourceEntryId,'x-liyuan-tavern-turn':turnNonce}});});
-  this.page=await context.newPage();this.page.on('dialog',d=>{void d.dismiss();});this.key=key;
-   await this.page.goto(this.origin()+'/tavern-plugin-host.html?view=runtime'+(mvuRetry?'&mvuRetry=1':''));
-  try{await this.page.waitForFunction(()=>!!(window as any).LiyuanTavernPlugins?.ready(),{},{timeout:45_000});}
-  catch{const status=await this.page.evaluate(()=>document.getElementById('status')?.textContent??'').catch(()=> '');throw new Error('原酒馆插件加载未完成：'+status);}
-  this.http.assertBinding(binding.scopeKey,binding.sourceEntryId);return this.page;
+   const page=await context.newPage();if(this.epoch!==epoch){await context.close().catch(()=>{});stale();}
+   this.page=page;page.on('dialog',d=>{void d.dismiss();});
+   // Use the local page: an abandoned ensure must never drive a page installed by a later turn.
+   await page.goto(this.origin()+'/tavern-plugin-host.html?view=runtime'+(mvuRetry?'&mvuRetry=1':''));
+  try{await page.waitForFunction(()=>!!(window as any).LiyuanTavernPlugins?.ready(),{},{timeout:45_000});}
+  catch{const status=await page.evaluate(()=>document.getElementById('status')?.textContent??'').catch(()=> '');throw new Error('原酒馆插件加载未完成：'+status);}
+   stale();this.http.assertBinding(binding.scopeKey,binding.sourceEntryId);this.key=key;return page;
  }
    private async owned<T>(work:(page:Page)=>Promise<T>,signal?:AbortSignal,sourceEntryId?:string,expected?:{scopeKey:string;sourceEntryId:string},mvuRetry=false):Promise<T>{
   const job=this.queue.then(async()=>{
     if(signal?.aborted)throw new Error('插件任务已取消');if(expected)this.http.assertBinding(expected.scopeKey,expected.sourceEntryId);if(mvuRetry&&sourceEntryId)this.http.mvuRecovery={head:this.http.binding(),sourceEntryId};this.http.turnSignal=signal;this.active++;this.http.boundSourceEntryId=sourceEntryId;
    const stop=()=>{void this.close();};signal?.addEventListener('abort',stop,{once:true});
-   try{const binding=this.http.binding(),page=await this.ensure(mvuRetry);if(signal?.aborted){await this.close();throw new Error('插件任务已取消');}const result=await work(page);if(signal?.aborted)throw new Error('插件任务已取消');this.http.assertBinding(binding.scopeKey,binding.sourceEntryId);return result;}
+   // Settle on abort even if launch/goto/evaluate never answers: close() already discarded the browser, and a
+   // wedged job must not hold the serialized queue for the next turn. Late results are ignored.
+   try{const binding=this.http.binding(),page=await untilAbort(this.ensure(mvuRetry),signal);if(signal?.aborted){await this.close();throw new Error('插件任务已取消');}const result=await untilAbort(work(page),signal);if(signal?.aborted)throw new Error('插件任务已取消');this.http.assertBinding(binding.scopeKey,binding.sourceEntryId);return result;}
     finally{signal?.removeEventListener('abort',stop);if(mvuRetry)await this.close(false);this.http.mvuRecovery=undefined;this.http.boundSourceEntryId=undefined;this.active--;}
   });this.queue=job.catch(()=>{});return job;
  }
@@ -63,7 +92,7 @@ export class TavernPluginRuntime {
    if(!sourceEntryId){
     const saved=this.http.store?.read(head).state,message=head.chat.find(row=>row.__liyuanEntryId===head.sourceEntryId),receipt=(saved?.chatMetadata.__liyuanMvuProcessed as Record<string,any>)?.[head.sourceEntryId];
     if(message&&!message.is_user&&!message.__liyuanUnfinished&&typeof message.__liyuanAuthorDelivery==='string'){
-     const materialHash=createHash('sha256').update(JSON.stringify([mvuParsingProjection(message.__liyuanAuthorDelivery).text,head.readonlyBooks,saved?.extensionSettings.mvu_settings])).digest('hex');
+     const materialHash=createHash('sha256').update(JSON.stringify([mvuParsingProjection(mvuParseSource(message.__liyuanAuthorDelivery,message.__liyuanSupplementaryVariables)).text,head.readonlyBooks,saved?.extensionSettings.mvu_settings])).digest('hex');
      if(receipt?.nativeRetry===true&&receipt.authorHistoryVersion===2&&receipt.materialHash===materialHash&&['updated','unchanged'].includes(receipt.status))return {scopeKey:head.scopeKey,sourceEntryId:head.sourceEntryId,status:'reused'};
     }
    }
@@ -74,7 +103,7 @@ export class TavernPluginRuntime {
      if(sourceEntryId)this.http.mvuRecovery={head,sourceEntryId};
     this.http.internalPhase="after";
      try{return await page.evaluate(()=>(window as any).LiyuanTavernPlugins.recoverMvu());}
-     catch(error){const text=error instanceof Error?error.message:String(error),message=text.replace(/^page\.evaluate:\s*(?:Error:\s*)?/,'').split('\n')[0];if(message.includes('已达8次预算'))throw Error('本回合辅助解析额度已用完（8/8）。已保存变量仍保留；材料有变化时不能继续解析，未调用模型。');throw Error(message);}
+     catch(error){const text=error instanceof Error?error.message:String(error),message=text.replace(/^page\.evaluate:\s*(?:Error:\s*)?/,'').split('\n')[0];throw Error(message);}
      finally{this.http.internalPhase=undefined;this.http.mvuRecovery=undefined;}
      },retrySignal,sourceEntryId,head,true);}finally{controller.abort();if(this.http.turnSignal===retrySignal)this.http.turnSignal=undefined;}
   }

@@ -19,18 +19,18 @@ async function fixture(run: (f: {cwd:string;store:TavernPluginStore;root:string;
 function child(code:string,...args:string[]):ChildProcess { return spawn(process.execPath, ["--input-type=module", "-e", code, ...args], {stdio:["ignore","pipe","pipe","ipc"]}); }
 async function stop(proc:ChildProcess) { if (proc.exitCode === null && proc.signalCode === null) { const exited = once(proc,"exit"); proc.kill("SIGKILL"); await exited; } }
 
-test("eight-call ledger survives store re-instantiation without changing story revision or branch inheritance", () => fixture(({cwd,store}) => {
+test("unlimited cumulative ledger survives store re-instantiation without changing story revision or branch inheritance", () => fixture(({cwd,store}) => {
  for(let n=1;n<=8;n++)assert.equal(store.claimModelRequest(binding,8,()=>{}).calls,n);
- const restarted=new TavernPluginStore(cwd);assert.throws(()=>restarted.claimModelRequest(binding,8,()=>{}),/8次预算/);
+ const restarted=new TavernPluginStore(cwd);assert.equal(restarted.claimModelRequest(binding,8,()=>{}).calls,9);
  assert.deepEqual(restarted.read(binding),{revision:0,state:emptyTavernPluginState()});
  for(const target of [{...binding,card:"other-card"},{...binding,sessionId:"other-session"},{...binding,sourceEntryId:"other-source"}])assert.equal(restarted.claimModelRequest(target,8,()=>{}).calls,1);
 }));
 
-test("guard/invalid budget data fail closed and no new allowance is silently minted", () => fixture(({store,root}) => {
+test("guard/invalid accounting data fail closed without clearing history", () => fixture(({store,root}) => {
  assert.throws(()=>store.claimModelRequest(binding,8,()=>{throw new Error("synthetic cancelled");}),/cancelled/);
  assert.equal(existsSync(join(root,"model-request-budget.json")),false);
  store.claimModelRequest(binding,8,()=>{});writeFileSync(join(root,"model-request-budget.json"),'{"version":99,"claims":{}}');
- assert.throws(()=>store.claimModelRequest(binding,8,()=>{}),/预算账本无效/);
+ assert.throws(()=>store.claimModelRequest(binding,8,()=>{}),/计数账本无效/);
  assert.equal(store.read(binding).revision,0);
 }));
 
@@ -79,11 +79,11 @@ test("lost lease cannot release or publish through a replacement owner's nonce",
  assert.throws(()=>held.assertOwned(),{statusCode:409});assert.throws(()=>held.release(),{statusCode:409});assert.equal(JSON.parse(readFileSync(path,"utf8")).nonce,value.nonce);
 }));
 
-test("two real processes cannot overspend the shared persistent allowance", () => fixture(async ({cwd,store}) => {
+test("two real processes serialize cumulative accounting without dropping requests or imposing a quota", () => fixture(async ({cwd,store}) => {
  const code=`import {TavernPluginStore} from ${JSON.stringify(storeModule)};const store=new TavernPluginStore(process.argv[1]),binding=${JSON.stringify(binding)};process.send('ready');process.once('message',async()=>{let wins=0;for(let n=0;n<80;n++){try{store.claimModelRequest(binding,8,()=>{});wins++;}catch(e){if(e.statusCode!==409)break;}await new Promise(r=>setTimeout(r,2));}process.send({wins});process.disconnect();});`;
  const a=child(code,cwd),b=child(code,cwd);
  try { await Promise.all([once(a,"message"),once(b,"message")]);const results=Promise.all([once(a,"message"),once(b,"message")]);a.send('go');b.send('go');const [[ra],[rb]]=await results;
- assert.equal(ra.wins+rb.wins,8);assert.throws(()=>store.claimModelRequest(binding,8,()=>{}),/8次预算/);assert.equal(store.read(binding).revision,0);
+ const total=ra.wins+rb.wins;assert.ok(total>8);assert.equal(store.modelRequestUsage(binding).used,total);assert.equal(store.claimModelRequest(binding,8,()=>{}).calls,total+1);assert.equal(store.read(binding).revision,0);
  }finally{await Promise.all([stop(a),stop(b)]);}
 }));
 

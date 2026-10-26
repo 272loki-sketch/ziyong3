@@ -143,6 +143,47 @@ test("默认JSON缩进为tab", () => fixture((dir, path) => {
 	assert.equal(readFileSync(path, "utf8"), `${JSON.stringify(value, null, "\t")}\n`);
 }));
 
+for (const purpose of ["new", "backup", "bak-rollback"]) {
+	test(`EPERM restoring ${purpose} ownership preserves config and prior backup`, () => fixture((dir, path) => {
+		const original = '{ "prior": true }\n';
+		const oldBak = '{ "older": true }\n';
+		writeFileSync(path, original, { mode: 0o600 });
+		writeFileSync(`${path}.bak`, oldBak, { mode: 0o600 });
+		const descriptors = new Map<number, string>();
+		let rejected = false;
+		const ops: Partial<AtomicJsonFsOps> = {
+			openSync(file, flags, mode) {
+				const fd = openSync(file, flags as never, mode);
+				descriptors.set(fd, file);
+				return fd;
+			},
+			fstatSync(fd) {
+				const actual = fstatSync(fd);
+				return descriptors.get(fd)?.includes(`-${purpose}-`)
+					? { uid: actual.uid + 1, gid: actual.gid }
+					: actual;
+			},
+			fchownSync() {
+				rejected = true;
+				throw Object.assign(new Error("synthetic ownership denied"), { code: "EPERM", syscall: "fchown" });
+			},
+			closeSync(fd) {
+				try { closeSync(fd); }
+				finally { descriptors.delete(fd); }
+			},
+		};
+
+		assert.throws(() => writeJsonAtomicWithBackup(path, { next: true }, { ops }), { code: "EPERM", syscall: "fchown" });
+		assert.equal(rejected, true);
+		assert.equal(readFileSync(path, "utf8"), original);
+		assert.equal(readFileSync(`${path}.bak`, "utf8"), oldBak);
+		assertPosixMode(path, 0o600);
+		assertPosixMode(`${path}.bak`, 0o600);
+		assert.equal(descriptors.size, 0);
+		assert.deepEqual(names(dir), ["config.json", "config.json.bak"]);
+	}));
+}
+
 test("首次创建失败不留下目标或 bak；POSIX 上成功时使用私有 0600", () => fixture((dir, path) => {
 	assert.throws(() => writeJsonAtomicWithBackup(path, { first: true }, { ops: failWritesFor("new") }), { code: "ENOSPC" });
 	assert.equal(existsSync(path), false);

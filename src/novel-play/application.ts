@@ -8,6 +8,7 @@ import { scanSkillFiles } from "../stage/skill-store.ts";
 import { resolveConfigPath } from "../paths.ts";
 import { readJsonFile } from "../jsonio.ts";
 import type { RpConfig } from "../types.ts";
+import { scopedLorebookPaths, setScopedLorebooks, worldbookCardKey } from "../worldbook-bindings.ts";
 import { buildNovelPlayCard, type NovelPlayRawCard } from "./card.ts";
 import { type NovelAnchor, type NovelPackage } from "./canon.ts";
 import { extractNovelCharacterProfiles, extractNovelOpening, type NovelOpeningProposal } from "./opening.ts";
@@ -42,7 +43,7 @@ export type StartResult =
 
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 
-/** Ensure novel character profiles also exist as a visible mounted lorebook. */
+/** Keep generated profiles mounted only on their owning card and package revision. */
 export function ensureNovelPlayLorebook(cwd: string): string | undefined {
 	const configState = loadRawConfig(cwd), cardPath = String(configState.config.card ?? "");
 	if (!cardPath) return undefined;
@@ -59,12 +60,13 @@ export function ensureNovelPlayLorebook(cwd: string): string | undefined {
 			return Number(row.insertion_order ?? row.order ?? 0) >= 120 && row.selective === true;
 		}));
 		if (!Object.keys(profileEntries).length) return undefined;
-		const relativeLore = `assets/lorebooks/novel-play-${String(extension.docId)}.json`;
+		const identity = sha256(JSON.stringify([worldbookCardKey(cardPath), extension.docId, extension.revision]));
+		const relativeLore = `assets/lorebooks/novel-play-${identity}.json`;
 		const loreFile = join(cwd, relativeLore);
 		mkdirSync(dirname(loreFile), { recursive: true });
 		atomicWrite(loreFile, `${JSON.stringify({ entries: profileEntries, extensions: { liyuanNovelPlay: { docId: extension.docId, revision: extension.revision, kind: "character-profiles" } } }, null, "\t")}\n`);
-		const mounted = Array.isArray(configState.config.lorebooks) ? [...configState.config.lorebooks] : [];
-		if (!mounted.includes(relativeLore)) atomicWrite(configState.path, `${JSON.stringify({ ...configState.config, lorebooks: [...mounted, relativeLore] }, null, "\t")}\n`);
+		const mounted = scopedLorebookPaths(configState.config, "character_aux");
+		if (!mounted.includes(relativeLore)) atomicWrite(configState.path, `${JSON.stringify(setScopedLorebooks(configState.config, "character_aux", [...mounted, relativeLore]), null, "\t")}\n`);
 		return relativeLore;
 	} catch { return undefined; }
 }

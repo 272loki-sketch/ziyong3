@@ -16,19 +16,9 @@ const assets = new Set([
 const presets = new Set(['presets/\u9ed8\u8ba4.json']);
 // Only these current guides are public. Nested docs and all other records stay local.
 export const approvedDocumentation = new Set([
-  'AGENTIC-RESEARCH.md', 'ARCHITECTURE-NOVEL-PLAY.md', 'ARCHITECTURE-OVERVIEW.md',
-  'BRANCH-RELEASE-WORKFLOW.md', 'DATABASE-PLUGIN.md', 'DIRECTOR-ROOM.md',
-  'DOCUMENTATION-INDEX.md', 'FORMAT-DELIVERY.md', 'GENERATION-MODES.md',
-  'IMAGE-GENERATION-RETIREMENT.md', 'LOCAL-UPSTREAM-UPDATES.md', 'LOREBOOKS.md',
-  'MODEL-CONNECTIONS.md', 'MVU.md', 'NOVEL-PLAY.md', 'NOVEL-PLAY-MAINTENANCE.md',
-  'NPC-PARALLEL.md', 'PLAN-LIVING-ECOLOGY.md', 'PLAN-NOVEL-DIGEST.md',
-  'PLAN-OUTLINE-SYSTEM.md', 'PLAN-ROUND-FLOW.md', 'PLAN-RP-MEMORY.md',
-  'PLAN-RP-TOOLING.md', 'PLAN-WORLD-ENGINE.md',
-  'PRESET-SPLIT-TAXONOMY.md', 'STANDALONE-INTEGRATION-BASELINE.md',
-  'PRIVACY-AND-PUBLISHING.md', 'PROJECT-STRUCTURE.md', 'PROMPT-BUDGETS.md',
-  'PROMPT-SOURCES.md', 'READING-THINKING.md', 'RECOVERY-AND-DIAGNOSTICS.md',
-  'REQUEST-INSPECTOR.md', 'TAVERN-PLUGINS.md',
-  'THIRD-PARTY-INSPIRATION.md', 'VERIDIS-REWRITE.md', 'WRITER-API-COMPATIBILITY.md',
+  'architecture.md', 'decisions.md', 'diagnostics.md', 'features.md',
+  'materials.md', 'memory.md', 'models.md', 'planning.md', 'plugins.md',
+  'shipping.md', 'world-ecology.md',
 ]);
 
 // SDK documentation/examples are product inputs, not permission for new Markdown.
@@ -55,7 +45,7 @@ const builtinSkills = new Set([
   '大纲转移审计', '导演主Agent', '导演事实审阅', '导演生态参考', '导演角度构思',
   '导演设定核对', '导演证据整理', '导演预设审阅', '小说人物画像提取', '小说作品构建',
   '小说分支校准', '小说开场提取', '小说开演边界', '小说消化', '小说研究检索',
-  '小说续更事件提取', '拍后事实信封', '故事编剧室', '文学连续性', '独立谢幕格式',
+  '日常剧情筹备', '小说续更事件提取', '拍后事实信封', '故事编剧室', '文学连续性', '独立谢幕格式',
   '结构化校验修复', '角色卡世界画像', '角色卡生态池', '通用叙事原型池',
 ].map(name => `skills/${name}/SKILL.md`));
 const markdownPaths = new Set([
@@ -79,7 +69,7 @@ const publicDiagnostics = new Set([
   '_privacy_scan.py', 'check-tavern-canary.mjs', 'deploy-agentic-research.sh',
   'probe-backstage.mjs', 'rename-paths-once.mjs', 'research-test-model.ts',
   'smoke-f34.mjs', 'smoke-web.mjs',
-  'test-npc-parallel-integration.mjs', 'test-plugin-server-canary.mjs',
+  'test-plugin-server-canary.mjs',
   'test-summary.mjs', 'test-tavern-native.mjs', 'test-veridis-rewrite-integration.mjs',
   'update-local.sh',
 ]);
@@ -142,7 +132,6 @@ const syntheticUrls = new Map([
   ['test/database-plugin-source.test.ts', ['https://' + 'user:pass@gcore.jsdelivr.net']],
   ['test/mvu-managed-routing.test.ts', ['https://' + 'user:pass@parser.invalid']],
   ['test/mvu-model-list.test.ts', ['https://' + 'user:password@managed.invalid']],
-  ['test/npc-parallel-source.test.ts', ['http://' + 'user:pass@proxy.example.invalid:7890']],
   ['test/veridis-rewrite-source.test.ts', ['http://' + 'user:pass@proxy.example.invalid:7890']],
   ['test/plugin-git-network.test.ts', ['http://' + 'user:synthetic-private-secret@127.0.0.1:9']],
   ['test/tavern-plugin-source.test.ts', ['http://' + 'fixture-user:fixture-pass@127.0.0.1:1']],

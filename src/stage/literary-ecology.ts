@@ -127,6 +127,8 @@ export interface EcologyTransitionOptions {
 
 export interface EcologyOccurrence {
 	id: string;
+	origin?: "generated-offscreen" | "narrative";
+	narrativeEvidence?: { sourceEntryId: string; quote: string };
 	name: string;
 	kind: "ambient" | "activity" | "test" | "encounter" | "personal";
 	status: "scheduled" | "active" | "resolved" | "expired";
@@ -195,7 +197,9 @@ export interface LiteraryEcologyState {
 export interface EcologyWireView {
 	round: number;
 	digest: string;
-	public: { actors: string[]; events: string[]; locations: string[] };
+	degraded?: LiteraryEcologyState["degraded"];
+	snapshot?: { entryId?: string; sourceEntryId?: string; latestNarrativeEntryId?: string; status: "current" | "stale" | "pending" | "failed" | "unknown" };
+	public: { actors: string[]; events: string[]; historyEvents?: string[]; locations: string[] };
 	discovered: { actors: string[]; events: string[] };
 	propagation: Array<{ occurrenceId: string; eventName: string; publicity: "trace" | "public"; headline: string; summary: string; trace: string; result: string; sourceType: EcologyPublicSurface["sourceType"]; claimStatus: EcologyPublicSurface["claimStatus"]; audience: string[]; scope: string }>;
 	spoilers: { actors: string[]; events: string[]; secrets: string[]; cognition: string[]; actorAdvances: string[] };
@@ -357,7 +361,9 @@ function normalizeUserCommitment(value: unknown): EcologyUserCommitmentEvidence 
 	};
 }
 
-export function normalizeLiteraryEcologyState(value: unknown, previous: LiteraryEcologyState): LiteraryEcologyState | null {
+/** occurrenceIds exposes only unambiguous, retained merge identities to admission. */
+export function normalizeLiteraryEcologyState(value: unknown, previous: LiteraryEcologyState, occurrenceIds = new Map<string, string>()): LiteraryEcologyState | null {
+	occurrenceIds.clear();
 	const source = objectOf(value);
 	if (!source) return null;
 	const actors = records(source.actors).map((item, index): EcologyActor | null => {
@@ -424,7 +430,9 @@ export function normalizeLiteraryEcologyState(value: unknown, previous: Literary
 		const communication = communicationCandidate && (kind === "ambient" || (communicationCandidate.senderRef && communicationCandidate.recipientRefs.length))
 			? communicationCandidate
 			: old?.communication;
-		return { id: candidateId, name, kind, status, time: oldText("time", 120), location: oldText("location", 120), participants: oldList("participants", 16), cause: oldText("cause"), development: oldText("development", 600), visibility, discovery: oldText("discovery"), expires: oldText("expires", 120), withoutUser: oldText("withoutUser"), userRole, ...(userCommitment ? { userCommitment } : {}), prototypeId: oldText("prototypeId", 80), templateId: oldText("templateId", 80), patternKey, tone, intrusion, createdRound: Math.max(0, Number(item.createdRound) || old?.createdRound || previous.round), lastAdvancedRound: Math.max(0, Number(item.lastAdvancedRound) || old?.lastAdvancedRound || previous.round), cooldownUntilRound: Math.max(0, Number(item.cooldownUntilRound) || old?.cooldownUntilRound || 0), ...(publicSurface ? { publicSurface } : {}), causedBy: oldList("causedBy", 12), ...(communication ? { communication } : {}) };
+		const origin = item.origin === "narrative" || item.origin === "generated-offscreen" ? item.origin : old ? old.origin : "generated-offscreen";
+		const evidence = Object.hasOwn(item, "narrativeEvidence") ? objectOf(item.narrativeEvidence) : old?.narrativeEvidence;
+		return { id: candidateId, origin, ...(evidence ? { narrativeEvidence: { sourceEntryId: clean(evidence.sourceEntryId, 160), quote: clean(evidence.quote, 2000) } } : {}), name, kind, status, time: oldText("time", 120), location: oldText("location", 120), participants: oldList("participants", 16), cause: oldText("cause"), development: oldText("development", 600), visibility, discovery: oldText("discovery"), expires: oldText("expires", 120), withoutUser: oldText("withoutUser"), userRole, ...(userCommitment ? { userCommitment } : {}), prototypeId: oldText("prototypeId", 80), templateId: oldText("templateId", 80), patternKey, tone, intrusion, createdRound: Math.max(0, Number(item.createdRound) || old?.createdRound || previous.round), lastAdvancedRound: Math.max(0, Number(item.lastAdvancedRound) || old?.lastAdvancedRound || previous.round), cooldownUntilRound: Math.max(0, Number(item.cooldownUntilRound) || old?.cooldownUntilRound || 0), ...(publicSurface ? { publicSurface } : {}), causedBy: oldList("causedBy", 12), ...(communication ? { communication } : {}) };
 	}).filter((item): item is EcologyOccurrence => !!item).slice(0, 80);
 	const locationStates = records(source.locationStates).map((item) => ({ location: clean(item.location, 120), state: clean(item.state), activities: strings(item.activities, 12) })).filter((item) => item.location).slice(0, 30);
 	const secrets = records(source.secrets).map((item, index) => ({ id: stableId(item.id, "secret", `${clean(item.subject)}:${index}`), subject: clean(item.subject, 120), truth: clean(item.truth, 600), knownBy: strings(item.knownBy, 16, 100), traces: strings(item.traces, 12), revealCondition: clean(item.revealCondition) })).filter((item) => item.subject || item.truth).slice(0, 40);
@@ -437,8 +445,18 @@ export function normalizeLiteraryEcologyState(value: unknown, previous: Literary
 		if (["resolved", "expired"].includes(old.status)) return old;
 		return { ...old, ...next, id: old.id, createdRound: old.createdRound };
 	}, 80);
+	// Pattern merging preserves the first identity. Rebind its structured edges,
+	// not prose or provenance, and never alias a filtered/terminal/ambiguous record.
+	for (const item of cooled) {
+		if (previous.occurrences.some(old => old.id === item.id) || occurrences.filter(row => row.id === item.id).length !== 1 || mergedOccurrences.some(row => row.id === item.id)) continue;
+		const matches = mergedOccurrences.filter(row => row.patternKey === item.patternKey);
+		if (matches.length === 1 && !["resolved", "expired"].includes(previous.occurrences.find(old => old.id === matches[0].id)?.status ?? "")) occurrenceIds.set(item.id, matches[0].id);
+	}
+	const occurrenceRef = (ref: string): string => ref.startsWith("occurrence:") ? `occurrence:${occurrenceIds.get(ref.slice(11)) ?? ref.slice(11)}` : ref;
+	for (const actor of actors) actor.knowledgeLedger = actor.knowledgeLedger?.map(entry => previous.actors.some(old => old.knowledgeLedger?.includes(entry)) ? entry : { ...entry, subjectRef: occurrenceRef(entry.subjectRef), sourceRef: occurrenceRef(entry.sourceRef) });
+	const referencedOccurrences = mergedOccurrences.map(item => previous.occurrences.some(old => old.causedBy === item.causedBy) ? item : { ...item, causedBy: item.causedBy?.map(ref => occurrenceIds.get(ref) ?? ref) });
 	const recentUses = records(source.recentUses).map((item) => ({ key: clean(item.key, 160), round: Math.max(0, Number(item.round) || previous.round) })).filter((item) => item.key).slice(-80);
-	return { version: 1, round: previous.round, digest: clean(source.digest, 1000) || previous.digest, actors: actors.length ? actors : previous.actors, occurrences: mergedOccurrences, locationStates: locationStates.length ? locationStates : previous.locationStates, recentPatterns: strings(source.recentPatterns, 20, 120), recentUses: recentUses.length ? recentUses : previous.recentUses, secrets: secrets.length ? secrets : previous.secrets, ...(previous.commitmentWarnings?.length ? { commitmentWarnings: [...previous.commitmentWarnings] } : {}) };
+	return { version: 1, round: previous.round, digest: clean(source.digest, 1000) || previous.digest, actors: actors.length ? actors : previous.actors, occurrences: referencedOccurrences, locationStates: locationStates.length ? locationStates : previous.locationStates, recentPatterns: strings(source.recentPatterns, 20, 120), recentUses: recentUses.length ? recentUses : previous.recentUses, secrets: secrets.length ? secrets : previous.secrets, ...(previous.commitmentWarnings?.length ? { commitmentWarnings: [...previous.commitmentWarnings] } : {}) };
 }
 
 export function commitLiteraryEcologyRound(state: LiteraryEcologyState, previousRound: number): LiteraryEcologyState {
@@ -513,6 +531,13 @@ export function validateEcologyTransition(previous: LiteraryEcologyState, next: 
 		if (current && ["resolved", "expired"].includes(old.status) && current.status !== old.status) errors.push(`终态事件 ${old.id} 不得从 ${old.status} 重开`);
 	}
 	for (const occurrence of next.occurrences) {
+		const prior = previous.occurrences.find(item => item.id === occurrence.id);
+		if ((!prior || prior.origin !== occurrence.origin || JSON.stringify(prior.narrativeEvidence) !== JSON.stringify(occurrence.narrativeEvidence))
+			&& (occurrence.origin === "narrative" || occurrence.narrativeEvidence)) {
+			const evidence = occurrence.narrativeEvidence;
+			if (occurrence.origin !== "narrative" || !evidence?.quote || evidence.sourceEntryId !== options.trustedNarrative?.entryId
+				|| !options.trustedNarrative.text.includes(evidence.quote)) errors.push(`事件 ${occurrence.id} 的正文提取来源或引文无效`);
+		}
 		// 大型校园/公共事件可引用未进入当前 actor 工作集的人物。
 		// 参与者集合可能大于当前 actor 工作集；状态一致性由具体更新和认知门禁检查，
 		// 不要求每个公共/已完成事件都物化全部参与人物。
@@ -545,7 +570,15 @@ export function validateEcologyTransition(previous: LiteraryEcologyState, next: 
 				? !secrets.has(entry.subjectRef.slice(7))
 				: false;
 		// world/lore 引用可能尚未物化进本拍最多 30 条跨域信号；只对本生态可完整验证的引用 fail closed。
-		if (localRefMissing && entry.route !== "public-channel") errors.push(`人物 ${actor.id} 的认知 ${entry.id} 引用了不存在的对象`);
+		if (localRefMissing && entry.route !== "public-channel") errors.push(`人物 ${actor.id} 的认知 ${entry.id} 引用了不存在的对象：subjectRef=${JSON.stringify(entry.subjectRef)}，sourceRef=${JSON.stringify(entry.sourceRef)}，knownOccurrenceIds=${JSON.stringify([...occurrences.keys()])}，knownSecretIds=${JSON.stringify([...secrets])}`);
+		if (entry.sourceRef.startsWith("occurrence:") && !occurrences.has(entry.sourceRef.slice(11))) errors.push(`人物 ${actor.id} 的认知 ${entry.id} 引用了不存在的获知事件`);
+		if (entry.subjectRef.startsWith("secret:") && entry.certainty === "confirmed") {
+			const secret = next.secrets.find(item => `secret:${item.id}` === entry.subjectRef);
+			const source = entry.sourceRef.startsWith("occurrence:") ? occurrences.get(entry.sourceRef.slice(11)) : undefined;
+			const known = previous.secrets.find(item => item.id === secret?.id)?.knownBy.some(id => id === actor.id || id === actor.name);
+			if (!known && (!entry.evidence || !source || !source.participants.some(id => id === actor.id || id === actor.name)
+				|| source.status === "scheduled" || source.status === "expired")) errors.push(`人物 ${actor.id} 的秘密认知 ${entry.id} 缺少实际获知事件`);
+		}
 		if (["told", "investigated", "message", "public-channel"].includes(entry.route) && !entry.sourceRef) errors.push(`人物 ${actor.id} 的认知 ${entry.id} 缺少来源引用`);
 		if (entry.route === "message") {
 			const source = entry.sourceRef.startsWith("occurrence:") ? occurrences.get(entry.sourceRef.slice(11)) : undefined;
@@ -578,9 +611,9 @@ export function literaryEcologyFromBranch(branch: BranchEntryLike[]): LiteraryEc
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
 		if (entry.type === "custom" && entry.customType === LITERARY_ECOLOGY_ENTRY_TYPE) {
-			const raw = entry.data as { round?: unknown; commitmentWarnings?: unknown } | undefined;
+			const raw = entry.data as { round?: unknown; commitmentWarnings?: unknown; degraded?: LiteraryEcologyState["degraded"] } | undefined;
 			const parsed = normalizeLiteraryEcologyState(entry.data, { ...defaultLiteraryEcologyState(), round: Math.max(0, Number(raw?.round) || 0) });
-			if (parsed) return { ...parsed, ...(strings(raw?.commitmentWarnings, 12, 300).length ? { commitmentWarnings: strings(raw?.commitmentWarnings, 12, 300) } : {}) };
+			if (parsed) return { ...parsed, ...(raw?.degraded && ["arrival", "aftermath"].includes(raw.degraded.stage) ? { degraded: { stage: raw.degraded.stage, error: clean(raw.degraded.error, 500) } } : {}), ...(strings(raw?.commitmentWarnings, 12, 300).length ? { commitmentWarnings: strings(raw?.commitmentWarnings, 12, 300) } : {}) };
 		}
 	}
 	return defaultLiteraryEcologyState();
@@ -629,32 +662,84 @@ export function buildEcologyCardPrompt(skillBody: string, input: { global: Ecolo
 export function buildEcologyRuntimePrompt(skillBody: string, input: { phase: "arrival" | "aftermath"; ecology: LiteraryEcologyState; global: EcologyGlobalPool; cardPool: EcologyCardPool; lore?: LorebookEntry[]; state: WorldState; stateBasis?: "pre-turn"; history: BeatMsg[]; userText: string; userEntryId?: string; narrativeText?: string; trustedNarrative?: { entryId: string; text: string }; worldSignals?: unknown[] }): { systemPrompt: string; userText: string } {
 	const templates = input.cardPool.templates.filter((item) => item.status === "active").sort((a, b) => a.useCount - b.useCount).slice(0, 40);
 	const narrative = input.phase === "aftermath" ? input.trustedNarrative?.text ?? input.narrativeText : input.narrativeText;
-	return { systemPrompt: skillPrompt("人物与场所生态运行", skillBody), userText: JSON.stringify({ phase: input.phase, current_ecology: input.ecology, due_actors: dueEcologyActors(input.ecology), global_pool_digest: input.global.digest, card_ecology: { ...input.cardPool, templates }, world_lore: boundedLore(input.lore ?? [], 40, 24_000), ...(input.stateBasis === "pre-turn" ? { state_basis: input.stateBasis, source_contract: "prior_scene_state_reference_only 是拍前账本，只供背景参考，不是本拍事实或最终账本。latest_turn.narrative 是冻结的规范正文；aftermath 的可信正文由宿主绑定已保存正文 id 并完整提供。与拍前参考冲突时以冻结正文为准，不补写镜头内事实。", prior_scene_state_reference_only: input.state } : { current_scene_state: input.state }), world_constraints: input.worldSignals ?? [], recent_history: boundedHistory(input.history, 16), latest_turn: { user: clipPromptText(input.userText, 8_000), user_entry_id: input.userEntryId ?? null, narrative: input.stateBasis === "pre-turn" ? narrative ?? "" : clipPromptText(narrative, 20_000), narrative_entry_id: input.phase === "aftermath" ? input.trustedNarrative?.entryId ?? null : null } }, null, 2) };
+	return { systemPrompt: skillPrompt("人物与场所生态运行", skillBody), userText: JSON.stringify({ phase: input.phase, current_ecology: input.ecology, due_actors: dueEcologyActors(input.ecology), global_pool_digest: input.global.digest, card_ecology: { ...input.cardPool, templates }, world_lore: boundedLore(input.lore ?? [], 40, 24_000), ...(input.stateBasis === "pre-turn" ? { state_basis: input.stateBasis, source_contract: "prior_scene_state_reference_only 是拍前账本，只供背景参考，不是本拍事实或最终账本。latest_turn.narrative 是冻结的规范正文；aftermath 的可信正文由宿主绑定已保存正文 id 并完整提供。与拍前参考冲突时以冻结正文为准，不补写镜头内事实。", prior_scene_state_reference_only: input.state } : { current_scene_state: input.state }), world_constraints: input.worldSignals ?? [], recent_history: boundedHistory(input.history, 8, 16_000), latest_turn: { user: clipPromptText(input.userText, 8_000), user_entry_id: input.userEntryId ?? null, narrative: input.stateBasis === "pre-turn" ? narrative ?? "" : clipPromptText(narrative, 20_000), narrative_entry_id: input.phase === "aftermath" ? input.trustedNarrative?.entryId ?? null : null } }, null, 2) };
 }
 
 export function formatLiteraryEcologyInjection(ecology: LiteraryEcologyState, maxChars = 6000): string | undefined {
-	if (ecology.round <= 0) return undefined;
-	const publicEvents = ecology.occurrences.filter((item) => item.visibility === "public" && ["scheduled", "active"].includes(item.status));
-	const discoverable = ecology.occurrences.filter((item) => item.visibility === "discoverable" && ["scheduled", "active"].includes(item.status));
-	const visibleActors = ecology.actors.filter((item) => item.tier !== "background" && item.location);
-	const lines = [`生态轮次：${ecology.round}`, `概况：${ecology.digest}`];
-	if (ecology.locationStates.length) lines.push(`场所正在运行：${ecology.locationStates.map((item) => `${item.location}：${item.state}${item.activities.length ? `（${item.activities.join("、")}）` : ""}`).join("；")}`);
-	if (publicEvents.length) lines.push(`公开可知：${publicEvents.map((item) => `${item.name}@${item.location}：${item.development}`).join("；")}`);
-	const publicTraces = ecology.occurrences.filter((item) => item.publicSurface && item.publicSurface.publicity !== "private");
-	if (publicTraces.length) lines.push(`社会传播面：${publicTraces.map((item) => item.publicSurface!.publicity === "trace" ? `${item.name}：${item.publicSurface!.trace}` : `${item.publicSurface!.headline || item.name}：${item.publicSurface!.summary || item.publicSurface!.trace}`).join("；")}`);
-	if (discoverable.length) lines.push(`可经合理接触发现：${discoverable.map((item) => `${item.name}@${item.location}；发现条件：${item.discovery || "进入场所或接触参与者"}`).join("；")}`);
-	if (visibleActors.length) lines.push(`人物此刻：${visibleActors.map((item) => `${item.name}@${item.location}，正在${item.activity || "处理自己的事情"}`).join("；")}`);
-	if (ecology.secrets.length || ecology.occurrences.some((item) => item.visibility === "secret")) lines.push("信息边界：生态中存在用户角色尚不知道的行动、动机或事件；不得让角色凭系统全知直接泄露，只能按目击、交谈、痕迹和传播自然显露。");
-	return lines.join("\n").slice(0, maxChars) || undefined;
+	if (ecology.round <= 0 || maxChars <= 0) return undefined;
+	// The free-form digest can contain backstage truth. Project typed records instead.
+	const header = `生态轮次：${ecology.round}\n信息边界：以下是派生参考，当前分支正文优先；公开不等于角色已知，传闻不等于事实。发现须有接触渠道；已结束事件只供后果参考，不重演。`;
+	if (header.length > maxChars) return undefined;
+	const ongoing = (item: EcologyOccurrence) => item.status === "scheduled" || item.status === "active";
+	const status = { scheduled: "预定", active: "进行中", resolved: "已结束", expired: "已过期" };
+	const recent = [...ecology.occurrences].sort((a, b) => b.lastAdvancedRound - a.lastAdvancedRound);
+	const detail = (label: string, value: string) => value ? `；${label}：${clean(value, 160)}` : "";
+	const eventText = (item: EcologyOccurrence) => `${clean(item.name, 100)}@${clean(item.location, 100) || "地点未定"}［${status[item.status]}］${detail("时间", item.time)}${detail("进展/结果", item.development)}${ongoing(item) ? detail("期限", item.expires) : ""}`;
+	const surfaceText = (item: EcologyOccurrence): string => {
+		const surface = item.publicSurface!;
+		// Even the event's internal name can disclose a secret behind a public trace.
+		if (surface.publicity === "trace") return `公开痕迹［${status[item.status]}］${detail("可见痕迹", surface.trace)}`;
+		const claim = { fact: "事实", mixed: "事实与说法混合", rumor: "传闻" }[surface.claimStatus];
+		return `${clean(surface.headline, 100) || "公开消息"}［${status[item.status]}；${claim}；${surface.sourceType}］${detail("公开版本", surface.summary || surface.trace)}${detail("公开结果", surface.result)}${detail("受众", surface.audience.slice(0, 3).join("、"))}${detail("传播范围", surface.scope)}`;
+	};
+	const publicEvents = recent.filter(item => item.visibility === "public" && !item.publicSurface);
+	const surfaces = recent.filter(item => item.publicSurface && item.publicSurface.publicity !== "private");
+	const sections = [
+		publicEvents.filter(ongoing).map(item => `公开可知：${eventText(item)}`),
+		surfaces.filter(ongoing).map(item => `社会传播面：${surfaceText(item)}`),
+		[...publicEvents.filter(item => !ongoing(item)).map(item => ({ item, text: eventText(item) })),
+			...surfaces.filter(item => !ongoing(item)).map(item => ({ item, text: surfaceText(item) }))]
+			.sort((a, b) => b.item.lastAdvancedRound - a.item.lastAdvancedRound)
+			.map(({ text }) => `已结束事项的后果参考：${text}`),
+		ecology.actors.filter(item => item.tier !== "background" && item.location)
+			.sort((a, b) => (b.lastAdvancedRound ?? 0) - (a.lastAdvancedRound ?? 0))
+			.map(item => `人物此刻：${clean(item.name, 100)}@${clean(item.location, 100)}${detail("正在", item.activity || "处理自己的事情")}`),
+		ecology.locationStates.map(item => `场所正在运行：${clean(item.location, 100)}${detail("状态", item.state)}${detail("活动", item.activities.slice(0, 3).join("、"))}`),
+		recent.filter(item => item.visibility === "discoverable" && !item.publicSurface && ongoing(item))
+			.map(item => `可经合理接触发现：${clean(item.name, 100)}@${clean(item.location, 100)}［${status[item.status]}］${detail("发现条件", item.discovery || "进入场所或接触参与者")}`),
+	];
+	// Interleave complete, bounded records so a large location/event list cannot
+	// consume the whole prompt before people, consequences or discovery appear.
+	const lines = [header];
+	let used = header.length;
+	for (let index = 0; sections.some(section => index < section.length); index++) {
+		for (const section of sections) {
+			const line = section[index];
+			if (!line || used + line.length + 1 > maxChars) continue;
+			lines.push(line);
+			used += line.length + 1;
+		}
+	}
+	return lines.join("\n");
 }
 
-export function ecologyWireView(ecology: LiteraryEcologyState): EcologyWireView {
+export function ecologyWireView(ecology: LiteraryEcologyState, branch?: BranchEntryLike[]): EcologyWireView {
 	const eventText = (item: EcologyOccurrence) => `${item.name}｜${item.status}｜${item.time || "时间未定"}｜${item.location || "地点未定"}｜${item.development}`;
+	let snapshot: EcologyWireView["snapshot"];
+	if (branch) {
+		const entries = [...branch].reverse();
+		const saved = entries.find(entry => entry.type === "custom" && entry.customType === LITERARY_ECOLOGY_ENTRY_TYPE);
+		const sourceEntryId = clean((saved?.data as Record<string, unknown> | undefined)?._diagnosticSourceEntryId, 160) || undefined;
+		const latest = entries.find(entry => entry.message?.role === "assistant" && typeof (entry.message.details as Record<string, unknown> | undefined)?.rpNarrative === "string");
+		const receipt = latest?.id ? entries.find(entry => entry.customType === "rp-turn-settlement" && (entry.data as Record<string, unknown> | undefined)?.narrativeEntryId === latest.id) : undefined;
+		const checkpoint = receipt?.data as { status?: string; ecologyDone?: boolean; degradedDomains?: string[] } | undefined;
+		const failedAudit = latest?.id ? entries.find(entry => entry.customType === "rp-ecology-audit" && (entry.data as Record<string, unknown> | undefined)?.narrativeEntryId === latest.id && (entry.data as Record<string, unknown>).status === "failed") : undefined;
+		// Receipts describe this turn; an older successful snapshot must not imply freshness.
+		const auditAfterReceipt = failedAudit && (!receipt || branch.indexOf(failedAudit) > branch.indexOf(receipt));
+		const failed = checkpoint?.ecologyDone === false || checkpoint?.degradedDomains?.includes("ecology") || ecology.degraded || auditAfterReceipt;
+		// Persisted settling survives cancellation/restart: pending is not a live-running signal.
+		const status = checkpoint?.status === "settling" && !checkpoint.ecologyDone && !auditAfterReceipt ? "pending"
+			: failed ? "failed" : !sourceEntryId || !latest?.id ? "unknown" : sourceEntryId === latest.id ? "current" : "stale";
+		snapshot = { entryId: saved?.id, sourceEntryId, latestNarrativeEntryId: latest?.id, status };
+	}
 	return {
 		round: ecology.round, digest: ecology.digest,
+		...(ecology.degraded ? { degraded: { ...ecology.degraded } } : {}),
+		...(snapshot ? { snapshot } : {}),
 		public: {
 			actors: ecology.actors.filter((item) => item.tier !== "background").map((item) => `${item.name}｜${item.location || "地点未知"}｜${item.activity || "行动未明"}`),
-			events: ecology.occurrences.filter((item) => item.visibility === "public").map(eventText),
+			events: ecology.occurrences.filter((item) => item.visibility === "public" && ["scheduled", "active"].includes(item.status)).map(eventText),
+			historyEvents: ecology.occurrences.filter((item) => item.visibility === "public" && ["resolved", "expired"].includes(item.status)).map(eventText),
 			locations: ecology.locationStates.map((item) => `${item.location}｜${item.state}${item.activities.length ? `｜${item.activities.join("、")}` : ""}`),
 		},
 		discovered: {

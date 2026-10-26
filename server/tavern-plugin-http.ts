@@ -4,7 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, lstatSync } from "node:fs";
 import { join, extname } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { TavernPluginSources, type TavernPluginCandidate } from "./tavern-plugin-source.ts";
+import { TavernPluginSources, TAVERN_PLUGIN_UPSTREAMS, readTavernCandidateAsset, type TavernPluginCandidate } from "./tavern-plugin-source.ts";
 import { TAVERN_CDN_ASSETS } from "./tavern-plugin-cdn.ts";
 import { TAVERN_MODULE_IMPORTS } from "./tavern-plugin-imports.ts";
 import { TavernPluginStore, tavernPluginScope, validateTavernPluginState, type TavernPluginBinding } from "./tavern-plugin-store.ts";
@@ -51,6 +51,7 @@ export function createTavernPluginGenerator<M extends {provider:string;id:string
  };
 }
 export interface TavernPluginContext extends TavernPluginBinding {
+ worldbookSelections?: { primary: string | null; additional: string[]; global: string[]; chat: string[] };
  chat: Array<Record<string, unknown>>; character: Record<string, unknown>; userName: string; userPersona?: string;
  preset?: Record<string, unknown>; model?: {id:string;contextWindow?:number}; mvu?:{model?:{provider:string;id:string;managedEndpoint:string}}; readonlyBooks: Record<string, {entries:unknown[]}>;
 }
@@ -79,15 +80,16 @@ export class TavernPluginHttp {
  constructor(cwd:string,host:TavernPluginHost,assetsCwd=cwd){this.cwd=cwd;this.host=host;this.assetsCwd=assetsCwd;this.store=new TavernPluginStore(cwd);const network=join(cwd,".liyuan-tavern-plugins/network.json");const proxy=process.env.LIYUAN_TAVERN_GIT_PROXY??(existsSync(network)?(()=>{const stat=lstatSync(network);if(stat.isSymbolicLink()||!stat.isFile()||stat.size>4096)throw new Error("插件网络配置类型无效");return JSON.parse(readFileSync(network,"utf8")).gitProxy;})():undefined);this.sources=new TavernPluginSources(cwd,{...(typeof proxy==="string"?{proxy}:{})});}
  binding(){const ctx=this.host.context();if(this.boundSourceEntryId){const index=ctx.chat.findIndex(message=>message.__liyuanEntryId===this.boundSourceEntryId);if(index<0)throw Object.assign(new Error("待恢复插件来源不在当前分支"),{statusCode:409});ctx.chat=ctx.chat.slice(0,index+1);ctx.sourceEntryId=this.boundSourceEntryId;ctx.visibleEntryIds=ctx.visibleEntryIds.slice(0,ctx.visibleEntryIds.indexOf(this.boundSourceEntryId)+1);}return {...ctx,scopeKey:tavernPluginScope(ctx)};}
   assertBinding(scope:string,source:string){const ctx=this.binding(),head=this.mvuRecovery?this.host.context():undefined;if(ctx.scopeKey!==scope||ctx.sourceEntryId!==source||head&&(tavernPluginScope(head)!==this.mvuRecovery!.head.scopeKey||head.sourceEntryId!==this.mvuRecovery!.head.sourceEntryId))throw Object.assign(new Error("会话、角色卡或分支已变化，迟到插件操作未执行"),{statusCode:409});return ctx;}
- private asset(path:string){
+ private assetBytes(path:string){
   const match=path.match(/^\/tavern-compat\/scripts\/extensions\/third-party\/(JS-Slash-Runner|ST-Prompt-Template)\/(.+)$/);
   if(!match)return null;const plugin=match[1]==="JS-Slash-Runner"?"helper":"template";
   const relative=match[2];if(relative.includes("\\")||relative.split("/").some(x=>!x||x==="."||x===".."||x.startsWith(".")))throw new Error("非法插件文件路径");
-  if(this.candidate?.id===plugin){const found=this.candidate.files.find(f=>f.path===relative);if(!found)return null;const file=join(this.candidate.root,relative);if(createHash("sha256").update(readFileSync(file)).digest("hex")!==found.sha256)throw new Error("候选原文件完整性校验失败");return file;}
-  return this.sources.resolveAsset(plugin,relative)??this.fallbackSources?.resolveAsset(plugin,relative)??null;
+  if(this.candidate?.id===plugin)return readTavernCandidateAsset(this.candidate,relative);
+  return this.sources.readAsset(plugin,relative)??this.fallbackSources?.readAsset(plugin,relative)??null;
  }
+ private asset(path:string){return this.assetBytes(path)?.path??null;}
  resolveOriginalAsset(path:string){return this.asset(path);}
- private sendFile(res:ServerResponse,path:string){const type=({".js":"text/javascript; charset=utf-8",".mjs":"text/javascript; charset=utf-8",".css":"text/css; charset=utf-8",".html":"text/html; charset=utf-8",".json":"application/json",".svg":"image/svg+xml",".ttf":"font/ttf"} as Record<string,string>)[extname(path)]??"application/octet-stream";res.writeHead(200,{"content-type":type,"cache-control":"no-store","x-content-type-options":"nosniff"});res.end(readFileSync(path));}
+ private sendFile(res:ServerResponse,path:string,bytes?:Buffer){const type=({".js":"text/javascript; charset=utf-8",".mjs":"text/javascript; charset=utf-8",".css":"text/css; charset=utf-8",".html":"text/html; charset=utf-8",".json":"application/json",".svg":"image/svg+xml",".ttf":"font/ttf"} as Record<string,string>)[extname(path)]??"application/octet-stream";res.writeHead(200,{"content-type":type,"cache-control":"no-store","x-content-type-options":"nosniff"});res.end(bytes??readFileSync(path));}
  async handle(req:IncomingMessage,res:ServerResponse):Promise<boolean>{
   const raw=new URL(req.url??"/","http://localhost");const path=raw.pathname==="/version"?"/api/tavern-plugins/legacy/version":raw.pathname.startsWith("/scripts/extensions/third-party/JS-Slash-Runner/")?"/tavern-compat"+raw.pathname:raw.pathname;if(!path.startsWith("/api/tavern-plugins/")&&!path.startsWith("/tavern-compat/"))return false;
   try{
@@ -98,8 +100,8 @@ export class TavernPluginHttp {
     if(names){res.writeHead(200,{"content-type":"text/javascript; charset=utf-8","cache-control":"no-store"});res.end(`const H=globalThis.LiyuanTavern;\n${names.map(name=>`export const ${name}=H.resolve(${JSON.stringify(module)},${JSON.stringify(name)});`).join("\n")}`);return true;}
     if(module.startsWith("/vendor/yaml/")){const rel=module.slice("/vendor/yaml/".length);if(rel.split("/").some(x=>x===".."||x.startsWith("."))||!rel.endsWith(".js"))throw new Error("非法依赖路径");const file=join(this.assetsCwd,"node_modules/yaml/browser",rel);if(!existsSync(file)){response(res,404,{error:"YAML依赖不存在"});return true;}this.sendFile(res,file);return true;}
     if(module.startsWith("/vendor/")){const file=tavernVendorAsset(this.assetsCwd,module.slice("/vendor/".length));if(!file){response(res,404,{error:"请先安装酒馆兼容依赖"});return true;}this.sendFile(res,file);return true;}
-    const upstream=this.asset(path);if(upstream){this.sendFile(res,upstream);return true;}
-    if(["/bridge.js","/host.js","/i18n.js","/settings-ui.js","/settings-host.css","/mvu-adapter.js"].includes(module)){this.sendFile(res,join(this.assetsCwd,"web/public/tavern-compat",module.slice(1)));return true;}
+    const upstream=this.assetBytes(path);if(upstream){this.sendFile(res,upstream.path,upstream.bytes);return true;}
+    if(["/bridge.js","/host.js","/host-base.js","/frontend-api.js","/i18n.js","/settings-ui.js","/settings-host.css","/mvu-adapter.js","/native-resources.js"].includes(module)){this.sendFile(res,join(this.assetsCwd,"web/public/tavern-compat",module==="/bridge.js"?"bridge-worldbooks.js":module==="/host.js"?"host-frontends.js":module==="/host-base.js"?"host-worldbooks.js":module.slice(1)));return true;}
     response(res,404,{error:"插件文件不存在或不是固定安装产物"});return true;
    }
    const route=path.slice("/api/tavern-plugins".length);
@@ -151,7 +153,16 @@ export class TavernPluginHttp {
     const extensions=JSON.parse(String(form.get("extensions")??"{}"));const saved=this.store.read(ctx);const state={...saved.state,characterExtensions:extensions};validateTavernPluginState(state,new Set([...ctx.visibleEntryIds,ctx.sourceEntryId]),new Set(Object.keys(ctx.readonlyBooks)));
     const revision=Number(req.headers["x-liyuan-tavern-revision"]);const result=this.store.save(ctx,Number.isSafeInteger(revision)?revision:saved.revision,state,()=>this.assertBinding(scope,source));response(res,200,result);return true;
    }
-   if(route.startsWith("/legacy/")){if(route==="/legacy/version"){response(res,200,{pkgVersion:"1.13.4",liyuanCompat:true});return true;}if(route==="/legacy/worldinfo/get"){const data=await body(req);const ctx=this.binding();const derived=this.store.read(ctx).state.worldbooks;const value=ctx.readonlyBooks[data.name]??derived[data.name];if(!value)throw new Error("世界书不存在");response(res,200,{entries:Object.fromEntries(value.entries.map((e:any)=>[e.uid,e]))});return true;}response(res,400,{error:"此酒馆服务器操作尚未适配，不执行生产写入"});return true;}
+   if(route==="/legacy/extensions/version"&&req.method==="POST"){
+    const scope=String(req.headers["x-liyuan-tavern-scope"]??""),source=String(req.headers["x-liyuan-tavern-source"]??"");
+    this.assertBinding(scope,source);const data=await body(req);this.assertBinding(scope,source);
+    const plugin=Object.entries(slugs).find(([,slug])=>slug===data.extensionName)?.[0] as keyof typeof slugs|undefined;
+    if(!plugin||data.global!==undefined&&data.global!==false)throw new Error("仅支持查询当前已安装的固定来源扩展");
+    const status=(this.fallbackSources?.status()??this.sources.status()).plugins.find(row=>row.id===plugin&&row.installed);
+    if(!status)throw Object.assign(new Error("该固定来源扩展尚未安装"),{statusCode:404});
+    response(res,200,{currentBranchName:"pinned",currentCommitHash:status.commit,remoteUrl:TAVERN_PLUGIN_UPSTREAMS[plugin].repository});return true;
+   }
+   if(route.startsWith("/legacy/")){if(route==="/legacy/version"){response(res,200,{pkgVersion:"1.13.4",liyuanCompat:true});return true;}if(route==="/legacy/worldinfo/get"){const data=await body(req);const ctx=this.binding();const derived=this.store.read(ctx).state.worldbooks;const value=ctx.readonlyBooks[data.name]??derived[data.name];if(!value)throw new Error("世界书不存在");response(res,200,{entries:Object.fromEntries(value.entries.map((e:any)=>[e.entryKey??e.uid,e]))});return true;}response(res,400,{error:"此酒馆服务器操作尚未适配，不执行生产写入"});return true;}
    if(route==="/config"&&req.method==="PUT"){if(this.host.isStreaming())throw new Error("生成期间不能切换插件；请结束后重试");const data=await body(req);const result=this.sources.configure(id(data.id),{...(typeof data.enabled==="boolean"?{enabled:data.enabled}:{}),...(typeof data.autoUpdate==="boolean"?{autoUpdate:data.autoUpdate}:{})});await this.onChanged?.();response(res,200,result);return true;}
    if(["/install","/check","/update","/rollback"].includes(route)&&req.method==="POST"){const data=await body(req);const plugin=id(data.id);const activeBefore=JSON.stringify(this.sources.status().plugins.map(p=>[p.id,p.commit,p.sha256]));if(route!=="/check")await ensureTavernPluginVendors(this.cwd,{proxy:process.env.LIYUAN_TAVERN_GIT_PROXY??(existsSync(join(this.cwd,".liyuan-tavern-plugins/network.json"))?JSON.parse(readFileSync(join(this.cwd,".liyuan-tavern-plugins/network.json"),"utf8")).gitProxy:undefined)});const value=route==="/install"?await this.sources.install(plugin):route==="/check"?await this.sources.checkUpdate(plugin):route==="/update"?await this.sources.update(plugin):await this.sources.rollback(plugin);if(route!=="/check"&&JSON.stringify(this.sources.status().plugins.map(p=>[p.id,p.commit,p.sha256]))!==activeBefore)await this.onChanged?.();response(res,200,value);return true;}
    const internal=req.headers["x-liyuan-tavern-host"]===this.internalToken;
@@ -195,7 +206,7 @@ export class TavernPluginHttp {
       if(!internal||entryPhase!=="after"||this.internalPhase!==entryPhase||!status.enabled||!status.installed||settings?.更新方式!=="额外模型解析"||settings?.额外模型解析配置?.模型来源!=="自定义")throw Error("自定义模型请求仅允许当前MVU额外解析的受信任拍后任务");
       const config=settings.额外模型解析配置;if(config.模型名称!==data.model||managedMvuEndpoint(config.api地址)!==managedMvuEndpoint(data.reverse_proxy)||config.密钥)throw Error("MVU请求与当前设置不匹配或包含非受管鉴权");
      };
-     mvuGuard();tavernSampler(data,8192);let claimed=false;const claimRequest=()=>{mvuGuard();if(claimed)throw Error("脚本模型请求不能重复计费");this.store.claimModelRequest(ctx,8,mvuGuard);claimed=true;};
+     mvuGuard();tavernSampler(data,8192);let claimed=false;const claimRequest=()=>{mvuGuard();if(claimed)throw Error("脚本模型请求不能重复计费");this.store.recordModelRequest(ctx,mvuGuard);claimed=true;};
      // Never refund automatically: even a cancelled/network-failed attempt may already have been billed.
      if(!this.host.generateManagesBudget)claimRequest();
      const content=await this.host.generate(data.messages,signal,{purpose:custom?"mvu.parse":"tavern-helper",payload:data,scope:{sessionId:ctx.sessionId,card:ctx.card??""},sourceEntryId:ctx.sourceEntryId,validateBinding:mvuGuard,claimRequest});mvuGuard();

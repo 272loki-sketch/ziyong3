@@ -10,9 +10,10 @@ import { chromium } from 'playwright';
 
 const root = resolve(new URL('../..', import.meta.url).pathname);
 
-test('MVU settings: native readiness precedes iframe load, rejects stale/foreign messages, and rewrites model discovery', { timeout: 60_000 }, async () => {
+test('MVU settings: native readiness precedes iframe load, rejects stale/foreign messages, and rewrites model discovery', { timeout: 60_000 }, async t => {
  let server, browser;
  const errors = [], requests = [], pendingResources = new Set();
+ t.signal.addEventListener('abort',()=>{for(const res of pendingResources)res.destroy();server?.closeAllConnections?.();void browser?.close();},{once:true});
  const context = { scopeKey: 'synthetic-scope', sourceEntryId: 'synthetic-round', sessionId: 'synthetic-session', plugins: [{ id: 'helper', enabled: true, version: 'synthetic' }], mvu: { enabled: true, installed: true, model: { id: 'managed-synthetic-model' } } };
  try {
   const bundle = await build({
@@ -20,9 +21,10 @@ test('MVU settings: native readiness precedes iframe load, rejects stale/foreign
    bundle: true, format: 'esm', jsx: 'automatic', write: false, loader: { '.css': 'empty' }, logLevel: 'silent',
   });
   const modules = {
-   '/tavern-compat/bridge.js': `export const host={context:null,errors:[],chat:[],metadata:{},displayProjection:0,characters:[],async request(){return ${JSON.stringify(context)}},async bind(value){this.context=value},async flush(){},async save(){}};export const event_types={};export const eventSource={listeners:new Map(),makeFirst(){},async emit(){}};`,
+   '/tavern-compat/bridge.js': `export const host={context:null,errors:[],chat:[],metadata:{},displayProjection:0,characters:[],async request(){return ${JSON.stringify(context)}},async bind(value){this.context=value},async flush(){},async save(){}};export const event_types={};export const eventSource={listeners:new Map(),makeFirst(){},on(){},async emit(){}};`,
    '/tavern-compat/i18n.js': 'export async function loadPluginLocales(){}',
-   '/tavern-compat/settings-ui.js': 'export function installSettingsUI(){return {refresh(){},mvuReady(){return window.__settingsReady===true}}}',
+   '/tavern-compat/native-resources.js': 'export function installNativeResources(){}',
+   '/tavern-compat/settings-ui.js': 'export async function ensureManagerWorker(){return false;}export function installSettingsUI(){return {refresh(){},mvuReady(){return window.__settingsReady===true}}}',
    '/tavern-compat/vendor/yaml/index.js': 'export const synthetic=true;',
    '/tavern-compat/scripts/extensions/third-party/JS-Slash-Runner/dist/index.js': `window.TavernHelper={getScriptTrees:({type})=>type==='global'?[{type:'script',enabled:true,content:'MagVarUpdate'}]:[],async waitGlobalInitialized(){}};window.Mvu={parseMessage(){}};window.__bootstrapReady=true;`,
    '/tavern-compat/scripts/extensions/third-party/JS-Slash-Runner/dist/index.css': '',
@@ -66,7 +68,7 @@ test('MVU settings: native readiness precedes iframe load, rejects stale/foreign
   const iframe = page.locator('.tavern-plugin-frame-wrap iframe');
   const currentFrame = async () => { const handle = await iframe.elementHandle(); return handle.contentFrame(); };
   let frame = await currentFrame();
-  await frame.waitForFunction(() => window.__bootstrapReady);
+  try { await frame.waitForFunction(() => window.__bootstrapReady); } catch (error) { console.error("MVU_BOOT_DIAGNOSTICS", JSON.stringify({ errors, status: await frame.locator("#status").textContent(), source: await iframe.getAttribute("src") })); throw error; }
   const assertLoading = async () => {
    assert.equal(await iframe.evaluate(node => node.inert), true);
    assert.equal(await iframe.getAttribute('aria-hidden'), 'true');
@@ -128,9 +130,9 @@ test('MVU settings: native readiness precedes iframe load, rejects stale/foreign
   assert.equal(requests.length, 2);
   assert.deepEqual(await frame.evaluate(() => window.__nativeRequests.map(request => request.credentials)), [null, null], 'host must not inject fetch credentials');
   assert.deepEqual(errors, []);
- } finally {
-  await browser?.close();
+ } catch(error) { console.error('SYNTHETIC SETTINGS DIAGNOSTIC',error.message,JSON.stringify({errors,requests:requests.length,pending:pendingResources.size}));throw error; } finally {
   for (const res of pendingResources) res.destroy();
+  await browser?.close();
   if (server?.listening) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
  }
 });

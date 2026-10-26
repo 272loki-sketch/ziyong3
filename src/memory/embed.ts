@@ -76,7 +76,14 @@ function normalizeBaseUrl(baseUrl: string): string {
 export async function embedTextsCloud(
 	texts: string[],
 	cloud: MemoryCloudEmbed,
- observe?: {onPayload?:(payload:unknown)=>void;onUsage?:(usage:Record<string,unknown>)=>void},
+ observe?: {
+		onPayload?: (payload: unknown) => void;
+		onUsage?: (usage: Record<string, unknown>) => void;
+		signal?: AbortSignal;
+		/** Optional stricter plot-index transport; legacy memory callers retain compatibility. */
+		strict?: boolean;
+		maxResponseBytes?: number;
+	},
 ): Promise<number[][]> {
 	const inputs = texts.map((t) => t.trim()).filter(Boolean);
 	if (!inputs.length) return [];
@@ -95,10 +102,27 @@ export async function embedTextsCloud(
 			"content-type": "application/json",
 			authorization: `Bearer ${key}`,
 		},
-		signal: AbortSignal.timeout(30_000),
+		signal: observe?.signal ? AbortSignal.any([observe.signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
 		body:JSON.stringify(payload),
 	});
-	const raw = await res.text();
+	let raw: string;
+	if (observe?.maxResponseBytes && res.body) {
+		const reader = res.body.getReader(), chunks: Uint8Array[] = [];
+		let total = 0;
+		try {
+			while (true) {
+				const part = await reader.read();
+				if (part.done) break;
+				total += part.value.byteLength;
+				if (total > observe.maxResponseBytes) {
+					await reader.cancel();
+					throw Error("云端 embedding：响应超过安全预算");
+				}
+				chunks.push(part.value);
+			}
+		} finally { reader.releaseLock(); }
+		raw = Buffer.concat(chunks).toString("utf8");
+	} else raw = await res.text();
 	if (!res.ok) {
 		throw new Error(`云端 embedding HTTP ${res.status}：${raw.slice(0, 240)}`);
 	}
@@ -111,6 +135,14 @@ export async function embedTextsCloud(
 	if(data.usage&&typeof data.usage==="object")observe?.onUsage?.(data.usage);
  const rows = Array.isArray(data.data) ? data.data : [];
 	if (!rows.length) throw new Error("云端 embedding：空 data");
+	if (observe?.strict) {
+		const indexed = rows.filter(row => row.index !== undefined);
+		if (indexed.length && (indexed.length !== rows.length || new Set(indexed.map(row => row.index)).size !== inputs.length || indexed.some(row => !Number.isInteger(row.index) || row.index! < 0 || row.index! >= inputs.length)))
+			throw Error("云端 embedding：index缺失、重复或越界");
+		const dim = rows[0]?.embedding?.length ?? 0;
+		if (dim < 2 || dim > 16384 || rows.some(row => !Array.isArray(row.embedding) || row.embedding.length !== dim || row.embedding.some(n => typeof n !== "number" || !Number.isFinite(n)) || !row.embedding.some(n => n !== 0)))
+			throw Error("云端 embedding：向量数值或维度无效");
+	}
 	// 按 index 排序（若有）
 	rows.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 	const out: number[][] = [];

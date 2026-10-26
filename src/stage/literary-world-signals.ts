@@ -11,16 +11,29 @@ export interface CrossDomainSignal {
 }
 
 export function ecologySignalsForWorld(ecology: LiteraryEcologyState): CrossDomainSignal[] {
-	return ecology.occurrences.filter((item) => (item.status === "active" || item.status === "scheduled") && (item.visibility !== "secret" || item.publicSurface?.publicity === "trace" || item.publicSurface?.publicity === "public")).slice(0, 20).map((item) => {
+	return ecology.occurrences.flatMap((item): CrossDomainSignal[] => {
 		const surface = item.publicSurface;
-		const summary = surface?.publicity === "trace"
-			? `${item.name}@${item.location || "地点未定"}：${surface.trace}`
-			: surface?.publicity === "public"
-				? `${surface.headline || item.name}@${item.location || "地点未定"}：${surface.summary || surface.trace}`
-				: `${item.name}@${item.location || "地点未定"}：${item.development}`;
-		const visibility = surface?.publicity === "trace" || surface?.publicity === "public" ? "public" : item.visibility === "public" ? "public" : item.visibility === "secret" ? "secret" : "discoverable";
-		return { source: "ecology", sourceRound: ecology.round, ref: { domain: "ecology", recordId: item.id }, kind: surface?.publicity === "trace" ? "public-trace" : item.kind, visibility, summary };
-	});
+		const terminal = item.status === "resolved" || item.status === "expired";
+		// Match the author projection's information boundary: an explicit surface
+		// replaces internal event fields, and a private surface is never a fallback.
+		if (surface?.publicity === "private" || (!surface && item.visibility === "secret")) return [];
+		let summary: string;
+		if (surface?.publicity === "trace") {
+			if (!surface.trace.trim()) return [];
+			summary = `公开痕迹：${surface.trace}`;
+		} else if (surface?.publicity === "public") {
+			if (![surface.summary, surface.trace, surface.result].some(value => value.trim())) return [];
+			const detail = (label: string, value: string) => value ? `；${label}：${value}` : "";
+			summary = `${surface.headline || "公开消息"}［说法标记：${surface.claimStatus}；${surface.sourceType}］：${surface.summary || surface.trace}${detail("公开结果", surface.result)}${detail("受众", surface.audience.join("、"))}${detail("传播范围", surface.scope)}`;
+		} else {
+			// Bare discoverable records are ongoing leads, not public aftermath.
+			if (terminal && (item.visibility !== "public" || !item.development.trim())) return [];
+			summary = `${item.name}@${item.location || "地点未定"}：${item.development}`;
+		}
+		if (terminal) summary = `已结束事项的后果参考［${item.status}］：${summary}`;
+		const visibility = surface ? "public" : item.visibility;
+		return [{ source: "ecology", sourceRound: ecology.round, ref: { domain: "ecology", recordId: item.id }, kind: surface?.publicity === "trace" ? "public-trace" : item.kind, visibility, summary }];
+	}).slice(0, 20);
 }
 
 export function worldSignalsForEcology(world: ModularWorldState): CrossDomainSignal[] {

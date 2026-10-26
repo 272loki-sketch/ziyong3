@@ -122,7 +122,14 @@ export async function probeDatabasePluginModels(cwd: string,payload:Record<strin
 }
 export function validateDatabasePluginChatPayload(payload:Record<string,any>):void {
  if(!Array.isArray(payload.messages)||!payload.messages.length||payload.messages.length>100||payload.messages.some((m:any)=>!["system","user","assistant","tool"].includes(m?.role)||typeof m.content!=="string"&&m.content!==null))throw new Error("无效数据库模型消息");
- if(payload.messages.reduce((n:number,m:any)=>n+String(m.content??"").length,0)>240000)throw new Error("数据库模型材料过大");
+  const sizes=payload.messages.map((m:any)=>String(m.content??"").length);
+  const total=sizes.reduce((n:number,size:number)=>n+size,0);
+  if(total>240000){
+   // Counts only: rejected requests never reach SDK observation and may contain private material.
+   const roles=["system","user","assistant","tool"].map(role=>`${role}=${payload.messages.reduce((n:number,m:any,i:number)=>n+(m.role===role?sizes[i]:0),0)}`).join(",");
+   const largest=sizes.map((chars:number,index:number)=>({chars,index})).sort((a:any,b:any)=>b.chars-a.chars).slice(0,3).map((row:any)=>`${row.index}:${row.chars}`).join(",");
+   throw new Error(`数据库模型材料过大：${total}/240000 UTF-16字符；消息${sizes.length}条；${roles}；最大消息(index:字符)=${largest}；未发送模型`);
+  }
  if(payload.tools!==undefined&&(!Array.isArray(payload.tools)||payload.tools.length>32||payload.tools.some((t:any)=>t?.type!=="function"||typeof t.function?.name!=="string"||!t.function.parameters||typeof t.function.parameters!=="object")))throw new Error("无效数据库工具定义");
 }
 export function databasePluginChatReply(text:string,model="host-managed"):DatabasePluginChatReply {

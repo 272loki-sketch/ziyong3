@@ -453,11 +453,68 @@ export function listProfiles(cwd: string): AgentProfileListItem[] {
 	return out;
 }
 
-/** 启用仓库中的配置 → 写入当前 Agent 配置并同步 runtime */
+/** Enabling a main profile is not an instruction to disconnect other enabled APIs.
+ * Only providers explicitly present in the selected profile replace their current
+ * definitions. Unselected warehouse profiles remain disconnected.
+ */
+export function mergeEnabledAgentProfile(current: LiyuanAgentConfig, selected: LiyuanAgentConfig): LiyuanAgentConfig {
+	const incoming = normalizeAgentConfig(selected);
+	const fields = Object.fromEntries(Object.entries(incoming).filter(([, value]) => value !== undefined));
+	return normalizeAgentConfig({ ...current, ...fields, providers: { ...current.providers, ...incoming.providers } });
+}
+
+/**
+ * 渠道归属：多个渠道同时启用，但每个渠道只有一份权威定义。
+ * 仓库里有与渠道同名的配置（如渠道 `zhuzhan` ↔ 配置 `zhuzhan`）时由它独占；
+ * 没有同名配置时，包含该渠道的配置共同拥有。
+ * 别的配置里夹带的同名渠道只是旧副本（例如以完整运行配置为底保存时被带进去的），
+ * 不得在启用时覆盖归属配置的最新定义——否则已删掉的模型会"复活"，
+ * 改过的渠道会被旧副本悄悄还原。
+ */
+export function providerOwners(cwd: string, providerName: string): string[] {
+	const dir = profilesDir(cwd);
+	if (!existsSync(dir)) return [];
+	const ids = readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => f.replace(/\.json$/i, ""));
+	if (ids.includes(providerName) && loadProfile(cwd, providerName)?.config.providers[providerName]) return [providerName];
+	return ids.filter((id) => loadProfile(cwd, id)?.config.providers[providerName] !== undefined);
+}
+
+/** 配置自有的渠道：去掉归属其它配置的旧副本；新渠道（尚无归属）算作自有。 */
+export function ownedProfileProviders(cwd: string, id: string, config: LiyuanAgentConfig): Record<string, AgentProvider> {
+	const out: Record<string, AgentProvider> = {};
+	for (const [name, provider] of Object.entries(config.providers)) {
+		const owners = providerOwners(cwd, name);
+		if (owners.length === 0 || owners.includes(id)) out[name] = provider;
+	}
+	return out;
+}
+
+/**
+ * 运行配置里某渠道定义发生变化时，写回它的归属配置，使仓库与运行一致。
+ * 只回写变化的渠道；运行配置里移除的渠道不删除仓库副本（断开连接不等于删除配置）。
+ */
+export function syncLiveProvidersToProfiles(cwd: string, before: LiyuanAgentConfig, after: LiyuanAgentConfig): void {
+	for (const [name, provider] of Object.entries(after.providers)) {
+		if (JSON.stringify(before.providers[name]) === JSON.stringify(provider)) continue;
+		for (const owner of providerOwners(cwd, name)) {
+			const rec = loadProfile(cwd, owner);
+			if (!rec || JSON.stringify(rec.config.providers[name]) === JSON.stringify(provider)) continue;
+			writeJsonBackup(profilePath(cwd, owner), {
+				id: rec.id,
+				name: rec.name,
+				updatedAt: Date.now(),
+				config: normalizeAgentConfig({ ...rec.config, providers: { ...rec.config.providers, [name]: provider } }),
+			});
+		}
+	}
+}
+
+/** 启用仓库中的配置 → 写入当前 Agent 配置并同步 runtime（只带入该配置自有的渠道） */
 export function enableProfile(cwd: string, agentDir: string, id: string): LiyuanAgentConfig {
 	const rec = loadProfile(cwd, id);
 	if (!rec) throw new Error(`配置不存在：${id}`);
-	const config = normalizeAgentConfig(rec.config);
+	const owned = ownedProfileProviders(cwd, id, rec.config);
+	const config = mergeEnabledAgentProfile(loadAgentConfig(cwd).config, { ...rec.config, providers: owned });
 	materializeEnvKeysInConfig(config);
 	saveAgentConfig(cwd, config);
 	syncAgentConfigToRuntime(cwd, agentDir, config);
@@ -502,10 +559,8 @@ export function migrateActiveConfigIntoProfiles(cwd: string): { migrated: boolea
 			: ids[0]) ?? null;
 	if (active) {
 		saveActiveProfileId(cwd, active);
-		const rec = loadProfile(cwd, active);
-		if (rec) {
-			saveAgentConfig(cwd, rec.config);
-		}
+		// Seeding the warehouse is not activation: retain all currently enabled
+		// providers and the complete live configuration exactly as supplied.
 	}
 	return { migrated: true, ids };
 }

@@ -39,3 +39,13 @@ export function initialStateFromGreeting(text: string): WorldState | null {
 		plot_threads: [],
 	};
 }
+
+/** Model/thinking settings do not constitute a story-branch change for an opening UI. */
+export function greetingBranchLeaf(branch: ReadonlyArray<{ id?: unknown; type?: unknown }>): string | null {
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type === "model_change" || entry.type === "thinking_level_change") continue;
+		return typeof entry.id === "string" ? entry.id : null;
+	}
+	return null;
+}

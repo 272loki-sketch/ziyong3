@@ -35,43 +35,59 @@ type WorldProfileResponse = {
 	profile: CardWorldProfile | null;
 	card: { key: string; name: string };
 	materialsChanged: boolean;
+	analyzing?: boolean;
+	configuredModel?: { provider: string; id: string } | null;
 };
 
 export function WorldProfileSection({ enabled, toast }: { enabled: boolean; toast: (level: "info" | "warning" | "error", text: string) => void }) {
-	const { data, error, loading, reload } = usePanelData(() => apiGet<WorldProfileResponse>("/api/world-profile"), { cacheKey: "/api/world-profile" });
+	const { data, error, loading, reload } = usePanelData(() => apiGet<WorldProfileResponse>("/api/world-profile"), { cacheKey: "/api/world-profile", watchAgent: true });
 	const { busy, run } = useAction(toast);
 	const [actionError, setActionError] = useState("");
+	const [analyzing, setAnalyzing] = useState(false);
+	const [actionStatus, setActionStatus] = useState("");
+	useEffect(() => { setActionError(""); setActionStatus(""); }, [data?.card.key]);
 	const [requirements, setRequirements] = useState("");
 	const [notes, setNotes] = useState("");
 	useEffect(() => {
+		if (!data?.analyzing || analyzing) return;
+		const timer = window.setTimeout(reload, 1500);
+		return () => window.clearTimeout(timer);
+	}, [data, analyzing, reload]);
+	useEffect(() => {
 		setRequirements(data?.profile?.userRequirements.join("\n") ?? "");
 		setNotes(data?.profile?.optimizationNotes.join("\n") ?? "");
-	}, [data]);
+	}, [data?.card.key, data?.profile?.revision]);
 	const save = (patch: Record<string, unknown>, done: string) => run(async () => {
 		await apiPut("/api/world-profile", patch);
 		reload();
 	}, done);
 	const analyze = () => run(async () => {
 		setActionError("");
+		setActionStatus("");
+		setAnalyzing(true);
 		try {
-			await apiPost("/api/world-profile/analyze", {});
+			const result = await apiPost<{ profile: CardWorldProfile; manifestApplied: boolean; note?: string }>("/api/world-profile/analyze", {});
+			setActionStatus(result.manifestApplied ? `画像 v${result.profile.revision} 已生成并用于当前分支，已有剧情和世界状态保留。` : result.note ?? "画像已保存，当前分支未改变。");
 			reload();
 		} catch (cause) {
 			const message = cause instanceof Error ? cause.message : String(cause);
 			setActionError(message);
 			throw cause;
-		}
+		} finally { setAnalyzing(false); }
 	}, "已按当前素材与优化记录生成角色卡世界画像");
 	const clearModule = (moduleId: string) => run(async () => {
 		await api(`/api/world-state/module?moduleId=${encodeURIComponent(moduleId)}`, { method: "DELETE" });
 	}, `已清空模块 ${moduleId} 的当前分支运行态`);
 	return <section className="sp-section">
 		<h4>角色卡世界适配</h4>
+		{data?.configuredModel && <div className="field-hint">画像岗位：{data.configuredModel.provider} / {data.configuredModel.id}。模型失效时请在下方“模型插头 → 角色卡世界画像”选择可用模型并保存。</div>}
 		<PanelStatus loading={loading} error={error} hasData={!!data} />
-		{actionError && <div className="panel-error">{actionError}</div>}
+		{actionError && <div className="panel-error" role="alert">{actionError}</div>}
+		{actionStatus && <div className="field-hint" role="status">{actionStatus}</div>}
+		{(analyzing || data?.analyzing) && <div className="field-hint" role="status">正在分析角色卡与启用资料，请稍候；完成后会保存画像，不会重新生成剧情。</div>}
 		{data && !data.profile && <>
-			<div className="field-hint">「{data.card.name}」尚未建立独立世界画像。首次开演会自动分析，也可以现在生成。</div>
-			<button className="drawer-btn primary" disabled={busy || !enabled} onClick={() => void analyze()}>分析这张卡</button>
+			<div className="field-hint">「{data.card.name}」尚无可用世界画像。{enabled ? "首次正文完成后会在后台建立适配，也可以现在分析。" : "世界推演当前未启用；可以手动分析，但不会自动开启推演。"}</div>
+			<button className="drawer-btn primary" disabled={busy || data.analyzing} onClick={() => void analyze()}>{analyzing ? "正在分析…" : "分析这张卡"}</button>
 		</>}
 		{data?.profile && <>
 			<div className="field-hint">{data.profile.digest}</div>
@@ -94,7 +110,7 @@ export function WorldProfileSection({ enabled, toast }: { enabled: boolean; toas
 				</div>)}
 			</div>
 			{data.profile.unresolvedQuestions.length > 0 && <details><summary>待确认问题（{data.profile.unresolvedQuestions.length}）</summary><ul>{data.profile.unresolvedQuestions.map((item) => <li key={item}>{item}</li>)}</ul></details>}
-			<button className="drawer-btn primary" disabled={busy || !enabled} onClick={() => void analyze()}>重新分析适配</button>
+			<button className="drawer-btn primary" disabled={busy || data.analyzing} onClick={() => void analyze()}>{analyzing ? "正在分析…" : "重新分析适配"}</button>
 		</>}
 	</section>;
 }

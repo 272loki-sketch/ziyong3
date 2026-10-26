@@ -2,12 +2,12 @@
  * 三档程序卡运行时垫片（对照酒馆助手 JS-Slash-Runner 公开调用面的最小子集）。
  *
  * 设计纪律（docs card-frontend §6/§8）：
- * - 读族/存在性：先给桩，保证卡初始化不炸
- * - 生成族 / 斜杠：可接到梨园聊天总线（App 注册 bridge）
+ * - 读族/存在性：只投影已绑定来源，不伪装完整原助手
+ * - 斜杠输入：接到梨园聊天总线；模型生成仍由原助手处理
  * - 写正文：不提供
  *
  * 卡实际调用面：
- * - parent.TavernHelper.generate / stopAllGeneration
+ * - 原助手未就绪时 generate / stopAllGeneration 明确拒绝
  * - triggerSlash(`/send …|/trigger`)  ← 某卡 开场表单
  * - eventOn / eventEmit
  * - parent.TheaterAPI / handleTheaterAction
@@ -22,10 +22,12 @@ export type TavernGenerateParams = {
 
 /** App 注册：把卡侧 slash / generate 接到输入框与 WS prompt */
 export type TavernChatBridge = {
+	/** Current composer text for source-bound native /trigger; never a story/history write. */
+	getInput?: () => string;
 	/** 只填输入框，不发送 */
 	setInput: (text: string) => void;
 	/** 作为用户消息发送并触发生成（空串 = 发送当前输入框内容） */
-	sendPrompt: (text: string) => void;
+	sendPrompt: (text: string) => void | { accepted: boolean; reason?: string };
 	/** 可选：执行梨园斜杠命令原文（如 /rewind） */
 	runCommand?: (text: string) => void;
 	/** 把程序卡 toastr 通知映射到梨园 toast */
@@ -46,7 +48,11 @@ export type TavernWorldbookEntry = {
 	[k: string]: unknown;
 };
 
-type TavernWorldbookResponse = { name: string; path: string; entries: TavernWorldbookEntry[] };
+type TavernWorldbookBinding = {
+	name: string; source: "card" | "file" | "agent"; path: string; cardIdentity: string; revision: string; sessionId?: string;
+};
+type TavernWorldbookResponse = TavernWorldbookBinding & { entries: TavernWorldbookEntry[] };
+const worldbookBindings = new WeakMap<TavernWorldbookEntry[], TavernWorldbookBinding>();
 
 async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
 	const res = await fetch(path, {
@@ -59,41 +65,40 @@ async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 /**
- * 当前挂载书名。酒馆公开 API 是同步函数，程序卡普遍直接读取 `.primary`，故这里使用
+ * 当前卡内书及挂载书名。酒馆公开 API 是同步函数，程序卡普遍直接读取 `.primary`，故这里使用
  * 同源同步 XHR；只取极小的书名清单，不读取正文。世界书正文与写入仍走异步 fetch。
  */
 export function getCharWorldbookNames(_scope?: string): { primary: string | null; additional: string[] } {
-    try {
-        const native=readNativeTavernRaw();const books=native.readonlyBooks??{};
-        const primary=native.character?.data?.extensions?.world??Object.keys(books)[0];
-        if(typeof primary==="string"&&Object.hasOwn(books,primary))return {primary,additional:Object.keys(books).filter(name=>name!==primary)};
-    }catch{ /* native plugin unavailable: preserve the mounted-book legacy seam */ }
 	const xhr = new XMLHttpRequest();
-	xhr.open("GET", "/api/lorebooks", false);
+	xhr.open("GET", "/api/tavern/worldbooks", false);
 	xhr.send();
-	if (xhr.status < 200 || xhr.status >= 300) throw new Error(`读取挂载世界书失败：HTTP ${xhr.status}`);
-	const data = JSON.parse(xhr.responseText || "{}") as { active?: string[] };
-	const paths = Array.isArray(data.active) ? data.active : [];
-	const names = paths.map((p) => p.split(/[\\/]/).pop()?.replace(/\.json$/i, "") || p);
-	return { primary: names[0] ?? null, additional: names.slice(1) };
+	if (xhr.status < 200 || xhr.status >= 300) throw new Error(`读取世界书名称失败：HTTP ${xhr.status}`);
+	return JSON.parse(xhr.responseText || "{}") as { primary: string | null; additional: string[] };
 }
 
 export async function getWorldbook(name?: string): Promise<TavernWorldbookEntry[]> {
-    try {
-        const native=await apiJson<{readonlyBooks:Record<string,{entries:TavernWorldbookEntry[]}>;character?:{data?:{extensions?:{world?:string}}}}>("/api/tavern-plugins/context");
-        const books=native.readonlyBooks??{},key=name??native.character?.data?.extensions?.world??Object.keys(books)[0];
-        if(key&&Object.hasOwn(books,key))return books[key].entries.map(entry=>({...entry,name:entry.name||entry.comment||String(entry.uid),enabled:entry.enabled??!entry.disable}));
-    }catch{ /* fall back to the existing mounted-worldbook REST API */ }
 	const q = name ? `?name=${encodeURIComponent(name)}` : "";
 	const data = await apiJson<TavernWorldbookResponse>(`/api/tavern/worldbook${q}`);
-	return data.entries;
+	const { name: resolvedName, source, path, cardIdentity, revision, sessionId } = data;
+	const binding: TavernWorldbookBinding = Object.freeze({ name: name ?? resolvedName, source, path, cardIdentity, revision, ...(sessionId ? { sessionId } : {}) });
+	// 可枚举的来源随卡作者的 {...entry}/for-in 克隆保留，不以可能重复的 uid 或正文寻址。
+	const entries = data.entries.map(entry => ({ ...entry, __liyuanWorldbook: binding }));
+	worldbookBindings.set(entries, binding);
+	return entries;
 }
 
 export async function replaceWorldbook(name: string, entries: TavernWorldbookEntry[]): Promise<void> {
-	await apiJson("/api/tavern/worldbook", {
+	const binding = worldbookBindings.get(entries) ?? entries[0]?.__liyuanWorldbook as TavernWorldbookBinding | undefined;
+	if (!binding || binding.name !== name || entries.some(entry => JSON.stringify(entry.__liyuanWorldbook) !== JSON.stringify(binding)))
+		throw new Error("世界书来源不匹配，请先用 getWorldbook 读取对应世界书");
+	const result = await apiJson<{ cardIdentity: string; revision: string }>("/api/tavern/worldbook", {
 		method: "PUT",
-		body: JSON.stringify({ name, entries: entries.map((e) => ({ uid: e.uid, enabled: e.enabled })) }),
+		body: JSON.stringify({ ...binding, entries: entries.map(e => ({ uid: e.uid, enabled: e.enabled, entryKey: e.entryKey, fingerprint: e.fingerprint })) }),
 	});
+	// 同一调用者可继续使用刚保存的数组；不更新其它读者的旧快照，也不在失败后自动重放。
+	const saved = Object.freeze({ ...binding, cardIdentity: result.cardIdentity, revision: result.revision });
+	for (const entry of entries) entry.__liyuanWorldbook = saved;
+	worldbookBindings.set(entries, saved);
 }
 
 /** Real opening snapshot: indices are zero-based; no fake "always 0" read. */
@@ -137,7 +142,8 @@ export function openingChatMessages(context:TavernGreetingContext,range:number|s
 export function getChatMessages(range:number|string=0,options?:{include_swipes?:boolean}) { return openingChatMessages(readTavernGreeting(),range,options); }
 export async function selectTavernGreeting(index:number,expected:TavernGreetingBinding):Promise<TavernGreetingContext> {
  if(!Number.isInteger(index)||index<0)throw new Error("开场白序号无效");
- const result=await apiJson<{context:TavernGreetingContext}>("/api/tavern/greeting-select",{method:"POST",body:JSON.stringify({index,expected})});
+ const binding:TavernGreetingBinding={sessionId:expected.sessionId,card:expected.card,leafId:expected.leafId,greetingIndex:expected.greetingIndex};
+ const result=await apiJson<{context:TavernGreetingContext}>("/api/tavern/greeting-select",{method:"POST",body:JSON.stringify({index,expected:binding})});
  if(!result.context||result.context.sessionId!==expected.sessionId||result.context.card!==expected.card||result.context.greetingIndex!==index)throw new Error("开场切换未确认，请刷新后核对");
  return result.context;
 }
@@ -151,9 +157,14 @@ export async function setChatMessages(updates:TavernOpeningUpdate[],_options?:{r
  const index=openingIndex(updates);if(index===undefined)return;
  await selectTavernGreeting(index,readTavernGreeting());
 }
-export async function setChatMessage(_text:string,messageId:number|string,options?:{swipe_id?:number}):Promise<void> {
- if(Number(messageId)!==0||!Number.isInteger(options?.swipe_id)||_text.trim())throw new Error("梨园仅支持程序卡切换第0楼已有开场白，不支持正文改写");
- await setChatMessages([{message_id:0,swipe_id:options!.swipe_id}]);
+export async function setChatMessage(text:string,messageId:number|string,options?:{swipe_id?:number}):Promise<void> {
+ const index=options?.swipe_id;
+ if(Number(messageId)!==0||typeof index!=="number"||!Number.isInteger(index)||index<0||typeof text!=="string")throw new Error("梨园仅支持程序卡切换第0楼已有开场白，不支持正文改写");
+ const context=readTavernGreeting();
+ // Some cards pass the existing swipe's exact text as well as its index. It is an
+ // identity check only: the server still receives index+binding, never replacement text.
+ if(text.trim()&&text!==context.greetings[index])throw new Error("只能选择对应已有开场白，不能改写正文");
+ await selectTavernGreeting(index,context);
 }
 
 type BusMap = Map<string, Set<(...args: unknown[]) => void>>;
@@ -274,7 +285,8 @@ export function executeTriggerSlash(
 		// /send X|/trigger → 直接发 X 并生成；仅 /trigger → 发当前输入框
 		const text = pendingSend;
 		try {
-			bridge.sendPrompt(text);
+			const result = bridge.sendPrompt(text);
+			if (result && !result.accepted) return { ok: false, error: result.reason || "输入未被接收，草稿仍保留" };
 			return { ok: true, text, triggered: true };
 		} catch (e) {
 			return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -292,6 +304,38 @@ export function executeTriggerSlash(
 	}
 
 	return { ok: true };
+}
+
+/** Native helper UI commands use the existing composer, never arbitrary story/system commands. */
+export function executeNativeFrontendSlash(raw: string): SlashExecResult {
+ if (typeof raw !== "string" || !raw.trim() || raw.length > 256_000) return { ok: false, error: "前端命令为空或超出输入长度限制" };
+ const parts = parseSlashPipeline(raw);
+ if (!parts.length || parts.length > 32) return { ok: false, error: "前端命令管道无效或过长" };
+ const commands: string[] = [];
+ let fills = 0, triggers = 0;
+ for (const part of parts) {
+  if (/^\/trigger\s*$/i.test(part)) { triggers++; commands.push("/trigger"); }
+  else {
+   const match = part.match(/^\/(send|setinput)(?:\s+([\s\S]*))?$/i);
+   if (!match || /^\s*(?:name|role|as)=/i.test(match[2] ?? "")) return { ok: false, error: "此原前端仅支持 /send、/setinput 与 /trigger，不执行改写故事或系统命令" };
+   fills++; commands.push("/send " + (match[2] ?? ""));
+  }
+ }
+ if (fills > 1 || triggers > 1 || triggers && commands.at(-1) !== "/trigger") return { ok: false, error: "仅允许一次填入和末尾一次触发，不重复提交输入" };
+ if (!triggers && !commands[0].slice(6).trim()) {
+  if (!chatBridge) return { ok: false, error: "聊天桥未就绪" };
+  try { chatBridge.setInput(""); return { ok: true, text: "", filledOnly: true }; }
+  catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+ }
+ if (triggers) {
+  if (!chatBridge) return { ok: false, error: "聊天桥未就绪" };
+  if (!fills && !chatBridge.getInput) return { ok: false, error: "输入框读取接口尚未就绪，未提交" };
+  const input = (fills ? commands[0].slice(6) : chatBridge.getInput!()).trim();
+  if (!input) return { ok: false, error: "没有可发送的内容" };
+  if (/^\/(?!\/)/.test(input)) return { ok: false, error: "原前端不能将输入转发为故事或系统管理命令" };
+  return executeTriggerSlash("/send " + input + "|/trigger", chatBridge);
+ }
+ return executeTriggerSlash(commands.join("|"), chatBridge);
 }
 
 /** 父页全局 triggerSlash（iframe 通过 parent 或 postMessage 调用） */
@@ -354,35 +398,23 @@ export function installParentTavernShim(): void {
 		window.addEventListener("message", (ev: MessageEvent) => {
 			const d = ev.data as { liyuanTriggerSlash?: unknown } | null;
 			if (!d || typeof d.liyuanTriggerSlash !== "string") return;
+            // Opaque sandbox cards may have origin "null", but only our mounted card iframe is authorized.
+            if (ev.origin !== window.location.origin && ev.origin !== "null") return;
+            const frames = document.querySelectorAll<HTMLIFrameElement>("iframe.msg-html-frame");
+            if (![...frames].some(frame => frame.contentWindow === ev.source)) return;
 			void triggerSlash(d.liyuanTriggerSlash);
 		});
 	}
 
 	w.TavernHelper = {
         getTavernHelperVersion,getCharWorldbookNames,getWorldbook,replaceWorldbook,getLastMessageId,getChatMessages,setChatMessages,setChatMessage,
-		/**
-		 * 对照卡内：await generate({ user_input, should_stream }) → string
-		 * 已注册 bridge 时：把 user_input 当用户发言并触发生成。
-		 */
-		async generate(params) {
-			const input = String(params?.user_input ?? "").trim();
-			if (chatBridge && input) {
-				try {
-					chatBridge.sendPrompt(input);
-					return input;
-				} catch (e) {
-					console.warn("[liyuan TavernHelper.generate]", e);
-				}
-			}
-			console.warn("[liyuan TavernHelper.generate] 无 bridge 或空输入", {
-				len: input.length,
-				stream: params?.should_stream,
-			});
-			return `（梨园：界面内 AI 生成未接入聊天桥。输入：${input.slice(0, 80) || "（空）"}）`;
-		},
-		stopAllGeneration() {
-			console.warn("[liyuan TavernHelper.stopAllGeneration] no-op");
-		},
+        /** Only the original helper can return a model candidate. A composer submission is not generation. */
+        async generate() {
+            throw new Error("当前不是已就绪的原酒馆助手生成上下文；兼容桥不会伪造模型结果或把生成请求当作用户输入。请启用原酒馆助手后重新打开前端。");
+        },
+        stopAllGeneration() {
+            throw new Error("当前不是原酒馆助手生成上下文，未执行取消；请在对应原助手前端或梨园停止按钮操作。");
+        },
 	};
 
 	w.TheaterAPI = {
@@ -445,7 +477,7 @@ try{
 	/* 世界书/开场白兼容 API：脚本帧只代理父页，文件与会话主权仍在梨园。 */
 	/* getCharWorldbookNames 必须同步透传：社区程序卡直接读返回值的 .primary。 */
 	if(typeof g.getCharWorldbookNames!=="function"){
-		g.getCharWorldbookNames=function(){var p=parentWin();if(!p||typeof p.getCharWorldbookNames!=="function")return {primary:null,additional:[]};return p.getCharWorldbookNames.apply(p,arguments);};
+		g.getCharWorldbookNames=function(){readOpening();var p=parentWin();if(!p||typeof p.getCharWorldbookNames!=="function")return {primary:null,additional:[]};return p.getCharWorldbookNames.apply(p,arguments);};
 	}
 	// Each frame captures its own binding, so an old card cannot choose a new card's swipe.
  if(typeof g.getTavernHelperVersion!=="function")g.getTavernHelperVersion=function(){var p=parentWin();if(!p||typeof p.getTavernHelperVersion!=="function")throw new Error("酒馆助手尚未就绪");return p.getTavernHelperVersion();};
@@ -465,11 +497,15 @@ try{
   var index=updates[0].swipe_id;if(index===undefined){readOpening();return;}if(!Number.isInteger(index)||index<0)throw new Error("开场白序号无效");
   readOpening();var selected=await greetingApi().select(index,openingBinding);openingBinding=bindingOf(selected);
  };
- if(typeof g.setChatMessage!=="function")g.setChatMessage=function(text,id,options){if(String(text||"").trim()||Number(id)!==0||!options||!Number.isInteger(options.swipe_id))return Promise.reject(new Error("梨园仅支持切换第0楼已有开场白"));return g.setChatMessages([{message_id:0,swipe_id:options.swipe_id}]);};
+ if(typeof g.setChatMessage!=="function")g.setChatMessage=async function(text,id,options){
+  if(Number(id)!==0||!options||!Number.isInteger(options.swipe_id)||options.swipe_id<0||typeof text!=="string")throw new Error("梨园仅支持切换第0楼已有开场白，不允许正文改写");
+  var c=readOpening();if(text.trim()&&text!==c.greetings[options.swipe_id])throw new Error("只能选择对应已有开场白，不能改写正文");
+  return g.setChatMessages([{message_id:0,swipe_id:options.swipe_id}]);
+ };
  var compat=["getWorldbook","replaceWorldbook"];
 	for(var ci=0;ci<compat.length;ci++)(function(name){
 		if(typeof g[name]==="function")return;
-		g[name]=function(){var p=parentWin();if(!p||typeof p[name]!=="function")return Promise.reject(new Error("梨园兼容 API 未就绪："+name));return p[name].apply(p,arguments);};
+		g[name]=async function(){readOpening();var p=parentWin();if(!p||typeof p[name]!=="function")throw new Error("梨园兼容 API 未就绪："+name);var result=await p[name].apply(p,arguments);readOpening();return result;};
 	})(compat[ci]);
 	if(!g.toastr){
 		g.toastr={};

@@ -1,9 +1,10 @@
 /** Post-author style projection. Original author/narrative remain the sole story source. */
 import {createHash}from'node:crypto';
 import type {NpcParallelScope,NpcParallelModelRequest}from'./npc-parallel.ts';
+export interface VeridisRewriteModelRequest extends NpcParallelModelRequest {useProviderDefaultMaxTokens?:boolean}
 export const VERIDIS_REWRITE_ENTRY_TYPE='rp-veridis-rewrite';
 export const authorDraftHash=(text:string)=>createHash('sha256').update(text).digest('hex');
-export interface VeridisRewriteInput {scope:NpcParallelScope;authorDraft:string;narrative:string;signal?:AbortSignal;guard:()=>void;generate:(request:NpcParallelModelRequest,signal?:AbortSignal)=>Promise<string>}
+export interface VeridisRewriteInput {scope:NpcParallelScope;authorDraft:string;narrative:string;signal?:AbortSignal;guard:()=>void;generate:(request:VeridisRewriteModelRequest,signal?:AbortSignal)=>Promise<string>}
 export interface VeridisRewriteResult {text:string;changed:boolean;calls:number;errors:string[];version:string;commit:string;skipped?:boolean;reason?:string;hits?:number|unknown[];projectionMode?:'native'|'ai-targets-only'}
 export interface VeridisRewriteProvider {enabled():boolean;run(input:VeridisRewriteInput):Promise<VeridisRewriteResult>;claimRequest(scope:NpcParallelScope,guard:()=>void):void}
 export interface VeridisRewriteReceipt {version:1;sourceEntryId:string;authorHash:string;upstreamVersion:string;upstreamCommit:string;status:'complete'|'skipped'|'failed';changed:boolean;calls:number;text?:string;error?:string;reason?:string;hits?:number|unknown[];projectionMode?:'native'|'ai-targets-only'}

@@ -1,0 +1,1 @@
+{"version":3,"file":"observe-fetch.d.ts","sourceRoot":"../../src/utils/","sources":["observe-fetch.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,oBAAoB,EAAE,MAAM,aAAa,CAAC;AAExD,4FAA4F;AAC5F,wBAAgB,YAAY,CAAC,MAAM,EAAE,CAAC,KAAK,EAAE,oBAAoB,KAAK,IAAI,GAAG;IAAC,KAAK,EAAE,OAAO,KAAK,CAAC;IAAC,SAAS,EAAE,MAAM,IAAI,CAAA;CAAC,CAqCxH"}

@@ -125,9 +125,16 @@ function mergeConflicts(pkg: NovelPackage, prior: NovelConflict[], current: Nove
 
 export function novelPlayStateFromBranch(branch: BranchEntryLike[], binding: NovelPlayCardBinding, pkg: NovelPackage): NovelPlayRuntimeState | undefined {
 	const ids = new Set(branch.map(entry => text(entry.id)).filter(Boolean));
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index]!;
+		if (entry.type !== "custom" || entry.customType !== NOVEL_PLAY_STATE_ENTRY_TYPE) continue;
+		const raw = record(entry.data), card = record(raw?.card) as NovelPlayCardBinding | undefined;
+		const progress = validAnchor(pkg, raw?.progress), conflicts = conflictsOf(pkg, raw?.conflicts, ids), preparedFromLeafId = text(raw?.preparedFromLeafId);
+		if (raw?.version === 1 && card && sameCard(card, binding) && progress && conflicts && preparedFromLeafId && ids.has(preparedFromLeafId)) return { version: 1, card: binding, progress, conflicts, preparedFromLeafId };
+	}
 	// An upgrade keeps the old progress/conflicts valid because append-only
-	// packages inherit every old node ID. Project that state into the child
-	// revision before looking for a native child-state entry.
+	// packages inherit every old node ID. Use that state only until the child
+	// revision has its own validated progress; inheritance must not shadow it.
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const upgrade = branch[index];
 		if (upgrade.type !== "custom" || upgrade.customType !== NOVEL_PLAY_UPGRADE_ENTRY_TYPE) continue;
@@ -144,13 +151,6 @@ export function novelPlayStateFromBranch(branch: BranchEntryLike[], binding: Nov
 			});
 			return { version: 1, card: binding, progress: { packageRevision: pkg.revision, nodeId, position: progress?.position === "after" ? "after" : "before" }, conflicts: mappedConflicts, preparedFromLeafId: text(stateEntry.id) };
 		}
-	}
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index]!;
-		if (entry.type !== "custom" || entry.customType !== NOVEL_PLAY_STATE_ENTRY_TYPE) continue;
-		const raw = record(entry.data), card = record(raw?.card) as NovelPlayCardBinding | undefined;
-		const progress = validAnchor(pkg, raw?.progress), conflicts = conflictsOf(pkg, raw?.conflicts, ids), preparedFromLeafId = text(raw?.preparedFromLeafId);
-		if (raw?.version === 1 && card && sameCard(card, binding) && progress && conflicts && preparedFromLeafId && ids.has(preparedFromLeafId)) return { version: 1, card: binding, progress, conflicts, preparedFromLeafId };
 	}
 	return undefined;
 }

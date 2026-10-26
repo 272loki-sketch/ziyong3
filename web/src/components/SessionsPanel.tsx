@@ -1,3 +1,5 @@
+import { ParallelSaves } from "./ParallelSaves.tsx";
+import { scopedUrl } from "../workspace.ts";
 import { RealTestRecords } from "./RealTestRecords.tsx";
 /**
  * 会话面板（左栏，PLAN-PANELS §2.1）：
@@ -21,7 +23,8 @@ function timeAgo(ms: number): string {
 }
 
 export interface SessionsPanelProps {
-	sessions: WireSessionInfo[] | null;
+	prepareWorkspaceSwitch?:()=>boolean;
+ sessions: WireSessionInfo[] | null;
 	stats: WireStats | null;
 	onOpen: (path: string) => void;
 	onNew: () => void;
@@ -37,7 +40,7 @@ export interface SessionsPanelProps {
 	atHome?: boolean;
 }
 
-const exportUrl = (path: string) => `/api/sessions/export?path=${encodeURIComponent(path)}`;
+const exportUrl = (path: string) => scopedUrl(`/api/sessions/export?path=${encodeURIComponent(path)}`);
 
 function sessionTitle(s: { name?: string; firstMessage: string }): string {
 	return s.name || s.firstMessage.slice(0, 40) || "（空会话）";
@@ -139,6 +142,7 @@ function Item({
 }
 
 export function SessionsPanel({
+ prepareWorkspaceSwitch = () => true,
 	sessions,
 	stats,
 	onOpen,
@@ -153,6 +157,7 @@ export function SessionsPanel({
 	const [query, setQuery] = useState("");
 	const [hits, setHits] = useState<SessionSearchHit[] | null>(null);
 	const [searching, setSearching] = useState(false);
+
 	const { busy, run } = useAction(toast);
 	// 相对时间不冻结：分钟级心跳重渲染
 	const [, setTick] = useState(0);
@@ -283,6 +288,7 @@ export function SessionsPanel({
 
 			<section className="sp-section">
 				<h4>会话列表</h4>
+    <ParallelSaves prepare={prepareWorkspaceSwitch} toast={toast}/>
 				<SearchInput
 					value={query}
 					onChange={(v) => {

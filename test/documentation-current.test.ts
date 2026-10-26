@@ -15,6 +15,6 @@ test("active documentation links resolve and retired author architecture no long
 		}
 		assert.ok(!/PLAN-ASK\.md|PLAN-RP-AGENT(?:-EXEC)?\.md|PLAN-RP-HARNESS\.md|ARCHITECTURE-RP-PIPELINE-20260902\.md|history\/ARCHITECTURE/.test(text), `${name}: retired architecture pointer`);
 	}
-	const flow = readFileSync(join(root, "docs/PLAN-ROUND-FLOW.md"), "utf8");
+	const flow = readFileSync(join(root, "docs/architecture.md"), "utf8");
 	assert.match(flow, /普通文本/); assert.match(flow, /3\/2\/2|三份|三报告/); assert.ok(!flow.includes("第一个动作就 ask"));
 });

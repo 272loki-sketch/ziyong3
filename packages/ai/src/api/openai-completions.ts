@@ -39,6 +39,7 @@ import { headersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { observeFetch } from "../utils/observe-fetch.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -181,7 +182,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			const compat = getCompat(model);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, compat);
+			const transport = options?.onTransport ? observeFetch(options.onTransport) : undefined;
+			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, compat, transport?.fetch);
 			let params = buildParams(model, context, options, compat, cacheRetention);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -332,8 +334,14 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				return block;
 			};
 
+			let effective = false;
 			for await (const chunk of chunkSource) {
 				if (!chunk || typeof chunk !== "object") continue;
+				const delta = chunk.choices?.[0]?.delta as Record<string, unknown> | undefined;
+				if (!effective && delta && (["content", "reasoning_content", "reasoning", "reasoning_text"].some(key => typeof delta[key] === "string" && delta[key].length > 0) || Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0 || delta.function_call)) {
+					effective = true;
+					transport?.effective();
+				}
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
 				// and each chunk in a streamed completion carries the same id.
@@ -543,6 +551,7 @@ function createClient(
 	optionsHeaders?: ProviderHeaders,
 	sessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
+	customFetch?: typeof fetch,
 ) {
 	const headers: ProviderHeaders = { ...model.headers };
 	if (model.provider === "github-copilot") {
@@ -570,6 +579,7 @@ function createClient(
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		defaultHeaders: headers,
+		fetch: customFetch,
 	});
 }
 

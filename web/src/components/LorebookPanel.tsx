@@ -343,7 +343,10 @@ function BooksSection({
 	const { busy, run } = useAction(toast);
 	const [importing, setImporting] = useState(false);
 
-	const active = useMemo(() => normalizeActiveLorebooks(data?.active ?? null), [data?.active]);
+	const [mountScope, setMountScope] = useState<"character_aux" | "global" | "chat">("character_aux");
+	const active = useMemo(() => data?.scopes?.[mountScope] ?? (mountScope === "global" ? normalizeActiveLorebooks(data?.active ?? null) : []), [data, mountScope]);
+	const scopeBody = () => ({ scope: mountScope, cardIdentity: data?.embeddedCard.cardIdentity, ...(mountScope === "chat" ? { sessionId: data?.sessionId } : {}) });
+	const scopeLabel = mountScope === "global" ? "全局书" : mountScope === "chat" ? "本聊天书" : "本角色附加书";
 	const activeSet = useMemo(() => new Set(active), [active]);
 
 	const previousCardPath = useRef<string | null>(null);
@@ -354,7 +357,7 @@ function BooksSection({
 		const switched = previousCardPath.current !== null && previousCardPath.current !== card.path;
 		previousCardPath.current = card.path;
 		if (switched || !view) {
-			onView({ kind: "card", cardIdentity: card.cardIdentity, cardPath: card.path });
+			onView(data.primary?.source === "file" ? { kind: "file", path: data.primary.path } : { kind: "card", cardIdentity: card.cardIdentity, cardPath: card.path });
 			return;
 		}
 		if (view.kind !== "file" && view.cardIdentity !== card.cardIdentity) {
@@ -380,7 +383,7 @@ function BooksSection({
 	const toggleMount = (path: string, e: React.MouseEvent) => {
 		e.stopPropagation();
 		run(async () => {
-			await apiPost("/api/lorebooks/select", { path });
+			await apiPost("/api/lorebooks/select", { path, ...scopeBody() });
 			reload();
 			onMountChanged();
 		});
@@ -388,10 +391,10 @@ function BooksSection({
 
 	const clearAll = () =>
 		run(async () => {
-			await apiPost("/api/lorebooks/select", { paths: [] });
+			await apiPost("/api/lorebooks/select", { paths: [], ...scopeBody() });
 			reload();
 			onMountChanged();
-		}, "已卸下全部独立世界书（卡内书仍随卡加载）");
+		}, `已卸下${scopeLabel}，不改变角色主书或其他作用域`);
 
 	const remove = (path: string) =>
 		run(async () => {
@@ -460,38 +463,45 @@ function BooksSection({
 		<section className="sp-section">
 			<h4>世界书</h4>
 			<div className="field-hint">
-				独立书<strong>勾选</strong>＝挂进会话（可多本）· <strong>点书名</strong>＝下方只显示该本条目（不合并其它书）。
+				独立书<strong>勾选</strong>＝挂到所选作用域（可多本）· <strong>点书名</strong>＝下方只显示该本条目（不合并其它书）。
 			</div>
 			<PanelStatus loading={loading} error={error} hasData={!!data} />
 			{data && (
 				<>
 					<div className="book-row book-toolbar">
-						<span className="lore-meta">独立书已挂 {active.length} 本</span>
+						<label>挂载到：<select aria-label="世界书挂载作用域" value={mountScope} onChange={ev => setMountScope(ev.target.value as typeof mountScope)}>
+							<option value="character_aux">本角色附加书（换卡不带走）</option><option value="chat" disabled={!data.sessionId}>本聊天（仅当前角色）</option><option value="global">全局书（跨角色生效）</option>
+						</select></label>
+						<span className="lore-meta">{scopeLabel}已挂 {active.length} 本</span>
 						{active.length > 0 && (
 							<button type="button" className="act" disabled={busy} onClick={() => clearAll()}>
-								全部卸下
+								卸下此作用域
 							</button>
 						)}
 					</div>
+					{data.primary?.source === "file" && <div className="field-hint">角色主书：<strong>{data.primary.name}</strong>（{data.primary.entryCount} 条）· 显式绑定 <code>{data.primary.path}</code>，无需重复挂载。</div>}
+					{data.declaredPrimary && data.primaryResolution === "embedded" && <div className="field-hint">未找到绑定书“{data.declaredPrimary}”，当前回退到内嵌书；没有复制或覆盖原文件。</div>}
 					<div className={`book-row book-embedded ${view?.kind === "card" ? "current" : ""}`}>
 						<button type="button" className="book-pick book-pick-full" onClick={() => onView({ kind: "card", cardIdentity: data.embeddedCard.cardIdentity, cardPath: data.embeddedCard.path })}>
 							<span className="book-name">当前角色卡内嵌世界书 · {data.embeddedCard.name}</span>
 							<span className="lore-meta">{data.embeddedCard.entryCount} 条 · 启用 {data.embeddedCard.enabledCount} 条</span>
-							<span className="lore-meta book-mounted-tag">自动随卡加载</span>
+							<span className="lore-meta book-mounted-tag">{data.embeddedCard.active === false ? "内嵌副本 · 当前不参与生成" : "自动随卡加载 · 角色主书"}</span>
 						</button>
 						<span className="book-acts"><button type="button" className="act" onClick={() => void exportCard()}>导出</button></span>
 					</div>
-					<div className="field-hint">卡内条目无需另存或挂载。下方可浏览全部启用和停用条目；启停、编辑会写回当前卡，原本关闭的模块不会自动开启。</div>
+					<div className="field-hint">只有当前生效的来源参与生成。编辑内嵌副本仅写回卡，不同步覆盖绑定的独立书；默认关闭模块不会自动开启。旧挂载保留为全局书，可在对应作用域明确卸下。</div>
 					{data.books.map((b) => {
 						const mounted = activeSet.has(b.path);
+						const primary = data.primary?.source === "file" && data.primary.path === b.path;
+						const boundScopes = data.scopes ? (Object.entries(data.scopes).filter(([, paths]) => paths.includes(b.path)).map(([scope]) => scope === "global" ? "全局" : scope === "chat" ? "本聊天" : "本角色附加")) : [];
 						const viewing = viewingFile === b.path;
 						return (
 							<div key={b.path} className={`book-row ${viewing ? "current" : ""}`}>
 								<button
 									type="button"
 									className="book-check"
-									disabled={busy}
-									title={mounted ? "卸下（不进会话）" : "挂载（进会话）"}
+									disabled={busy || primary}
+									title={primary ? "主书由角色卡显式绑定，不使用附加挂载开关" : mounted ? `从${scopeLabel}卸下` : `挂到${scopeLabel}`}
 									onClick={(ev) => toggleMount(b.path, ev)}
 								>
 									<span className={`check ${mounted ? "on" : ""}`} aria-checked={mounted} role="checkbox" />
@@ -504,14 +514,15 @@ function BooksSection({
 								>
 									<span className="book-name">{b.name}</span>
 									<span className="lore-meta">{b.entryCount} 条</span>
-									{mounted && <span className="lore-meta book-mounted-tag">已挂</span>}
+									{primary && <span className="lore-meta book-mounted-tag">角色主书 · 自动绑定</span>}
+									{boundScopes.length > 0 && <span className="lore-meta book-mounted-tag">{boundScopes.join(" / ")}</span>}
 								</button>
 								<span className="book-acts">
 									<button type="button" className="act" onClick={() => void exportBook(b.path)}>
 										导出
 									</button>
 									{b.path.startsWith("assets/lorebooks/") && (
-										<ConfirmButton disabled={busy} confirmText="确认删除" onConfirm={() => remove(b.path)}>
+										<ConfirmButton disabled={busy || primary || boundScopes.some(scope => scope !== "全局")} confirmText="确认删除" onConfirm={() => remove(b.path)}>
 											删除
 										</ConfirmButton>
 									)}

@@ -8,7 +8,7 @@ import test from "node:test";
 import { findHistoricalImage } from "../src/historical-images.ts";
 import { handleApiRequest, type RestHost } from "../server/rest.ts";
 
-test("retired image routes are absent; historical lookup preserves files and projects only src", async () => {
+test("restored routes stay opt-in; historical lookup preserves files and projects only src", async () => {
 	const cwd = mkdtempSync(join(tmpdir(), "liyuan-historical-images-"));
 	const config = { enabled: true, apiKey: "synthetic-private-key", baseUrl: "https://must-not-contact.invalid", model: "fixture", sampler: "fixture", scheduler: "fixture", steps: 12, scale: 5, cfgRescale: 0.2, width: 512, height: 768, positivePrefix: "synthetic prefix", positiveSuffix: "synthetic suffix", negativePrompt: "synthetic negative" };
 	const key = createHash("sha256").update(JSON.stringify({ prompt: "tree, cloud", negativePrompt: "", seed: null, model: config.model, sampler: config.sampler, scheduler: config.scheduler, steps: config.steps, scale: config.scale, cfgRescale: config.cfgRescale, width: config.width, height: config.height, positivePrefix: config.positivePrefix, positiveSuffix: config.positiveSuffix, configNegativePrompt: config.negativePrompt })).digest("hex");
@@ -23,7 +23,7 @@ test("retired image routes are absent; historical lookup preserves files and pro
 	const originalFetch = globalThis.fetch;
 	let requests = 0;
 	globalThis.fetch = (async () => { requests++; throw new Error("Network forbidden"); }) as typeof fetch;
-	const host = { cwd } as RestHost;
+	const host = { cwd, worldProfileContext: () => ({sessionId: "synthetic-session", card: "synthetic.png", leafId: "story", branch: [{id:"story"}]}) } as unknown as RestHost;
 	async function request(method: string, url: string) {
 		const req = Readable.from(['{"prompt":"tree, cloud","apiKey":"must-not-save"}']) as any;
 		req.method = method; req.url = url;
@@ -33,10 +33,15 @@ test("retired image routes are absent; historical lookup preserves files and pro
 		return { handled, status, body };
 	}
 	try {
-		for (const [method, url] of [["GET", "/api/novelai"], ["PUT", "/api/novelai"], ["POST", "/api/novelai/generate"], ["GET", "/api/novelai/cached?prompt=tree"], ["PUT", "/api/historical-images"], ["POST", "/api/historical-images"]]) {
+		const status = await request("GET", "/api/novelai");
+		assert.equal(status.status, 200);
+		assert.equal(JSON.parse(status.body).config.enabled, false);
+		assert.equal(JSON.parse(status.body).apiKeyConfigured, true);
+		assert.doesNotMatch(status.body, /synthetic-private-key|synthetic-leak/);
+		for (const [method, url, expected] of [["PUT", "/api/novelai", 409], ["POST", "/api/novelai/generate", 409], ["GET", "/api/novelai/cached?prompt=tree", 400], ["PUT", "/api/historical-images", 404], ["POST", "/api/historical-images", 404]] as const) {
 			const result = await request(method, url);
 			assert.equal(result.handled, true);
-			assert.equal(result.status, 404, `${method} ${url}`);
+			assert.equal(result.status, expected, `${method} ${url}`);
 		}
 		assert.deepEqual(findHistoricalImage(cwd, "  tree,   cloud  "), { src: "/media/fixture.png" });
 		const hit = await request("GET", "/api/historical-images?prompt=tree%2C%20cloud");

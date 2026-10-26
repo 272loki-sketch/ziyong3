@@ -4,7 +4,7 @@ description: 为本拍整理历史、记忆和关系的可追溯证据。
 workflow: director-evidence
 license: AGPL-3.0-only
 upstream-author: Luker Team
-attribution: docs/PROMPT-SOURCES.md
+attribution: docs/materials.md
 resident: false
 每轮: false
 ---

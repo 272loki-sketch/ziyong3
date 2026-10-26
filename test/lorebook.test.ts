@@ -71,7 +71,7 @@ test("程序卡批量启停：按 uid 原地写 enabled/disable 并保留未知�
 	}
 });
 
-test("合并去重（独立世界书与卡内嵌书内容相同）", () => {
+test("合并重复对象引用（不按正文合并独立条目）", () => {
 	const entries = loadLorebookFile(bookPath);
 	const merged = mergeEntries(entries, entries);
 	assert.equal(merged.length, 4);

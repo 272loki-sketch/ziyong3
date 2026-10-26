@@ -27,7 +27,13 @@ export interface DatabasePluginWorldbookEntry {
  exclude_recursion?: boolean;
  prevent_recursion?: boolean;
 }
+/** Transient current-branch reference for the existing native recall/model transport. */
+export interface DatabasePluginLiteraryDirector { systemPrompt: string; userText: string }
 export interface DatabasePluginPreparedPrompt {
+ /** True only when a merged request became a fresh native plot task and reached writeback. */
+ literaryDirectorHandled?: boolean;
+ /** Same-request director candidate, kept separate from exact native user-input writeback. */
+ literaryDirection?: string;
  /** Exact final input passed by the original generate interceptor to its host. */
  userInput: string;
  /** Unmodified native entries; disabled indexes are not an alternative recall source. */
@@ -124,7 +130,7 @@ export function insertDatabasePluginDepthEntries(messages: unknown[], entries: D
 
 /** Honour existing preset worldInfo/character markers instead of moving their
  * contents around. Only unrepresented slots use the ordinary card fallback. */
-export function placeDatabasePluginCharacterEntries(pieces: Array<{source: string; id: string; text: string}>, worldbook: {before: string; after: string}) {
+export function placeDatabasePluginCharacterEntries(pieces: Array<{source: string; id: string; text: string; role?: "system" | "user" | "assistant"; name?: string}>, worldbook: {before: string; after: string}) {
  const result = pieces.map(piece => ({...piece}));
  const remaining = {...worldbook};
  for (const side of ['before', 'after'] as const) {
@@ -136,7 +142,10 @@ export function placeDatabasePluginCharacterEntries(pieces: Array<{source: strin
   const positions = result.flatMap((piece, index) => piece.source === 'marker' && characterMarkers.includes(piece.id) ? [index] : []);
   if (!positions.length) continue;
   at = side === 'before' ? positions[0] : positions.at(-1)! + 1;
-  result.splice(at, 0, {source: 'marker', id: marker, text: remaining[side]}); remaining[side] = '';
+   result.splice(at, 0, {source: 'marker', id: marker, name: marker, role: 'system', text: remaining[side]}); remaining[side] = '';
  }
- return {presetBefore: result.map(piece => piece.text), remaining};
+  return {presetBefore: result.map(piece => piece.text), pieces: result.map(piece => ({ ...piece,
+   source: piece.source === 'marker' ? 'marker' as const : 'block' as const,
+   role: piece.role ?? 'system', name: piece.name ?? piece.id,
+  })), remaining};
 }

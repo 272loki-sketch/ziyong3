@@ -53,15 +53,18 @@ export class CorpusScheduler {
 	#deps: CorpusSchedulerDeps;
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#running = false;
+	#started = false;
 
 	constructor(deps: CorpusSchedulerDeps) { this.#deps = deps; }
 
 	start(): void {
-		if (!this.#deps.schedule.enabled || this.#timer) return;
+		if (!this.#deps.schedule.enabled || this.#started) return;
+		this.#started = true;
 		this.#arm();
 	}
 
 	stop(): void {
+		this.#started = false;
 		if (this.#timer) clearTimeout(this.#timer);
 		this.#timer = undefined;
 	}
@@ -100,6 +103,7 @@ export class CorpusScheduler {
 	}
 
 	#arm(): void {
+		if (!this.#started || !this.#deps.schedule.enabled || this.#timer) return;
 		this.#timer = setTimeout(async () => {
 			this.#timer = undefined;
 			try { await this.runNow(); }

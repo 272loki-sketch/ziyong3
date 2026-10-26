@@ -5,8 +5,8 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { apiPut, type StatePatchResult } from "../api.ts";
-import type { WireStats, WorldState } from "../wire.ts";
+import { apiPost, apiPut, type StatePatchResult } from "../api.ts";
+import type { LedgerStatus, WireStats, WorldState } from "../wire.ts";
 import { IconChevronDown, IconPencil, IconTrash } from "./icons.tsx";
 import { ConfirmButton, useAction } from "./kit.tsx";
 import { TOKEN_HELP } from "../request-labels.ts";
@@ -127,13 +127,40 @@ export function SessionStatsBar({ stats }: { stats: WireStats | null }) {
 /** 输入框上方：生效的世界状态（一行摘要，展开可编辑） */
 export function StatusStrip({
 	state,
+	ledgerStatus,
+	ledgerScope,
+	busy = false,
 	toast,
 }: {
 	state: WorldState | null;
+	ledgerStatus?: LedgerStatus | null;
+	ledgerScope?: {sessionId: string; card: string};
+	busy?: boolean;
 	toast: (level: "info" | "warning" | "error", text: string) => void;
 }) {
 	const [open, setOpen] = useState(false);
-	const { run } = useAction(toast);
+	const { run, busy: actionBusy } = useAction(toast);
+ const [ledgerRetrying,setLedgerRetrying] = useState(false);
+ const retryPending = useRef(false);
+ const currentBinding = useRef({ledgerScope,sourceEntryId:ledgerStatus?.sourceEntryId}); currentBinding.current={ledgerScope,sourceEntryId:ledgerStatus?.sourceEntryId};
+ const retryLedger = () => {
+  if(retryPending.current || busy || actionBusy || !ledgerStatus?.canRetry || !ledgerScope)return;
+  if(!window.confirm("只根据当前已保存的完整正文补写本轮账本，调用一次独立场记模型，可能产生费用。不重写正文，不重跑世界、生态、记忆或其它后台，不借用恢复模型。是否继续？"))return;
+  const expected={...ledgerScope,sourceEntryId:ledgerStatus.sourceEntryId,revision:ledgerStatus.revision};retryPending.current=true;setLedgerRetrying(true);
+  void run(async()=>{try{
+   const result=await apiPost<{error?:string;noChanges?:boolean}>("/api/state/retry-ledger",{confirm:true,expected});
+   if(result.error)throw new Error(result.error);
+   const active=currentBinding.current;
+   if(active.ledgerScope?.sessionId===expected.sessionId&&active.ledgerScope?.card===expected.card&&active.sourceEntryId===expected.sourceEntryId)
+    toast("info",result.noChanges?"场记确认本轮账本无需变更，其它后台未重跑":"本轮账本已补写，其它后台未重跑");
+  }finally{retryPending.current=false;setLedgerRetrying(false)}});
+ };
+
+
+	const confirmLedger = () => {
+  if (!ledgerStatus?.canConfirm || !ledgerScope || !window.confirm("请先按最新正文核对并编辑整份账本。确认后仅把本轮账本标为用户已核对，不调用模型、不改变正文，也不跳过其它失败领域。是否确认？")) return;
+  void run(async () => { await apiPost("/api/state/confirm-ledger", {confirm: true, expected: {...ledgerScope, sourceEntryId: ledgerStatus.sourceEntryId, revision: ledgerStatus.revision}, patch: {}}); }, "本轮账本已由用户核对确认");
+ };
 
 	const patch = (p: Record<string, unknown>) =>
 		run(async () => {
@@ -155,10 +182,14 @@ export function StatusStrip({
 		<div className={`status-strip ${open ? "open" : ""}`}>
 			<button type="button" className="status-strip-bar" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
 				<span className={`status-strip-text ${empty ? "faint" : ""}`}>{summary}</span>
+    {(ledgerRetrying || ledgerStatus && !["initial", "current"].includes(ledgerStatus.status)) && <span className="ledger-summary-status" role="status" title={ledgerRetrying ? "正在补写账本" : ledgerStatus?.message}>{ledgerRetrying ? "补写中" : "账本待补"}</span>}
 				<IconChevronDown size={14} className={`strip-caret ${open ? "up" : ""}`} />
 			</button>
+
 			{open && (
-				<div className="status-card">
+				<div className="status-card" role="region" aria-label="账本">
+   <div className="ledger-retry-controls"><button type="button" className="drawer-btn" disabled={busy||actionBusy||ledgerRetrying||!ledgerStatus?.canRetry||!ledgerScope} title="仅补写最新完整正文中未完成的账本；调用一次独立场记，可能产生费用，不重跑其它后台" onClick={retryLedger}>{ledgerRetrying?"正在补写账本…":"补写账本"}</button><small>仅场记 · 可能产生模型费用</small></div>
+			{ledgerStatus && !["initial", "current"].includes(ledgerStatus.status) && <div className="ledger-sync-notice" role="status" data-ledger-status={ledgerStatus.status}><p>{ledgerStatus.message}</p>{ledgerStatus.canConfirm && ledgerScope && <button type="button" className="drawer-btn" disabled={busy || actionBusy} onClick={confirmLedger}>已核对整份账本，确认本轮</button>}</div>}
 					<div className="kv">
 						<span className="kv-k">时间</span>
 						<span className="kv-v">

@@ -4,10 +4,13 @@ export const PERFORMANCE_PHASES = [
 	"prep", "agent.evidence", "agent.ideas", "agent.review", "settlement.recovery", "prep.arrival", "prep.continuity", "prep.novelCalibration", "prep.plotAdaptation",
 	"prep.director", "prep.sceneConductor", "prep.database", "prep.memoryRecall", "prep.memoryArcs",
 	"writer", "settlement.planFact", "settlement.scribe", "settlement.worldFacts",
-	"settlement.worldProposal", "settlement.worldAudit", "settlement.world", "settlement.ecology", "settlement.rewrite", "settlement.memory", "settlement.tavern", "curtain", "compaction",
+	"settlement.worldProposal", "settlement.worldAudit", "settlement.world", "settlement.ecology", "settlement.rewrite", "settlement.memory", "settlement.tavern", "settlement.supplementary", "curtain", "compaction",
 ] as const;
 export type PerformancePhase = typeof PERFORMANCE_PHASES[number];
 export type PerformanceStatus = "success" | "degraded" | "failed" | "aborted" | "skipped";
+const PERFORMANCE_REASONS = ["merged-database-recall", "upstream-plugin-managed", "missing-director-candidate"] as const;
+export type PerformanceReason = typeof PERFORMANCE_REASONS[number];
+export interface DatabaseRequestObservation { collector: TurnPerformanceCollector; phase: "prep.database" | "settlement.memory" }
 export interface PhasePerformance {
 	durationMs: number;
 	calls: number;
@@ -16,6 +19,7 @@ export interface PhasePerformance {
 	/** 有 usage 的 harness attempts 数；tokens 是已取得数据之和，不伪称完整供应商统计。 */
 	usageCalls?: number;
 	status?: PerformanceStatus;
+	reason?: PerformanceReason;
 }
 export interface RequestCallPerformance {id:string;phase:string;model:string;durationMs?:number;firstTokenMs?:number;inputTokens?:number;outputTokens?:number;totalTokens?:number;status:string;usageSource:"missing"|"provider-sdk"}
 export interface TurnPerformance {
@@ -31,7 +35,7 @@ export interface TurnPerformance {
 	providerRetries: "unknown";
 }
 
-type Phase = { intervals: Array<[number, number]>; open: Map<symbol, number>; calls: number; inputTokens?: number; outputTokens?: number; usageCalls: number; status?: PerformanceStatus };
+type Phase = { intervals: Array<[number, number]>; open: Map<symbol, number>; calls: number; inputTokens?: number; outputTokens?: number; usageCalls: number; status?: PerformanceStatus; reason?: PerformanceReason };
 const numeric = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER ? value : undefined;
 const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const STATUS = ["success", "degraded", "failed", "aborted", "skipped"] as const;
@@ -85,7 +89,7 @@ export class TurnPerformanceCollector {
 		} };
 	}
 	narrative(): void { if (!this.#closed && this.#first === undefined) this.#first = this.#now(); }
-	status(name: PerformancePhase, status: PerformanceStatus): void { if (!this.#closed) this.#phase(name).status = status; }
+	status(name: PerformancePhase, status: PerformanceStatus, reason?: PerformanceReason): void { if (!this.#closed) { const phase = this.#phase(name); phase.status = status; phase.reason = reason; } }
 	authorReady(): void { if (!this.#closed && this.#authorReady === undefined) this.#authorReady = this.#now(); }
 	finish(narrativeEntryId: string): TurnPerformance {
 		const now = this.#now(); this.#closed = true;
@@ -98,6 +102,7 @@ export class TurnPerformanceCollector {
 				...(phase.outputTokens !== undefined ? { outputTokens: phase.outputTokens } : {}),
 				...(phase.usageCalls ? { usageCalls: phase.usageCalls } : {}),
 				...(phase.status ? { status: phase.status } : {}),
+				...(phase.reason ? { reason: phase.reason } : {}),
 			};
 		}
 		return { version: 1, narrativeEntryId, totalMs: Math.max(0, Math.round(now - this.#start)), ...(this.#authorReady !== undefined ? { timeToAuthorReadyMs: Math.max(0, Math.round(this.#authorReady - this.#start)) } : {}), ...(this.#first !== undefined ? { timeToFirstNarrativeMs: Math.max(0, Math.round(this.#first - this.#start)) } : {}), phases, callsScope: "harness-attempts", providerRetries: "unknown" };
@@ -114,6 +119,7 @@ export function projectTurnPerformance(value: unknown, narrativeEntryId: string)
 		const phase: PhasePerformance = { durationMs: Math.round(row.durationMs as number), calls: Math.floor(row.calls as number) };
 		for (const key of ["inputTokens", "outputTokens", "usageCalls"] as const) { const n = numeric(row[key]); if (n !== undefined) phase[key] = Math.floor(n); }
 		if (STATUS.includes(row.status as PerformanceStatus)) phase.status = row.status as PerformanceStatus;
+		if (PERFORMANCE_REASONS.includes(row.reason as PerformanceReason)) phase.reason = row.reason as PerformanceReason;
 		phases[name] = phase;
 	}
 	const first = numeric(raw.timeToFirstNarrativeMs);

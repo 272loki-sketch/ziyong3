@@ -75,10 +75,15 @@ function syncMutable(target, source) {
  }
  return clone(source);
 }
+function sameJSON(left,right) {
+ if(Object.is(left,right))return true;
+ if(!left||!right||typeof left!=='object'||typeof right!=='object'||Array.isArray(left)!==Array.isArray(right))return false;
+ const keys=Object.keys(left);return keys.length===Object.keys(right).length&&keys.every(key=>Object.hasOwn(right,key)&&sameJSON(left[key],right[key]));
+}
 const host = {
  context: null, displayProjection:0, canonicalMes:new Map(), chat: [], characters: [], metadata: {}, extensions: {}, books: {}, modules: {}, prompts: {}, presets: [], pending: false, saving: Promise.resolve(), saveGeneration:0, bindingGeneration:0, pendingBindingGeneration:0, pendingContext:null, errors: [], generating: false,
- async request(path, body, binding=this.context) {
-  const response = await fetch('/api/tavern-plugins' + path, { method: body === undefined ? 'GET' : 'POST', headers: { 'content-type': 'application/json', ...(binding ? {'x-liyuan-tavern-scope':binding.scopeKey,'x-liyuan-tavern-source':binding.sourceEntryId} : {}) }, ...(body === undefined ? {} : {body:JSON.stringify(body)}) });
+ async request(path, body, binding=this.context, signal) {
+  const response = await fetch('/api/tavern-plugins' + path, { method: body === undefined ? 'GET' : 'POST', ...(signal?{signal}:{}), headers: { 'content-type': 'application/json', ...(binding ? {'x-liyuan-tavern-scope':binding.scopeKey,'x-liyuan-tavern-source':binding.sourceEntryId} : {}) }, ...(body === undefined ? {} : {body:JSON.stringify(body)}) });
   const data = await response.json(); if (!response.ok) throw new Error(data.error ?? '酒馆插件宿主请求失败'); return data;
  },
  async bind(context) {
@@ -90,6 +95,24 @@ const host = {
   syncMutable(this.chat, clone(context.chat));
   syncMutable(this.metadata, clone(context.state.chatMetadata));
   syncMutable(this.extensions, clone(context.state.extensionSettings));
+  // A message-render realm is not the script-management UI. Never enable disabled
+  // character/preset automation here, or let its first-use consent cover the card UI.
+  // This is a realm-local "already asked" overlay, masked out of every saved state.
+  this.renderScriptConsent=undefined;
+  if(new URLSearchParams(location.search).get('view')==='render'&&
+   context.plugins?.some(plugin=>plugin.id==='helper'&&plugin.enabled)&&
+   (this.extensions.tavern_helper===undefined||this.extensions.tavern_helper&&typeof this.extensions.tavern_helper==='object'&&!Array.isArray(this.extensions.tavern_helper))&&
+   (this.extensions.tavern_helper?.script===undefined||this.extensions.tavern_helper.script&&typeof this.extensions.tavern_helper.script==='object'&&!Array.isArray(this.extensions.tavern_helper.script))){
+   const settings=this.extensions.tavern_helper??={},script=settings.script??={};
+   const hasPopuped=Object.hasOwn(script,'popuped'),popuped=clone(script.popuped);
+   if(script.popuped===undefined||script.popuped&&typeof script.popuped==='object'&&!Array.isArray(script.popuped)){
+    this.renderScriptConsent={context,hasPopuped,popuped};
+    const overlay=script.popuped??={};
+    for(const [key,value] of [['characters',context.character?.avatar],['presets',context.preset?.name]]){
+     if(typeof value==='string'&&value&&(!Object.hasOwn(overlay,key)||Array.isArray(overlay[key])))overlay[key]=[...new Set([...(overlay[key]??[]),value])];
+    }
+   }
+  }
   syncMutable(this.books, clone(context.state.worldbooks));
   this.extensions.variables ??= {global:{}};this.extensions.note??={allowWIScan:false}; this.extensions.regex ??= [];this.extensions.disabledExtensions??=[];this.extensions.quickReplyV2 ??= {config:{setList:[]},chatConfig:{setList:[]}};
   this.extensions.EjsTemplate ??= {}; if (!Object.hasOwn(this.extensions.EjsTemplate,'compile_workers')) this.extensions.EjsTemplate.compile_workers = false;
@@ -104,9 +127,53 @@ const host = {
    }
   this.installModules(); this.renderChat();
  },
+ // Adopt a newer *saved* variable snapshot without rebinding modules, replacing
+ // message DOM, emitting chat/generation hooks, or restarting enabled scripts.
+ refreshDisplayState(snapshot) {
+  const current=this.context,fail=()=>{throw new Error('变量显示来源或配置已变化，请重新连接原卡界面');};
+  if(new URLSearchParams(location.search).get('view')!=='render'||!current||!snapshot)fail();
+  for(const key of ['sessionId','card','scopeKey','sourceEntryId'])if(snapshot[key]!==current[key])fail();
+  if(!Number.isSafeInteger(snapshot.revision)||snapshot.revision<current.revision)fail();
+  if(this.chat.some(message=>message.mes!==this.canonicalMes.get(message.__liyuanEntryId)))fail();
+  if(!Array.isArray(snapshot.chat)||snapshot.chat.length!==this.chat.length||snapshot.chat.some((message,index)=>message.__liyuanEntryId!==this.chat[index].__liyuanEntryId||message.mes!==this.canonicalMes.get(message.__liyuanEntryId)||(message.swipe_id??0)!==(this.chat[index].swipe_id??0)))fail();
+  if(snapshot.revision===current.revision){if(!sameJSON(snapshot.state,current.state))fail();return {changed:false,variablesChanged:false};}
+  if(this.displayBootstrap||this.pending||JSON.stringify(this.state())!==this.persistedStateJSON)throw new Error('原卡有尚未保存的变量修改，未用后台快照覆盖');
+  const state=this.state(),withoutVariables=value=>{
+   const settings=clone(value);delete settings.variables;
+   // Render-only consent is masked out of saved state. Its latest durable
+   // bookkeeping may change without granting any script enablement.
+   if(this.renderScriptConsent&&settings.tavern_helper?.script)delete settings.tavern_helper.script.popuped;
+   return settings;
+  };
+  // A settings change is not authority to start/stop/reload a script in this
+  // read-only path. Native normalization already equal to the saved state is OK.
+  for(const key of ['extensionSettings','characterExtensions','presetExtensions','worldbooks']){
+   const project=key==='extensionSettings'?withoutVariables:value=>value;
+   if(!sameJSON(project(snapshot.state[key]),project(current.state[key]))&&!sameJSON(project(snapshot.state[key]),project(state[key])))fail();
+  }
+  const variableView=value=>({messages:Object.fromEntries(Object.entries(value.messages).map(([id,fields])=>[id,fields.variables])),chat:value.chatMetadata.variables,global:value.extensionSettings.variables});
+  const variablesChanged=!sameJSON(variableView(state),variableView(snapshot.state));
+  for(const message of this.chat){
+   const fields=snapshot.state.messages[message.__liyuanEntryId]??{};
+   for(const key of ['variables','extra']){
+    if(Object.hasOwn(fields,key))message[key]=syncMutable(message[key],clone(fields[key]));else delete message[key];
+   }
+  }
+  syncMutable(this.metadata,clone(snapshot.state.chatMetadata));
+  this.extensions.variables=syncMutable(this.extensions.variables,clone(snapshot.state.extensionSettings.variables??{global:{}}));
+  current.revision=snapshot.revision;current.state=clone(snapshot.state);
+  if(this.renderScriptConsent?.context===current){const script=snapshot.state.extensionSettings.tavern_helper?.script;this.renderScriptConsent.hasPopuped=!!script&&Object.hasOwn(script,'popuped');this.renderScriptConsent.popuped=clone(script?.popuped);}
+  this.persistedStateJSON=JSON.stringify(this.state());
+  return {changed:true,variablesChanged};
+ },
   state() {
    const messages={}; for(const msg of this.chat) { if(!msg.__liyuanEntryId)continue; messages[msg.__liyuanEntryId]={...(msg.variables!==undefined?{variables:clone(msg.variables)}:{}),...(msg.extra?{extra:clone(msg.extra)}:{})}; }
    const state={chatMetadata:clone(this.metadata),extensionSettings:clone(this.extensions),characterExtensions:clone(this.characters[0]?.data?.extensions),presetExtensions:clone(this.presets[0]?.extensions),messages,worldbooks:clone(this.books)};
+   const consent=this.renderScriptConsent;
+   if(consent&&consent.context===this.context){
+    const script=state.extensionSettings.tavern_helper?.script;
+    if(script){if(consent.hasPopuped)script.popuped=clone(consent.popuped);else delete script.popuped;}
+   }
    const retry=this.mvuRetryBaseline;
    if(retry&&retry.context===this.context){
     if(retry.hasVariables)state.messages[retry.id].variables=clone(retry.variables);else delete state.messages[retry.id].variables;
@@ -117,20 +184,26 @@ const host = {
    return state;
  },
  save() {
+  // Native render initialization may normalize defaults/register schemas. These
+  // are view-local until an actual later change; sibling display frames must not
+  // race to rewrite a shared state snapshot merely because a message was opened.
   if(!this.displayProjection&&(this.chat.length!==this.canonicalMes.size||this.chat.some(m=>!this.canonicalMes.has(m.__liyuanEntryId)||m.mes!==this.canonicalMes.get(m.__liyuanEntryId))))throw new Error('原插件宿主只保存派生变量；改写、增删故事请用梨园编辑/重Roll，未提交故事变更');
+  if(this.displayBootstrap)return Promise.resolve();
   const context=this.context, bindingGeneration=this.bindingGeneration, saveGeneration=++this.saveGeneration;
   if(!context)throw new Error('酒馆插件尚未绑定会话');
   this.pending=true;this.pendingBindingGeneration=bindingGeneration;this.pendingContext=context;
   const operation=this.saving.catch(()=>{}).then(async()=>{
    if(bindingGeneration!==this.bindingGeneration||context!==this.context)throw new Error('会话或分支已变化，旧插件状态不会写入新作用域');
    const persistedState=this.state();const persistedStateJSON=JSON.stringify(persistedState);
+   if(persistedStateJSON===this.persistedStateJSON){if(saveGeneration===this.saveGeneration)this.pending=false;return;}
    const result=await this.request('/state',{revision:context.revision,state:persistedState},{scopeKey:context.scopeKey,sourceEntryId:context.sourceEntryId});
-   if(bindingGeneration===this.bindingGeneration&&context===this.context){context.revision=result.revision;this.persistedStateJSON=persistedStateJSON;if(saveGeneration===this.saveGeneration)this.pending=false;}
+   if(bindingGeneration===this.bindingGeneration&&context===this.context){context.revision=result.revision;context.state=clone(persistedState);this.persistedStateJSON=persistedStateJSON;if(saveGeneration===this.saveGeneration)this.pending=false;}
   });
   this.saving=operation;
   operation.catch(error=>{this.errors.push(error.message);window.dispatchEvent(new CustomEvent('liyuan-plugin-error',{detail:error.message}));}); return operation;
  },
  async flush(){
+  if(this.displayBootstrap)return;
   try{await this.saving;if(JSON.stringify(this.state())!==this.persistedStateJSON)await this.save();return await this.saving;}
   catch(error){
    if(!this.pending||this.pendingBindingGeneration!==this.bindingGeneration||this.pendingContext!==this.context)throw error;

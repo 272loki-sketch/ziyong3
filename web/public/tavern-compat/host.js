@@ -1,12 +1,14 @@
-import {mvuParsingProjection,assertMvuCandidatesSettled,mvuManagedCandidatePayload} from "./mvu-adapter.js";
+import {installNativeResources} from "./native-resources.js";
+import {mvuParsingProjection,mvuParseSource,assertMvuCandidatesSettled,mvuManagedCandidatePayload} from "./mvu-adapter.js";
 import {host,eventSource,event_types} from './bridge.js';
 import {loadPluginLocales} from './i18n.js';
-import {installSettingsUI} from './settings-ui.js';
+import {installSettingsUI,ensureManagerWorker} from './settings-ui.js';
 const params=new URLSearchParams(location.search),view=params.get('view')??'runtime';document.body.dataset.view=view;
 if(view==='manager'&&['helper','template'].includes(params.get('plugin')))document.body.dataset.plugin=params.get('plugin');
 const focus=view==='manager'&&params.get('focus')==='mvu'?'mvu':undefined;if(focus)document.body.dataset.focus=focus;
 const settingsUI=installSettingsUI({view,plugin:params.get('plugin'),focus});
 const status=document.getElementById('status');let ready=false;
+host.displayBootstrap=view==='render';
 window.hljs={highlightElement:()=>{},highlight:(text)=>({value:text})};
 window.addEventListener('unhandledrejection',e=>{host.errors.push(String(e.reason?.message??e.reason));status.textContent='插件错误：'+host.errors.at(-1);});
 const nativeFetch=window.fetch.bind(window);
@@ -93,17 +95,50 @@ eventSource.emit=async(event,...args)=>{
  }
  return originalEmit(event,...args);
 };
-window.LiyuanTavernPlugins={ready:()=>ready,status:()=>({ready,errors:host.errors,plugins:host.context?.plugins}),before:generation,async after(){const msg=host.chat.at(-1),id=msg?.__liyuanEntryId;host.metadata.__liyuanPluginProcessed??={};if(id&&!host.metadata.__liyuanPluginProcessed[id]){const canonical=msg.mes;try{if(typeof msg.__liyuanAuthorDelivery==='string')msg.mes=mvuParsingProjection(msg.__liyuanAuthorDelivery).text;await eventSource.emit(event_types.MESSAGE_RECEIVED,host.chat.length-1);await render();await eventSource.emit(event_types.GENERATION_ENDED);await host.flush();host.metadata.__liyuanPluginProcessed[id]=true;if(window.Mvu&&host.context.mvu?.enabled){host.metadata.__liyuanMvuProcessed??={};host.metadata.__liyuanMvuProcessed[id]={status:"normal",at:new Date().toISOString()};}await host.save();}finally{msg.mes=canonical;}}},async bind(){await host.bind(await host.request('/context'));await render();},async evaluate(text,context={}){if(!window.EjsTemplate)throw new Error('原提示词模板未启用');return window.EjsTemplate.evalTemplate(text,context);},async renderHtml(html,index){if(!window.TavernHelper)throw new Error('酒馆助手未启用，保留梨园原有安全HTML显示');const target=host.chat[index];if(!target)throw new Error('消息已不在当前分支');const node=document.querySelector(`.mes[mesid="${index}"] .mes_text`);if(!node)throw new Error('消息显示宿主缺失');const display=window.EjsTemplate?await window.EjsTemplate.evalTemplate(html,await window.EjsTemplate.prepareContext({},index)):html;const pre=document.createElement('pre'),code=document.createElement('code');code.className='language-html';code.textContent=/<html[\s>]/i.test(display)?display:'<!doctype html><html><head><meta charset="utf-8"></head><body>'+display+'</body></html>';pre.append(code);target.mes='```html\n'+code.textContent+'\n```';node.replaceChildren(pre);await eventSource.emit(event_types.MESSAGE_UPDATED,index);await eventSource.emit('chatLoaded');},host};
+window.LiyuanTavernPlugins={ready:()=>ready,status:()=>({ready,errors:host.errors,plugins:host.context?.plugins}),before:generation,async after(){const msg=host.chat.at(-1),id=msg?.__liyuanEntryId;host.metadata.__liyuanPluginProcessed??={};if(id&&!host.metadata.__liyuanPluginProcessed[id]){const canonical=msg.mes;try{if(typeof msg.__liyuanAuthorDelivery==='string')msg.mes=mvuParsingProjection(mvuParseSource(msg.__liyuanAuthorDelivery,msg.__liyuanSupplementaryVariables)).text;await eventSource.emit(event_types.MESSAGE_RECEIVED,host.chat.length-1);await render();await eventSource.emit(event_types.GENERATION_ENDED);await host.flush();host.metadata.__liyuanPluginProcessed[id]=true;if(window.Mvu&&host.context.mvu?.enabled){host.metadata.__liyuanMvuProcessed??={};host.metadata.__liyuanMvuProcessed[id]={status:"normal",at:new Date().toISOString()};}await host.save();}finally{msg.mes=canonical;}}},async bind(){await host.bind(await host.request('/context'));await render();},async evaluate(text,context={}){if(!window.EjsTemplate)throw new Error('原提示词模板未启用');return window.EjsTemplate.evalTemplate(text,context);},async renderHtml(html,index){if(!window.TavernHelper)throw new Error('酒馆助手未启用，保留梨园原有安全HTML显示');const target=host.chat[index];if(!target)throw new Error('消息已不在当前分支');const node=document.querySelector(`.mes[mesid="${index}"] .mes_text`);if(!node)throw new Error('消息显示宿主缺失');const display=window.EjsTemplate?await window.EjsTemplate.evalTemplate(html,await window.EjsTemplate.prepareContext({},index)):html;const pre=document.createElement('pre'),code=document.createElement('code');code.className='language-html';code.textContent=/<html[\s>]/i.test(display)?display:'<!doctype html><html><head><meta charset="utf-8"></head><body>'+display+'</body></html>';pre.append(code);target.mes='```html\n'+code.textContent+'\n```';node.replaceChildren(pre);await eventSource.emit(event_types.MESSAGE_UPDATED,index);await eventSource.emit('chatLoaded');},host};
 const originalRender=window.LiyuanTavernPlugins.renderHtml;window.LiyuanTavernPlugins.renderHtml=async(...args)=>{const canonical=host.chat.map(m=>m.mes);host.displayProjection++;try{return await originalRender(...args);}finally{host.chat.forEach((m,i)=>m.mes=canonical[i]);host.displayProjection--;}};
 window.LiyuanTavernPlugins.filterWorldbookEntries=filterWorldbookEntries;
 const originalAfter=window.LiyuanTavernPlugins.after;let afterPending=null;window.LiyuanTavernPlugins.after=(...args)=>{
  if(afterPending)return afterPending;
   afterPending=(async()=>{host.afterRunning=true;host.displayProjection++;host.mvuCandidates=[];try{return await originalAfter(...args);}finally{host.afterRunning=false;host.displayProjection--;delete host.mvuCandidates;}})().finally(()=>{afterPending=null;});return afterPending;
 };
+let displayWork=Promise.resolve();
+function enqueueDisplay(work){const next=displayWork.catch(()=>{}).then(work);displayWork=next;return next;}
+async function refreshStateFromParent(data){
+ const context=host.context,index=host.chat.findIndex(message=>message.__liyuanEntryId===data.entryId);
+ if(!ready||data.entryId!==params.get('entryId')||data.entryId!==context.sourceEntryId||data.entryScope!==context.scopeKey||index<0)throw new Error('变量刷新不属于当前显示来源');
+ await host.saving; // Never flush/retry a pending write as part of a read-only refresh.
+ const snapshot=await host.request('/context',undefined,context,AbortSignal.timeout(10000));
+ if(host.context!==context)throw new Error('原卡已切换，迟到变量未投送');
+ const before=window.Mvu?.getMvuData({type:'message',message_id:index});
+ const result=host.refreshDisplayState(snapshot);
+ if(result.variablesChanged&&window.Mvu){
+  const event=window.Mvu.events.VARIABLE_UPDATE_ENDED;
+  host.pendingDisplayNotification={context,revision:context.revision,event,before,after:window.Mvu.getMvuData({type:'message',message_id:index}),listeners:new Set((eventSource.listeners.get(event)??[]).filter(listener=>host.nativeDisplayListeners?.get(event)?.get(listener)?.isConnected))};
+ }
+ const notification=host.pendingDisplayNotification;
+ if(notification?.context===context&&notification.revision===context.revision){
+  // Only original message-iframe callbacks, never chat/render/generation/parser
+  // hooks. A failed callback can be retried without repeating successful ones.
+  for(const listener of notification.listeners){
+   if((eventSource.listeners.get(notification.event)??[]).includes(listener)&&host.nativeDisplayListeners?.get(notification.event)?.get(listener)?.isConnected)await listener(structuredClone(notification.after),structuredClone(notification.before));
+   notification.listeners.delete(listener);
+  }
+  delete host.pendingDisplayNotification;
+ }
+ parent.postMessage({type:'liyuan-tavern-state-refreshed',entryId:data.entryId,entryScope:data.entryScope,requestId:data.requestId},location.origin);
+}
 let pendingRender=null;
 async function renderFromParent(data){
  const index=host.chat.findIndex(m=>m.__liyuanEntryId===data.entryId);if(index<0||data.entryId!==params.get('entryId'))throw new Error('显示消息不属于当前分支');
- await window.LiyuanTavernPlugins.renderHtml(data.html,index);
+ const wasBootstrapping=host.displayBootstrap;host.displayBootstrap=true;
+ try{await window.LiyuanTavernPlugins.renderHtml(data.html,index);
+  // Original template receive accounting schedules a timer then the host's
+  // immediate token-count promise. Let that display-local work finish before
+  // recording the bootstrap baseline; it is not an unsaved user edit.
+  await new Promise(resolve=>setTimeout(resolve,0));
+ }
+ finally{host.persistedStateJSON=JSON.stringify(host.state());host.displayBootstrap=wasBootstrapping;}
 }
 async function evaluateTemplateFromParent(data){
  const index=host.chat.findIndex(m=>m.__liyuanEntryId===data.entryId);if(index<0||data.entryId!==params.get('entryId'))throw new Error('模板求值消息不属于当前分支');
@@ -116,7 +151,10 @@ window.addEventListener('message',event=>{
  const data=event.data;
  if(data?.type==='liyuan-tavern-render'&&typeof data.html==='string'){
   if(!ready){pendingRender=data;return;}
-  void renderFromParent(data).catch(error=>parent.postMessage({type:'liyuan-tavern-error',error:error.message},location.origin));return;
+  void enqueueDisplay(()=>renderFromParent(data)).catch(error=>parent.postMessage({type:'liyuan-tavern-error',error:error.message},location.origin));return;
+ }
+ if(data?.type==='liyuan-tavern-refresh-state'){
+  void enqueueDisplay(()=>refreshStateFromParent(data)).catch(error=>parent.postMessage({type:'liyuan-tavern-state-refresh-error',error:error.message,entryId:data.entryId,entryScope:data.entryScope,requestId:data.requestId},location.origin));return;
  }
  if(data?.type==='liyuan-tavern-evaluate-template'&&typeof data.html==='string'&&typeof data.requestId==='number'&&ready)
   void evaluateTemplateFromParent(data).catch(error=>parent.postMessage({type:'liyuan-tavern-error',error:error.message,requestId:data.requestId,entryId:data.entryId},location.origin));
@@ -153,8 +191,10 @@ if(view==='manager'&&focus==='mvu'){
  window.addEventListener('pagehide',()=>clearInterval(timer),{once:true});
 }
 try{
- const serviceWorkerReady=(async()=>{
-  if(view==='runtime'||params.get('network')==='isolated'||!('serviceWorker' in navigator))return;
+ const serviceWorkerReady = view === 'manager' && params.get('network') !== 'isolated'
+  ? ensureManagerWorker(navigator.serviceWorker, location.origin)
+  : (async()=>{
+  if(view==='runtime'||view==='render'||params.get('network')==='isolated'||!('serviceWorker' in navigator))return;
   if(navigator.serviceWorker.controller?.scriptURL===new URL('/tavern-plugin-sw.js',location.href).href)return;
   try{await Promise.race([(async()=>{await navigator.serviceWorker.register('/tavern-plugin-sw.js',{scope:'/tavern-plugin-host.html'});await navigator.serviceWorker.ready;if(!navigator.serviceWorker.controller)await new Promise(resolve=>{const done=()=>{clearTimeout(timer);navigator.serviceWorker.removeEventListener('controllerchange',done);resolve();},timer=setTimeout(done,2000);navigator.serviceWorker.addEventListener('controllerchange',done);});})(),new Promise(resolve=>setTimeout(resolve,5000))]);}catch{ /* restricted browsers retain original CDN requests */ }
  })();
@@ -163,6 +203,15 @@ try{
  if(params.has('scopeKey')&&params.get('scopeKey')!==host.context.scopeKey)throw new Error('会话或角色卡已变化，旧显示宿主不会写入新作用域');
  if(focus==='mvu'&&(!host.context.mvu?.enabled||!host.context.mvu.installed||!host.context.plugins.find(p=>p.id==='helper')?.enabled))throw new Error('请先启用已校验的原MVU与酒馆助手，不能以设置页临时启用冒充可用');
  if(view==='manager'){const selected=host.context.plugins.find(p=>p.id===params.get('plugin'));if(selected?.version)selected.enabled=true;}
+ if(host.context.plugins.some(plugin=>plugin.id==='helper'&&plugin.enabled)){
+  const assets=await host.request('/asset-map');
+  installNativeResources({origin:location.origin,assets,workspace:document.querySelector('meta[name="liyuan-workspace"]')?.content,lease:document.querySelector('meta[name="liyuan-workspace-lease"]')?.content});
+ }
+ // Existing old workers may still intercept unknown decorative resources. Update
+ // only our exact registration; render realms never require/register a worker.
+ if(view==='render'&&navigator.serviceWorker?.controller?.scriptURL===new URL('/tavern-plugin-sw.js',location.origin).href){
+  void navigator.serviceWorker.getRegistration('/tavern-plugin-host.html').then(registration=>{if(registration?.scope===new URL('/tavern-plugin-host.html',location.origin).href&&registration.active?.scriptURL===new URL('/tavern-plugin-sw.js',location.origin).href)return registration.update();}).catch(()=>{});
+ }
  if(view==='manager')await loadPluginLocales(host.context.plugins);
  await serviceWorkerReady;
  for(const plugin of ['template','helper']){
@@ -174,11 +223,13 @@ try{
  for(let i=0;i<100;i++){if(host.context.plugins.every(p=>!p.enabled||(p.id==='helper'?!!window.TavernHelper:!!window.EjsTemplate)))break;await new Promise(r=>setTimeout(r,50));}
   if(!host.context.plugins.every(p=>!p.enabled||(p.id==='helper'?!!window.TavernHelper:!!window.EjsTemplate)))throw new Error('原插件没有完成初始化');
   if(window.TavernHelper?._bind){
-   host.nativeMvuListeners=new Map();
+   host.nativeMvuListeners=new Map();host.nativeDisplayListeners=new Map();
    for(const name of ['_eventOn','_eventMakeFirst','_eventMakeLast','_eventOnce']){
     const original=window.TavernHelper._bind[name];if(typeof original!=='function')continue;
     window.TavernHelper._bind[name]=function(event,...args){
      const prior=new Set(eventSource.listeners.get(event)??[]),result=original.call(this,event,...args);
+     const iframeId=String(this.frameElement?.id??this.__TH_IFRAME_ID??this.name??'');
+     if(iframeId.startsWith('TH-message--')&&host.chat[Number(this.frameElement?.closest('.mes')?.getAttribute('mesid'))]?.__liyuanEntryId===params.get('entryId')){const listeners=host.nativeDisplayListeners.get(event)??new Map();for(const listener of eventSource.listeners.get(event)??[])if(!prior.has(listener))listeners.set(listener,this.frameElement);host.nativeDisplayListeners.set(event,listeners);}
      const scriptId=String(this.frameElement?.id??this.__TH_IFRAME_ID??this.name??'').replace(/TH-script--.+--/,'');
      const trees=window.TavernHelper.getScriptTrees({type:'global'});
      const native=items=>items.some(item=>item.type==='folder'?native(item.scripts??[]):item.id===scriptId&&/MagVarUpdate|MVU变量框架/.test(String(item.content??'')+' '+String(item.name??'')));
@@ -218,6 +269,7 @@ try{
   }
  }
    host.nativeMvuWorldbookListeners=host.nativeMvuListeners?.get(event_types.WORLDINFO_ENTRIES_LOADED)??new Set((eventSource.listeners.get(event_types.WORLDINFO_ENTRIES_LOADED)??[]).filter(listener=>!priorWorldbookListeners.has(listener)));
+   if(view==='render'){await new Promise(resolve=>setTimeout(resolve,0));host.displayBootstrap=false;host.persistedStateJSON=JSON.stringify(host.state());}
    settingsUI.refresh();if(focus==='mvu'){const deadline=Date.now()+10000;while(!settingsUI.mvuReady()){if(Date.now()>deadline)throw new Error('原MVU设置未挂载，不把空面板当成就绪');await new Promise(resolve=>setTimeout(resolve,30));}}ready=true;status.textContent='原插件已就绪（梨园宿主适配，不是完整酒馆）';
  if(view==='manager')parent.postMessage({type:'liyuan-tavern-manager-ready',attempt:params.get('attempt'),contextTick:params.get('contextTick')},location.origin);
  if(view==='manager'&&params.get('plugin')){const plugin=params.get('plugin');const unwanted=plugin==='helper'?document.getElementById('prompt_template_settings'):document.getElementById('tavern_helper');if(unwanted)unwanted.hidden=true;}
@@ -237,7 +289,7 @@ window.LiyuanTavernPlugins.recoverMvu=()=>{
   if(!ready||!host.context.mvu?.enabled||typeof window.Mvu?.parseMessage!=="function")throw new Error("原MVU尚未启用/初始化");
   const msg=host.chat.at(-1),id=msg?.__liyuanEntryId,scopeKey=host.context.scopeKey;
   if(!id||id!==host.context.sourceEntryId||msg.is_user||msg.__liyuanUnfinished||typeof msg.__liyuanAuthorDelivery!=="string"||!msg.__liyuanAuthorDelivery.trim())throw new Error("没有完整且可追溯的原作者交付，不能补造变量更新");
-   const projection=mvuParsingProjection(msg.__liyuanAuthorDelivery);
+   const projection=mvuParsingProjection(mvuParseSource(msg.__liyuanAuthorDelivery,msg.__liyuanSupplementaryVariables));
    if(host.extensions.mvu_settings?.更新方式==='额外模型解析'&&host.extensions.mvu_settings.额外模型解析配置?.密钥)throw new Error('MVU受管解析不接受原设置中的自定义密钥；原设置保持不变，请先核对独立受管连接');
    const records=host.metadata.__liyuanMvuProcessed??={},receipt=records[id];
    const materials=[projection.text,host.context.readonlyBooks,host.extensions.mvu_settings];

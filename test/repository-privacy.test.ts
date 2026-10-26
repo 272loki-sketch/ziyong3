@@ -248,7 +248,7 @@ test('license approval is exact, available, mirrored in ignore rules and content
   assert.match(readFileSync(resolve('.gitattributes'), 'utf8'), /^licenses\/Luker-AGPL-3\.0\.txt text eol=lf\r?$/m);
   // SHA-256 independently checked against GNU's official agpl-3.0.txt.
   assert.equal(createHash('sha256').update(license).digest('hex'), '0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0');
-  const doc = readFileSync(resolve('docs/PROMPT-SOURCES.md'), 'utf8');
+  const doc = readFileSync(resolve('docs/materials.md'), 'utf8');
   assert.equal(doc.includes('prompt-attribution/Luker-AGPL-3.0.txt'), false);
   for (const path of paths) {
     assert.match(doc, new RegExp(path.replace(/[.]/g, '\\.')));
@@ -281,13 +281,13 @@ test('path allowlist rejects private segments, new assets, presets and diagnosti
   for (const path of ['src/.rp-state/a', 'web/.pi/a', 'docs/.local/a', 'src/data/a', 'src/node_modules/a', 'web/screenshots/a', 'src/a.json.tmp-123', 'src/a.bak', 'test/.env.example', '.liyuan/settings.json', 'liyuan.agent.json', 'assets/cards/private.json', 'presets/new.json', 'scripts/probe-private.mjs', 'scripts/local-audit.mjs']) {
     assert.notEqual(pathCategory(path, true), null, path);
   }
-  for (const path of ['README.md', 'AGENTS.md', 'CLAUDE.md', 'TESTING.md', 'LICENSE', 'src/a.ts', 'server/main.ts', 'docs/GENERATION-MODES.md', 'packages/coding-agent/docs/sdk.md', '.liyuan/extensions/roleplay.ts', 'assets/cards/default_Qingwu.json', 'presets/\u9ed8\u8ba4.json']) assert.equal(pathCategory(path, true), null, path);
+  for (const path of ['README.md', 'AGENTS.md', 'CLAUDE.md', 'TESTING.md', 'LICENSE', 'src/a.ts', 'server/main.ts', 'docs/architecture.md', 'packages/coding-agent/docs/sdk.md', '.liyuan/extensions/roleplay.ts', 'assets/cards/default_Qingwu.json', 'presets/\u9ed8\u8ba4.json']) assert.equal(pathCategory(path, true), null, path);
   assert.notEqual(pathCategory('scripts/probe-backstage.mjs', false), null);
   assert.equal(pathCategory('scripts/probe-backstage.mjs', true), null);
 });
 
 test('docs approval is exact, mirrored in ignore rules, and has no binary baseline', () => {
-  assert.equal(approvedDocumentation.size, 37);
+  assert.equal(approvedDocumentation.size, 11);
   const ignore = readFileSync(resolve('.gitignore'), 'utf8');
   const names = [...ignore.matchAll(/^!\/docs\/(.+)$/gm)].map(m => m[1]);
   assert.deepEqual(names.sort(), [...approvedDocumentation].sort());

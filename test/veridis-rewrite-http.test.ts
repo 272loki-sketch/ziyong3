@@ -1,5 +1,11 @@
 import assert from'node:assert/strict';import test from'node:test';import{mkdtempSync,rmSync,writeFileSync,readFileSync,symlinkSync}from'node:fs';import{tmpdir}from'node:os';import{join}from'node:path';import{createServer}from'node:http';
 import{VeridisRewriteHttp}from'../server/veridis-rewrite-http.ts';
+test('status retains source-bound failure reason without returning author or projection text',async()=>fixture(async({http,base,source})=>{
+ http.host.branch=()=>[{customType:'rp-veridis-rewrite',data:{version:1,sourceEntryId:'synthetic-source',status:'failed',changed:false,calls:1,error:'受管改写 HTTP 429 限流',text:'synthetic-private-projection'}}];
+ const response=await fetch(base+'/api/veridis-rewrite/status'),status=await response.json();
+ assert.equal(status.receipt.error,'受管改写 HTTP 429 限流');assert.equal(status.receipt.calls,1);assert.equal(status.receipt.text,undefined);
+ source('other-source');assert.equal((await(await fetch(base+'/api/veridis-rewrite/status')).json()).receipt,undefined);
+}));
 for(const local of [{rules:[{id:'local-rule'}],aiRewrite:{temperature:0.2,enabled:true,autoTriggerEnabled:true}},{rules:[]},[{id:'local-array-rule'}],[]])test(`global default uses same-name local override (${JSON.stringify(local)})`,async()=>fixture(async({http,base})=>{
  const path=join(http.cwd,'.liyuan-veridis-rewrite','global-presets.json');writeFileSync(path,JSON.stringify({version:1,defaultPreset:'shared',presets:{shared:{rules:[{id:'global-rule'}],aiRewrite:{temperature:0.9}}}}),{mode:0o600});
  const scope=http.host.binding(),saved=http.store.read(scope),state=structuredClone(saved.state),settings={rules:[],activePreset:'',presets:{shared:local},aiRewrite:{enabled:true,autoTriggerEnabled:false,temperature:0.6}};state.extensionSettings.veridis_rewrite=settings;http.store.save(scope,saved.revision,state,()=>{});

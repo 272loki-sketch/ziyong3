@@ -4,7 +4,7 @@ description: 按原始预设和明确人设审阅草稿的表达，不另建通�
 workflow: director-review-style
 license: AGPL-3.0-only
 upstream-author: Luker Team
-attribution: docs/PROMPT-SOURCES.md
+attribution: docs/materials.md
 resident: false
 每轮: false
 ---

@@ -8,9 +8,12 @@ export function clampMaxTokensToContext(model, context, maxTokens) {
     return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));
 }
 export function buildBaseOptions(model, context, options, apiKey) {
+    if (options?.useProviderDefaultMaxTokens && (model.api !== "openai-completions" || options.maxTokens !== undefined)) {
+        throw new Error("Provider-default max tokens requires openai-completions and no explicit maxTokens");
+    }
     return {
         temperature: options?.temperature,
-        maxTokens: clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens),
+        maxTokens: options?.useProviderDefaultMaxTokens ? undefined : clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens),
         signal: options?.signal,
         apiKey: apiKey || options?.apiKey,
         transport: options?.transport,
@@ -19,6 +22,7 @@ export function buildBaseOptions(model, context, options, apiKey) {
         headers: options?.headers,
         onPayload: options?.onPayload,
         onResponse: options?.onResponse,
+        onTransport: options?.onTransport,
         timeoutMs: options?.timeoutMs,
         websocketConnectTimeoutMs: options?.websocketConnectTimeoutMs,
         maxRetries: options?.maxRetries,

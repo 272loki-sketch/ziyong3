@@ -50,6 +50,7 @@ export function RequestInspector({ onClose, contextTick }: { onClose: () => void
 					<dt>请求编号 / 轮次</dt><dd>{detail.id} / {detail.narrativeEntryId || detail.sourceEntryId}</dd>
 					<dt>渠道 / 模型 / 状态</dt><dd>{detail.provider} / {detail.model} · {requestStatusLabel(detail.status)}</dd>
 					<dt>结束原因</dt><dd title={detail.stopReason}>{stopReasonLabel(detail.stopReason)}</dd>
+     {detail.failure && <><dt>失败来源</dt><dd>{detail.failure.origin === "local-timeout" ? "本地预算到期" : detail.failure.origin === "cancelled" ? "调用已取消" : detail.failure.origin === "provider" ? "接口／网关返回" : "SDK／传输层"}{detail.failure.statusCode ? ` · HTTP ${detail.failure.statusCode}` : ""}{detail.failure.timeoutMs ? ` · ${ms(detail.failure.timeoutMs)}` : ""}</dd><dt>失败详情</dt><dd>{detail.failure.reason}</dd></>}
 					<dt>耗时 / 首个文本或思考增量</dt><dd>{ms(detail.durationMs)} / {ms(detail.firstTokenMs)}（单次实际经过时间；并行请求不能相加当整拍耗时）</dd>
 					<dt>输入 / 输出 / 总词元</dt><dd>{fmt(inputUsage(detail))} / {fmt(detail.usage?.output)} / {fmt(detail.usage?.totalTokens)} · {detail.usageSource === "missing" ? "未返回，不估算" : "模型接口用量回执"}（输入含缓存读取与写入）</dd>
 					<dt>缓存读取 / 写入词元</dt><dd>{fmt(detail.usage?.cacheRead)} / {fmt(detail.usage?.cacheWrite)}</dd>

@@ -61,7 +61,7 @@ const initiatives = (value: unknown): CharacterInitiative[] | undefined => {
 	return result.length ? result : undefined;
 };
 
-export function buildLiteraryDirectorPrompt(input: {
+export interface LiteraryDirectorInput {
 	state: WorldState;
 	history: BeatMsg[];
 	summary?: string;
@@ -78,9 +78,13 @@ export function buildLiteraryDirectorPrompt(input: {
 	characterIdentityIndex?: string;
 	characterCard?: { name: string; description: string; personality: string; scenario: string };
 	userPersona?: string;
-}): { systemPrompt: string; userText: string } {
+}
+
+const directorRole = "你是梨园文学工作流唯一的拍前导演。遵循随附 Stitches 工作流 Skill；只输出候选数据，不写正文、对白或状态补丁。不得创造新事实，不得把候选写成已发生历史。";
+
+export function buildLiteraryDirectorPrompt(input: LiteraryDirectorInput): { systemPrompt: string; userText: string } {
 	return {
-		systemPrompt: `你是梨园文学工作流唯一的拍前导演。遵循随附 Stitches 工作流 Skill；只输出候选数据，不写正文、对白或状态补丁。不得创造新事实，不得把候选写成已发生历史。
+		systemPrompt: `${directorRole}
 
 严格只返回 JSON：{"scenePressure":"","characterInitiatives":[],"personalThreads":[],"offstageThreads":[],"candidateBeats":[],"withheldInformation":[],"relationshipLimit":""}。characterInitiatives 每项为 {"character":"","motive":"","immediateIntent":"","limit":""}。所有数组最多三项；不适用项使用空字符串或空数组。`,
 		userText: JSON.stringify(
@@ -107,6 +111,20 @@ export function buildLiteraryDirectorPrompt(input: {
 	};
 }
 
+/** Same director responsibilities/data, inside the native recall task, not a second model call.
+ * The upstream task owns tags/AM selection/writeback; never impose our standalone JSON schema.
+ */
+export function buildDatabaseLiteraryDirectorPrompt(input: LiteraryDirectorInput, skillBody: string): { systemPrompt: string; userText: string } {
+	return {
+		systemPrompt: `本拍记忆召回与文学导演合并执行。${directorRole}
+原生任务仍负责召回、AM选择、标签与输入写回，不改原有结果。仅关键词/索引提取的子任务保持原格式；记忆召回或剧情任务完成原标签后，额外附上 <liyuan_literary_direction>{"scenePressure":"","characterInitiatives":[],"personalThreads":[],"offstageThreads":[],"candidateBeats":[],"withheldInformation":[],"relationshipLimit":""}</liyuan_literary_direction>。characterInitiatives每项为{"character":"","motive":"","immediateIntent":"","limit":""}，数组最多三项，不适用项留空。该候选由宿主读取，不替代原召回标签或正文。
+
+# 工作流 skill：拍前导演
+${skillBody}`,
+		userText: buildLiteraryDirectorPrompt(input).userText,
+	};
+}
+
 const parseObject = (value: unknown): Record<string, unknown> | null => {
 	if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
 	if (typeof value !== "string") return null;
@@ -123,6 +141,25 @@ const parseObject = (value: unknown): Record<string, unknown> | null => {
 	}
 	return null;
 };
+
+/** Empty but well-shaped native candidates mean “no advice”, not a reason for another model call. */
+export function parseDatabaseLiteraryDirection(value: unknown): LiteraryDirection | undefined {
+	const parsed = parseObject(value);
+	if (!parsed) return undefined;
+	const strings = ["scenePressure", "relationshipLimit"];
+	const arrays = ["characterInitiatives", "personalThreads", "offstageThreads", "candidateBeats", "withheldInformation"];
+	if (![...strings, ...arrays].some(key => Object.hasOwn(parsed, key))) return undefined;
+	if (strings.some(key => Object.hasOwn(parsed, key) && typeof parsed[key] !== "string") || arrays.some(key => Object.hasOwn(parsed, key) && !Array.isArray(parsed[key]))) return undefined;
+	if (arrays.filter(key => key !== "characterInitiatives").some(key => (parsed[key] as unknown[] | undefined)?.some(item => typeof item !== "string"))) return undefined;
+	if ((parsed.characterInitiatives as unknown[] | undefined)?.some(item => {
+		if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+		const record = item as Record<string, unknown>;
+		const fields = ["character", "motive", "immediateIntent", "limit"];
+		return !fields.some(key => Object.hasOwn(record, key)) || fields.some(key => Object.hasOwn(record, key) && typeof record[key] !== "string");
+	})) return undefined;
+	const candidate = Object.fromEntries([...strings, ...arrays].filter(key => Object.hasOwn(parsed, key)).map(key => [key, parsed[key]]));
+	return parseLiteraryDirection(candidate) ?? { version: 1 };
+}
 
 export function parseLiteraryDirection(value: unknown): LiteraryDirection | undefined {
 	const parsed = parseObject(value);

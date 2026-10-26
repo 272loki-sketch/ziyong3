@@ -8,7 +8,7 @@ export interface ImagePromptBlock {
 /** Display-only boundary retained when postprocessing unwraps the following tag. */
 export const IMAGE_PROMPT_BOUNDARY = "\uE012";
 
-/** Pure parser for historical image metadata; it has no generation capability. */
+/** Pure image metadata parser shared by historical display and explicit generation; no I/O. */
 export function parseImagePrompt(raw: string) {
 	const inner = raw.match(/image###([\s\S]*?)###/i)?.[1]?.trim() || raw.trim();
 	const fields = [...inner.matchAll(/\b(Scene Composition|Character\s+(\d+)\s+(Prompt|UC))\s*:/gi)];

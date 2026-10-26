@@ -1,3 +1,4 @@
+import { scopedUrl } from "../workspace.ts";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api.ts";
 import { PluginLeaveError, usePluginLeave } from "../plugins/usePluginLeave.tsx";
@@ -15,6 +16,8 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 	const [view, setView] = useState<View>({ phase: "checking" });
 	const [progress, setProgress] = useState("正在加载原数据库完整管理界面…");
 	const [feedback, setFeedback] = useState<{ kind: string; message: string } | null>(null);
+	const [bindingError, setBindingError] = useState("");
+	const [checkingBinding, setCheckingBinding] = useState(false);
 	const frameRef = useRef<HTMLIFrameElement>(null);
 	const dialogRef = useRef<HTMLDivElement>(null);
 	const closeRef = useRef<HTMLButtonElement>(null);
@@ -45,11 +48,14 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 		setView({ phase: "checking" });
 		setProgress("正在检查数据库安装与当前分支…");
 		setFeedback(null);
-		void Promise.all([api<Status>("/api/database-plugin/status"), api<Binding>("/api/database-plugin/binding")]).then(([status, binding]) => {
+		setBindingError("");
+		const controller = new AbortController();
+		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]);
+		void Promise.all([api<Status>("/api/database-plugin/status", { signal }), api<Binding>("/api/database-plugin/binding", { signal })]).then(([status, binding]) => {
 			if (!active) return;
 			setView({ phase: status.sourceReady ? "loading" : "missing", binding, enabled: status.config.enabled });
 		}).catch(error => { if (active) setView({ phase: "error", error: error instanceof Error ? error.message : "数据库状态读取失败" }); });
-		return () => { active = false; };
+		return () => { active = false; controller.abort(); };
 	}, [attempt]);
 
 	useEffect(() => {
@@ -72,12 +78,15 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 	// Check only a small binding record, never repeatedly download thousand-floor history.
 	useEffect(() => {
 		let active = true, inFlight = false;
+		const controller = new AbortController();
 		const check = async () => {
-			if (inFlight || !viewRef.current.binding || document.hidden) return;
+			if (inFlight) return;
+			if (!viewRef.current.binding || document.hidden) { if (active) setCheckingBinding(false); return; }
 			inFlight = true;
 			try {
-				const next = await api<Binding>("/api/database-plugin/binding");
+				const next = await api<Binding>("/api/database-plugin/binding", { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) });
 				if (!active) return;
+				setBindingError("");
 				const previous = viewRef.current.binding;
 				if (previous && keyOf(next) !== keyOf(previous)) {
 					// Remove the old frame immediately. Its late messages cannot mark the new frame ready.
@@ -85,29 +94,25 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 					setAttempt(value => value + 1);
 				} else setView(current => current.binding ? { ...current, binding: next } : current);
 			} catch (error) {
-				if (active) setView(current => ({ ...current, phase: "error", error: error instanceof Error ? error.message : "数据库作用域检查失败" }));
-			} finally { inFlight = false; }
+				// A network outage is not a source change. Retain the original frame and its draft.
+				if (active) setBindingError(error instanceof Error ? error.message : "数据库作用域检查失败");
+			} finally { inFlight = false; if (active) setCheckingBinding(false); }
 		};
+		setCheckingBinding(!!viewRef.current.binding);
 		void check();
 		const timer = window.setInterval(() => { void check(); }, 2500);
 		const wake = () => { void check(); };
 		window.addEventListener("focus", wake);
+		window.addEventListener("liyuan:database-binding-recheck", wake);
 		document.addEventListener("visibilitychange", wake);
-		return () => { active = false; clearInterval(timer); window.removeEventListener("focus", wake); document.removeEventListener("visibilitychange", wake); };
-	}, [contextTick, attempt]);
+		return () => { active = false; controller.abort(); clearInterval(timer); window.removeEventListener("focus", wake); window.removeEventListener("liyuan:database-binding-recheck", wake); document.removeEventListener("visibilitychange", wake); };
+	}, [contextTick, attempt, busy]);
 
 	useEffect(() => {
 		if (view.phase !== "loading") return;
 		const timer = window.setTimeout(() => setView(current => current.phase === "loading" ? { ...current, phase: "error", error: "原插件管理界面加载超时，请刷新重试；不会假称记忆已保存。" } : current), 65000);
 		return () => clearTimeout(timer);
 	}, [view.phase, attempt]);
-
-	const previousBusy = useRef(busy);
-	useEffect(() => {
-		const becameIdle = previousBusy.current && !busy;
-		previousBusy.current = busy;
-		if (becameIdle) { setView({ phase: "checking" }); setAttempt(value => value + 1); }
-	}, [busy]);
 
 	const refresh = () => leave(() => { setView({ phase: "checking" }); setAttempt(value => value + 1); });
 	const runHost = async (method: "openTables" | "refreshTables") => {
@@ -117,13 +122,13 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 			await host[method]();
 		} catch (error) { setFeedback({ kind: "error", message: error instanceof Error ? error.message : "原表格操作失败" }); }
 	};
-	const readOnly = busy || view.binding?.streaming === true;
+	const readOnly = busy || view.binding?.streaming === true || !!bindingError || checkingBinding;
 	const frameInert = readOnly || leaving || view.phase !== "ready";
 	useLayoutEffect(() => {
 		// Reconcile current read-only policy after the shared hook restores its pre-save inert snapshot.
 		if (frameRef.current) frameRef.current.inert = frameInert;
 	}, [frameInert, leaving, frameKey]);
-	const src = view.binding ? `/database-plugin-host.html?view=manager&scopeKey=${encodeURIComponent(view.binding.scopeKey)}&sourceEntryId=${encodeURIComponent(view.binding.sourceEntryId)}&hostSource=${encodeURIComponent(view.binding.sha256)}` : "";
+	const src = view.binding ? scopedUrl(`/database-plugin-host.html?view=manager&scopeKey=${encodeURIComponent(view.binding.scopeKey)}&sourceEntryId=${encodeURIComponent(view.binding.sourceEntryId)}&hostSource=${encodeURIComponent(view.binding.sha256)}`) : "";
 
 	return <div ref={dialogRef} className="database-manager-backdrop">
 	<div className="database-manager" role="dialog" aria-modal="true" aria-label="数据库管理台" onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); leave(onClose); } }}>
@@ -132,14 +137,16 @@ export function DatabasePluginManager({ onClose, busy, contextTick }: { onClose:
 			<div className="database-manager__actions">
 				<button type="button" disabled={view.phase !== "ready" || readOnly || leaving} onClick={() => { void runHost("openTables"); }}>实时表格</button>
 				<button type="button" disabled={view.phase !== "ready" || readOnly || leaving} onClick={() => { void runHost("refreshTables"); }}>刷新表格</button>
-				<button type="button" disabled={leaving} onClick={refresh} title="重新加载会丢弃尚未保存的原插件草稿"><IconRefresh size={16} />刷新</button>
-				<a href="/database-plugin-host.html?view=manager" target="_blank" rel="noopener noreferrer">独立打开</a>
+				<button type="button" disabled={leaving} onClick={refresh} title="确认原设置保存后重新加载"><IconRefresh size={16} />刷新</button>
+				<a href={scopedUrl("/database-plugin-host.html?view=manager")} target="_blank" rel="noopener noreferrer">独立打开</a>
 				<button ref={closeRef} type="button" disabled={leaving} onClick={() => leave(onClose)} aria-label="返回对话"><IconClose size={16} />返回对话</button>
 			</div>
 		</header>
 		<div className="database-manager__hint">人物、纪要：原「填表工作台」→「可视化表格编辑器」。首次填表前可能为空，可在原「数据管理」导入；不会自动收费重填全历史。梨园模型预设复用现有连接，密钥由服务端管理。</div>
 		{view.enabled === false && <div className="database-manager__notice">当前自动记忆后端未启用，管理数据仍保留；可在设置→上游数据库插件启用。</div>}
-		{readOnly && <div className="database-manager__notice" role="status">正文正在生成，管理台暂时只读，生成结束后可继续操作。</div>}
+		{(busy || view.binding?.streaming) && <div className="database-manager__notice" role="status">正文或后台任务正在进行，管理台暂时只读。</div>}
+		{checkingBinding && <div className="database-manager__notice" role="status">正在核对当前分支，编辑内容已保留…</div>}
+		{bindingError && <div className="database-manager__notice" role="alert">分支状态暂时无法确认：{bindingError}。编辑内容已保留，核对成功后恢复操作。 <button type="button" onClick={() => window.dispatchEvent(new Event("liyuan:database-binding-recheck"))}>重新核对分支</button></div>}
 		{feedback && <div className="database-manager__notice" role={feedback.kind === "error" ? "alert" : "status"}>{feedback.message}</div>}
 		{leaving && <div className="database-manager__notice" role="status">正在等待原数据库设置保存确认…</div>}
 		<PluginLeaveError error={leaveError} discard={discard} />

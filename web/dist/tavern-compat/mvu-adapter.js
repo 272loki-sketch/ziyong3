@@ -10,6 +10,17 @@ export function mvuParsingProjection(text){
  return {text:projected,repairedPatchClosingTag:changed};
 }
 
+/**
+ * MVU parse source: the author's delivery, plus only those validated supplementary
+ * items that carry a variable update block the author omitted. Display-only
+ * ancillary text never reaches MVU. Neither input is modified.
+ */
+export function mvuParseSource(authorDelivery,supplementaryVariableText){
+ const author=String(authorDelivery??'');
+ const extra=String(supplementaryVariableText??'').trim();
+ return extra?author+'\n\n'+extra:author;
+}
+
 /** Native MVU may catch a failed request and return normally. Do not issue a success receipt. */
 export function assertMvuCandidatesSettled(candidates){
  if(candidates.some(candidate=>candidate.pending))throw new Error('MVU candidate request is still pending; no completion receipt');

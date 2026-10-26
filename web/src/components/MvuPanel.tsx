@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type Ref } from "react";
 import { api } from "../api.ts";
 import { mvuRecoveryMessage, mvuReceiptMessage, sameMvuBinding, type MvuUiState, type MvuRecoveryResult } from "../mvu-ui.ts";
 import { IconCheck, IconChevronDown, IconRefresh, IconSettings } from "./icons.tsx";
@@ -10,8 +10,8 @@ interface Feedback {kind:"info"|"success"|"error";text:string;source?:string}
 export interface MvuSettingsTarget {version:string;commit:string}
 
 /** Native-drawer-inspired management shell. It never parses/rebuilds story or variable data. */
-export function MvuPanel({toast,contextTick=0,storyBusy=false,onOpenSettings}:{
- toast:Toast;contextTick?:number;storyBusy?:boolean;onOpenSettings?:(target:MvuSettingsTarget,signal:AbortSignal)=>Promise<void>;
+export function MvuPanel({toast,contextTick=0,storyBusy=false,onOpenSettings,titleRef}:{
+ toast:Toast;contextTick?:number;storyBusy?:boolean;titleRef?:Ref<HTMLHeadingElement>;onOpenSettings?:(target:MvuSettingsTarget,signal:AbortSignal)=>Promise<void>;
 }) {
  const [view,setView]=useState<MvuUiState|null>(null),[loading,setLoading]=useState(true);
  const [loadError,setLoadError]=useState(""),[action,setAction]=useState<Action|null>(null);
@@ -87,7 +87,7 @@ export function MvuPanel({toast,contextTick=0,storyBusy=false,onOpenSettings}:{
  return <section className="mvu-panel" aria-label="MVU变量系统" aria-busy={busy||loading}>
   <header className="mvu-panel-header">
    <div className="mvu-panel-mark" aria-hidden="true">MVU</div>
-   <div className="mvu-panel-heading"><h3>MVU 变量框架</h3><p>角色卡变量 · 原版框架运行</p></div>
+   <div className="mvu-panel-heading"><h3 ref={titleRef} tabIndex={-1}>MVU 变量框架</h3><p>角色卡变量 · 原版框架运行</p></div>
    <span className={`mvu-state-badge ${view?.enabled&&view.installed?"is-on":""}`}><span aria-hidden="true"/>{stateText}</span>
    <button type="button" className="mvu-icon-button" aria-label="刷新MVU状态" title="刷新 MVU 状态" disabled={loading} onClick={()=>void refresh()}><IconRefresh size={17}/></button>
   </header>

@@ -42,7 +42,7 @@ test('historical MVU state publication rejects a cancelled retry and a replaced 
  }
 });
 
-test('historical MVU model allowance is charged to the requested source, persists, and blocks attempt nine before generation',async()=>{
+test('historical MVU model allowance is charged to the requested source, persists, and permits attempt nine without a source quota',async()=>{
  const cwd=mkdtempSync(join(tmpdir(),'mvu-history-budget-')),context=syntheticTavernPluginContext();
  context.chat.push({mes:'Synthetic ancestor',is_user:false,__liyuanEntryId:'ancestor',__liyuanAuthorDelivery:'Synthetic complete ancestor'},{mes:'Synthetic head',is_user:false,__liyuanEntryId:'latest',__liyuanAuthorDelivery:'Synthetic complete latest'});
  context.visibleEntryIds.push('ancestor','latest');context.sourceEntryId='latest';let calls=0;
@@ -53,7 +53,7 @@ test('historical MVU model allowance is charged to the requested source, persist
  try{
   const base=`http://127.0.0.1:${(server.address() as any).port}`,headers={'content-type':'application/json','x-liyuan-tavern-scope':head.scopeKey,'x-liyuan-tavern-source':'ancestor','x-liyuan-tavern-host':api.internalToken,'x-liyuan-tavern-turn':api.turnNonce},body=JSON.stringify({messages:[{role:'user',content:'Synthetic MVU request'}]});
   for(let i=0;i<8;i++)assert.equal((await fetch(base+'/api/tavern-plugins/generate',{method:'POST',headers,body})).status,200);
-  const ninth=await fetch(base+'/api/tavern-plugins/generate',{method:'POST',headers,body});assert.equal(ninth.status,400);assert.match((await ninth.json()).error,/8次预算/);assert.equal(calls,8);
-  assert.equal(api.store.claimModelRequest(head,8,()=>{}).calls,1,'head and historical target retain independent source allowances');
+  const ninth=await fetch(base+'/api/tavern-plugins/generate',{method:'POST',headers,body});assert.equal(ninth.status,200);assert.equal(calls,9);
+  assert.equal(api.store.claimModelRequest(head,8,()=>{}).calls,1,'head and historical target retain independent source counts');
  }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));api.sources.close();rmSync(cwd,{recursive:true,force:true});}
 });

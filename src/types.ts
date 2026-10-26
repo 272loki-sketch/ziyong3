@@ -25,7 +25,7 @@ export interface CharacterCard {
 /** 归一化后的世界书条目（兼容 ST world info 格式与卡内嵌 character_book 格式） */
 export interface LorebookEntry {
 	uid: number;
-	/** 管理来源中的原始数组索引/对象键；不作为剧情检索权威。 */
+	/** 来源书中的原始数组索引/对象键；独立行即使同 uid/正文也不合并。 */
 	entryKey?: string;
 	keys: string[];
 	secondaryKeys: string[];
@@ -36,8 +36,12 @@ export interface LorebookEntry {
 	/** 是否要求次要关键词也命中（AND_ANY 语义，v0 仅实现该逻辑） */
 	selective: boolean;
 	order: number;
-	/** 统一知识集合中的来源，仅供审计；不参与检索或冲突判定。 */
+	/** 统一知识集合的原始来源。 */
 	source?: string;
+	/** 已解析存储实体身份；重复绑定只装载一次，正文不作为条目身份。 */
+	bookId?: string;
+	worldbookName?: string;
+	worldbookScope?: "character" | "character_aux" | "global" | "chat" | "agent";
 }
 
 /**
@@ -83,10 +87,17 @@ export interface RpConfig {
 	/** 角色卡路径（.png 或 .json），相对项目根 */
 	card: string;
 	/**
-	 * 已挂载的独立世界书路径列表（可 0..N 本同时启用；与角色卡无关，换卡不清除）。
-	 * 装配顺序即数组合序；条目按内容指纹去重。
+	 * 全局世界书路径（旧挂载保持全局，不猜测迁移）。换卡仍生效。
+	 * 角色主书由卡 extensions.world 显式绑定；附加/聊天书见 lorebookBindings。
 	 */
 	lorebooks?: string[];
+	/** 显式作用域绑定；角色键是规范卡路径，聊天再按 sessionId 隔离。 */
+	lorebookBindings?: {
+		/** 宿主复制/移动素材时的可验证路径映射；仅匹配卡当前声明，不改卡原字节。 */
+		primary?: Record<string, { reference: string; path: string }>;
+		character?: Record<string, string[]>;
+		chat?: Record<string, Record<string, string[]>>;
+	};
 	/**
 	 * @deprecated 旧版单本挂载；读时迁入 lorebooks，写盘时只保留 lorebooks。
 	 */

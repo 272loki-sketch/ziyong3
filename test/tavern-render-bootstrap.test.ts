@@ -1,0 +1,12 @@
+/** Synthetic render snapshots only. The original runtime/manager write contract stays unchanged. */
+import assert from 'node:assert/strict';import test from 'node:test';import vm from 'node:vm';import{readFileSync}from'node:fs';
+for(const entry of ['bridge.js','bridge-worldbooks.js'])test(`${entry}: render bootstrap stays local, later real changes still persist with exact CAS binding`,async()=>{
+ const source=readFileSync(new URL('../web/public/tavern-compat/'+entry,import.meta.url),'utf8').replace(/^import[^\r\n]*;\r?\n/,'').replace(/^export \{[^\r\n]+\};?\r?$/m,'');
+ const sandbox:any={URLSearchParams,structuredClone,location:{search:'?view=render'},window:{dispatchEvent(){}},document:{querySelector(){return null;}},getCurrentLocale:()=>'',t:()=>'',localizeTemplate:(v:unknown)=>v};vm.runInNewContext(source,sandbox);const h=sandbox.LiyuanTavern;
+ const context={sessionId:'synthetic',scopeKey:'scope',sourceEntryId:'reply',revision:9,userName:'Synthetic',plugins:[],chat:[{__liyuanEntryId:'reply',mes:'SYNTHETIC immutable facts',is_user:false}],character:{name:'Synthetic',avatar:'synthetic.png',data:{extensions:{}}},preset:{name:'Synthetic preset',extensions:{}},readonlyBooks:{},state:{messages:{reply:{variables:{ability:37},extra:{}}},chatMetadata:{},worldbooks:{},characterExtensions:{},presetExtensions:{},extensionSettings:{}}};
+ const original=JSON.stringify(context),writes:any[]=[];h.request=async(path:string,body:any,binding:any)=>{assert.equal(path,'/state');writes.push({body:structuredClone(body),binding:structuredClone(binding)});return{revision:body.revision+1};};
+ h.displayBootstrap=true;await h.bind(context);h.extensions.syntheticNormalization={keep:true};await h.save();await h.flush();assert.equal(writes.length,0);assert.equal(context.revision,9);assert.equal(JSON.stringify(context),original);
+ h.displayBootstrap=false;h.persistedStateJSON=JSON.stringify(h.state());await h.save();assert.equal(writes.length,0,'unchanged trailing native saves are no-ops');
+ h.chat[0].variables.ability=42;await h.save();assert.equal(writes.length,1);assert.equal(writes[0].body.revision,9);assert.deepEqual(writes[0].binding,{scopeKey:'scope',sourceEntryId:'reply'});assert.equal(writes[0].body.state.messages.reply.variables.ability,42);assert.equal(context.revision,10);
+ h.displayBootstrap=true;h.chat[0].mes='SYNTHETIC unauthorized story mutation';assert.throws(()=>h.save(),/不得|只保存/,'bootstrap is not permission to change canonical text');
+});

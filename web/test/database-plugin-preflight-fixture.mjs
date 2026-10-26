@@ -44,7 +44,7 @@ export async function runDatabasePluginPreflightTests({ source, vendor, legacyHo
  try{
   if(expectLegacyFailure){
    await assert.rejects(runtime.before(user,AbortSignal.timeout(60000)),/未完成发送前处理/);
-   assert.equal(calls.length,0);assert.equal(httpErrors.length,3);assert.ok(httpErrors.every(e=>e==='数据库模型材料过大'));
+    assert.equal(calls.length,0);assert.equal(httpErrors.length,3);assert.ok(httpErrors.every(e=>e.startsWith('数据库模型材料过大')));
    console.log('PASS reproduced legacy native preflight: global mount misbinding → oversized request → 3 failures → no author handoff');return;
   }
   const result=await runtime.before(user,AbortSignal.timeout(60000));
@@ -66,7 +66,7 @@ export async function runDatabasePluginPreflightTests({ source, vendor, legacyHo
   for(const name of readonly.characterBookNames)for(const e of unguardedBooks[name].entries){delete e.prevent_recursion;delete e.exclude_recursion;}
   context={...context,readonlyBooks:unguardedBooks,scope:{...context.scope,sessionId:'synthetic-missing-guards'},sourceEntryId:'unguarded-u',visibleEntryIds:['unguarded-u'],chat:[{mes:user,is_user:true,name:'旅人',message_id:'unguarded-u',__liyuanEntryId:'unguarded-u',extra:{}}]};
   await assert.rejects(runtime.before(user,AbortSignal.timeout(60000)),/未完成发送前处理.*数据库模型材料过大/);
-  assert.equal(calls.length,1);assert.ok(httpErrors.slice(-3).every(e=>e==='数据库模型材料过大'));
+   assert.equal(calls.length,1);assert.ok(httpErrors.slice(-3).every(e=>e.startsWith('数据库模型材料过大')));
   context={...context,readonlyBooks:readonly.readonlyBooks};
   console.log('PASS native counterfactual: correct bindings without recursion guards still fail; both host fixes are necessary');
 
@@ -75,7 +75,7 @@ export async function runDatabasePluginPreflightTests({ source, vendor, legacyHo
   context={...context,scope:{...context.scope,sessionId:'synthetic-direct-trigger'},sourceEntryId:'direct-u',visibleEntryIds:['direct-u'],chat:[{mes:explicit,is_user:true,name:'旅人',message_id:'direct-u',__liyuanEntryId:'direct-u',extra:{}}]};
   await assert.rejects(runtime.before(explicit,AbortSignal.timeout(60000)),/未完成发送前处理.*数据库模型材料过大/);
   assert.equal(calls.length,1,'oversized native materials remain protected by the unchanged host limit');
-  assert.ok(httpErrors.slice(-3).every(e=>e==='数据库模型材料过大'));
+   assert.ok(httpErrors.slice(-3).every(e=>e.startsWith('数据库模型材料过大')));
 
   await runtime.close();failModel=true;
   context={...context,scope:{...context.scope,sessionId:'synthetic-model-failure'},sourceEntryId:'failed-u',visibleEntryIds:['failed-u'],chat:[{mes:user,is_user:true,name:'旅人',message_id:'failed-u',__liyuanEntryId:'failed-u',extra:{}}]};

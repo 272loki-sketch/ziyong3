@@ -10,6 +10,8 @@ import { clipPromptText } from "./stage/prompt-budget.ts";
 import type { MemorySourceRef } from "./memory/types.ts";
 
 export interface ScribePromptInput {
+	/** Source-bound manual recovery keeps the full saved canonical text. */
+	trustedNarrative?: boolean;
 	/** 当前世界状态（JSON 序列化前的对象） */
 	state: WorldState;
 	/** 本轮用户输入文本 */
@@ -70,7 +72,7 @@ ${JSON.stringify(state, null, 2)}
 【本轮对话】
 ${userName}：${clipPromptText(userText, 8_000)}
 
-${charName}：${clipPromptText(assistantText, 30_000)}`;
+${charName}：${input.trustedNarrative ? assistantText : clipPromptText(assistantText, 30_000)}`;
 
 	return { systemPrompt, userText: user };
 }
@@ -81,7 +83,7 @@ ${charName}：${clipPromptText(assistantText, 30_000)}`;
  * 「{」，旧逻辑按首个 { 切分会从错位开始 → 整个解析失败。2026-08-03 实测）。
  * 解析失败返回 null（调用方静默跳过本轮）。
  */
-export function parseScribeResult(text: string): ScribeResult | null {
+export function parseScribeResult(text: string, options?: {strictPatch?: boolean}): ScribeResult | null {
 	let t = text.trim();
 	const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
 	if (fence) t = fence[1].trim();
@@ -117,6 +119,7 @@ export function parseScribeResult(text: string): ScribeResult | null {
 		try {
 			const obj = JSON.parse(t.slice(start, end + 1)) as Record<string, unknown>;
 			if (obj && typeof obj === "object" && !Array.isArray(obj) && Object.hasOwn(obj, "patch")) {
+				if (options?.strictPatch && (!obj.patch || typeof obj.patch !== "object" || Array.isArray(obj.patch))) return null;
 				const patch =
 					obj.patch && typeof obj.patch === "object" && !Array.isArray(obj.patch)
 						? (obj.patch as Record<string, unknown>)

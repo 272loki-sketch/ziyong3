@@ -26,7 +26,7 @@ export function boundedHistory(history: BeatMsg[], maxMessages: number, maxTotal
 export function boundedLore(entries: LorebookEntry[], maxItems = 40, maxTotal = 24_000): Array<{ title: string; content: string }> {
 	const out: Array<{ title: string; content: string }> = [];
 	let used = 0;
-	for (const entry of entries.slice(0, maxItems)) {
+	for (const entry of entries.filter(entry => entry.enabled !== false && entry.content.trim()).slice(0, maxItems)) {
 		if (used >= maxTotal) break;
 		const content = clipPromptText(entry.content, Math.min(4_000, maxTotal - used));
 		out.push({ title: entry.comment || entry.keys[0] || "", content });

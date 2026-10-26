@@ -8,7 +8,7 @@ export function installSettingsUI({ view, plugin, focus }) {
  const syncTheme = () => {
   let theme = themeRoot.dataset.theme;
   if (!theme) { try { theme = localStorage.getItem('liyuan.theme'); } catch {} }
-  const value = theme === 'dark' ? 'dark' : 'light';
+  const value = theme === 'dark' || theme === 'eye-care' ? theme : 'light';
   if (document.documentElement.dataset.theme !== value) document.documentElement.dataset.theme = value;
  };
  syncTheme();
@@ -128,4 +128,32 @@ export function installSettingsUI({ view, plugin, focus }) {
  for (const root of roots) observer.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'data-i18n'] });
  window.addEventListener('pagehide', () => { observer.disconnect(); themeObserver.disconnect(); window.removeEventListener('storage', syncTheme); }, { once: true });
  return { refresh: () => roots.forEach(enhance), mvuReady: () => !!document.querySelector('#extensions_settings2 .liyuan-mvu-settings .mvu-section') };
+}
+
+/** Manager-only dependency routing. No runtime/story hooks or upstream assets are changed. */
+export async function ensureManagerWorker(serviceWorker, origin, { timeoutMs = 5000 } = {}) {
+ if (!serviceWorker) return false;
+ const workerURL = new URL('/tavern-plugin-sw.js', origin).href;
+ const controlled = () => serviceWorker.controller?.scriptURL === workerURL;
+ if (controlled()) return true;
+ let timer, check;
+ const cleanups = [];
+ const ready = new Promise(resolve => {
+  let finished = false;
+  const finish = value => {
+   if (finished) return;
+   finished = true;
+   clearTimeout(timer);
+   for (const cleanup of cleanups) cleanup();
+   resolve(value);
+  };
+  check = () => { if (controlled()) finish(true); };
+  serviceWorker.addEventListener('controllerchange', check);
+  cleanups.push(() => serviceWorker.removeEventListener('controllerchange', check));
+  timer = setTimeout(() => finish(false), timeoutMs);
+  // Listen before register: a fast activation must not be lost between awaits.
+  Promise.resolve().then(() => serviceWorker.register(workerURL, { scope: '/tavern-plugin-host.html', updateViaCache: 'none' })).then(check, () => finish(false));
+  check();
+ });
+ return ready;
 }

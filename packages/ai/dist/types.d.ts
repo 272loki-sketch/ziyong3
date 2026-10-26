@@ -41,7 +41,17 @@ export interface ProviderResponse {
     status: number;
     headers: Record<string, string>;
 }
+export interface TransportObservation {
+    type: "transportStarted" | "responseHeaders" | "firstByte" | "firstEffectiveDelta" | "bodyEnd" | "transportError";
+    traceId: string;
+    timestamp: number;
+    status?: number;
+    requestId?: string;
+    errorCode?: string;
+}
 export interface StreamOptions {
+    /** Passive OpenAI-compatible HTTP lifecycle receipts. Never proves gateway receipt by itself. */
+    onTransport?: (event: TransportObservation) => void;
     temperature?: number;
     maxTokens?: number;
     signal?: AbortSignal;
@@ -208,6 +218,8 @@ export interface ImagesOptions {
 }
 export type ProviderImagesOptions = ImagesOptions & Record<string, unknown>;
 export interface SimpleStreamOptions extends StreamOptions {
+    /** Explicit omission of the output limit; supported only by openai-completions. Incompatible with maxTokens. */
+    useProviderDefaultMaxTokens?: boolean;
     reasoning?: ThinkingLevel;
     /** Custom token budgets for thinking levels (token-based providers only) */
     thinkingBudgets?: ThinkingBudgets;

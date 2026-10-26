@@ -1,3 +1,7 @@
+import { flushSync } from "react-dom";
+import { WorkspaceBar } from "./components/WorkspaceBar.tsx";
+import { storedDraft, saveDraft, workspaceStorageKey, scopedUrl, workspaceStale, WORKSPACE_RELOAD_EVENT } from "./workspace.ts";
+import { PlotOptionsBar, type PlotDraft } from "./components/PlotOptionsBar.tsx";
 import {RequestInspector} from "./components/RequestInspector.tsx";
 /**
  * 梨园 Web 前端 — F1 骨架：顶栏驱动的面板系统（PLAN-PHASE3 v2 §2）。
@@ -8,7 +12,7 @@ import {RequestInspector} from "./components/RequestInspector.tsx";
  */
 
 import { RealTestRecords } from "./components/RealTestRecords.tsx";
-import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, Fragment, lazy, Suspense } from "react";
 import {
 	apiGet,
 	apiGetCacheClear,
@@ -112,6 +116,7 @@ import { useReadingNavigation } from "./use-reading-position.ts";
 import { useReadingHistory } from "./use-reading-history.ts";
 import { DatabasePluginManager } from "./components/DatabasePluginManager.tsx";
 import { RegexManager } from "./components/RegexManager.tsx";
+const PlaySlotsPanel = lazy(() => import("./components/PlaySlotsPanel.tsx").then(module => ({ default: module.PlaySlotsPanel })));
 import { TavernPluginsManager } from "./components/TavernPluginsManager.tsx";
 import { SessionStatsBar, StatusStrip } from "./components/StatusStrip.tsx";
 import { GenerationModeControl } from "./components/GenerationModeControl.tsx";
@@ -128,6 +133,7 @@ import type {
 	WireSessionInfo,
 	WireStats,
 	UpdateWire,
+	LedgerStatus,
 	WorldState,
 } from "./wire.ts";
 
@@ -276,11 +282,20 @@ export default function App() {
 	const [updateModalOpen, setUpdateModalOpen] = useState(false);
 	const [updateToastDismissed, setUpdateToastDismissed] = useState(false);
 	const updateErrRef = useRef<string | null>(null);
-	const [input, setInput] = useState("");
-	const [generationMode, setGenerationMode] = useState<GenerationMode>(DEFAULT_GENERATION_MODE);
+	const [input, setInput] = useState(storedDraft);
+	const [plotDraft, setPlotDraft] = useState<PlotDraft | null>(()=>{try{const data=JSON.parse(sessionStorage.getItem(workspaceStorageKey("plot-draft"))??"null");return data&&typeof data.title==="string"&&typeof data.choice?.contextKey==="string"&&typeof data.choice.optionId==="string"?data:null;}catch{return null;}});
+	const [plotEpoch, setPlotEpoch] = useState(0);
+	const plotDraftRef = useRef<PlotDraft | null>(null); plotDraftRef.current = plotDraft;
+	const clearPlotDraft = useCallback(() => setPlotDraft(null), []);
+	const savedWorkspaceMode=useRef<GenerationMode|null>(null);
+ if(savedWorkspaceMode.current===null){try{const mode=sessionStorage.getItem(workspaceStorageKey("mode"));if(mode==="direct"||mode==="director")savedWorkspaceMode.current=mode;}catch{}}
+ const [generationMode, setGenerationMode] = useState<GenerationMode>(savedWorkspaceMode.current??DEFAULT_GENERATION_MODE);
 	const [restoredModeHint, setRestoredModeHint] = useState<GenerationMode | null>(null);
 	// 待发送附件（附件随消息，上传即落服务端 .liyuan-uploads/，发送时路径附在消息尾行）
-	const [pending, setPending] = useState<PendingUpload[]>([]);
+	const [pending, setPending] = useState<PendingUpload[]>(()=>{try{const data=JSON.parse(sessionStorage.getItem(workspaceStorageKey("attachments"))??"[]");return Array.isArray(data)&&data.every(item=>item&&typeof item.file==="string"&&typeof item.name==="string"&&typeof item.label==="string"&&["upload","media"].includes(item.kind))?data:[];}catch{return [];}});
+ useEffect(()=>{saveDraft(input);},[input]);
+ useEffect(()=>{try{sessionStorage.setItem(workspaceStorageKey("plot-draft"),JSON.stringify(plotDraft));}catch{}},[plotDraft]);
+ useEffect(()=>{try{sessionStorage.setItem(workspaceStorageKey("attachments"),JSON.stringify(pending));}catch{}},[pending]);
 	const [uploading, setUploading] = useState(false);
 	const [atBottom, setAtBottom] = useState(true);
 	/** 消息内联编辑：idx + 草稿 + 类型（用户改写后 reroll / agent 改写后 editreply） */
@@ -292,6 +307,8 @@ export default function App() {
 	const [sessions, setSessions] = useState<WireSessionInfo[] | null>(null);
 	// 右栏数据
 	const [worldState, setWorldState] = useState<WorldState | null>(null);
+	const [ledgerStatus, setLedgerStatus] = useState<LedgerStatus | null>(null);
+	const [ledgerScope, setLedgerScope] = useState<{sessionId: string; card: string} | undefined>(undefined);
 	const [stats, setStats] = useState<WireStats | null>(null);
 	const [warnings, setWarnings] = useState<WarnEntry[]>([]);
 	const [bellOpen, setBellOpen] = useState(false);
@@ -364,6 +381,7 @@ export default function App() {
 	const [planningOpen, setPlanningOpen] = useState(false);
 	const [databaseOpen, setDatabaseOpen] = useState(false);
 	const [tavernPluginsOpen, setTavernPluginsOpen] = useState(false);
+	const [playSlotsOpen, setPlaySlotsOpen] = useState(false);
  const [regexOpen, setRegexOpen] = useState(false);
  const [requestInspectorOpen,setRequestInspectorOpen]=useState(false);
  const openRegex = useCallback(() => {setCenterMenu(null);setDatabaseOpen(false);setTavernPluginsOpen(false);setRegexOpen(true);},[]);
@@ -438,7 +456,7 @@ export default function App() {
 	/** 在 onFrame 里发 WS（useWire 后于 onFrame 定义，走 ref） */
 	const sendRef = useRef<(frame: import("./wire.ts").ClientFrame) => void>(() => {});
 	// 仅编辑器交接信息，不是正文副本；ACK 前保留输入/附件，避免拒绝后清空。
-	const composerSubmissionsRef = useRef(new Map<string, { input: string; files: string[]; sessionId?: string }>());
+	const composerSubmissionsRef = useRef(new Map<string, { input: string; files: string[]; sessionId?: string; plotDraft?: PlotDraft | null }>());
 	const storyHelloSeenRef = useRef(false);
 	const generationModeChosenRef = useRef(false);
 	const restoredPromptModeRef = useRef<RestoredPromptMode | null>(null);
@@ -507,6 +525,7 @@ export default function App() {
 
 	const onGenerationModeChange = useCallback((mode: GenerationMode) => {
 		generationModeChosenRef.current = true;
+  savedWorkspaceMode.current=mode;try{sessionStorage.setItem(workspaceStorageKey("mode"),mode);}catch{}
 		setGenerationMode(mode);
 		void apiPut("/api/config", { generationMode: mode }).catch((error) => {
 			pushToast("warning", `模式已用于后续输入，但保存配置失败：${error instanceof Error ? error.message : String(error)}`);
@@ -672,7 +691,7 @@ export default function App() {
 			try {
 				const card = await apiGet<CardResponse>("/api/card");
 				if (card.path && /\.png$/i.test(card.path)) {
-					setCharAvatarUrl(`/api/cards/image?path=${encodeURIComponent(card.path)}&t=${Date.now()}`);
+					setCharAvatarUrl(scopedUrl(`/api/cards/image?path=${encodeURIComponent(card.path)}&t=${Date.now()}`));
 				} else {
 					setCharAvatarUrl(null);
 				}
@@ -700,18 +719,20 @@ export default function App() {
 					const draft = composerSubmissionsRef.current.get(frame.messageId);
 					if (frame.status === "accepted") {
 						if (draft && sessionIdRef.current === draft.sessionId) {
-							setInput((current) => current.trim() === draft.input.trim() ? "" : current);
+							if ((draft.plotDraft?.choice.optionId ?? null) === (plotDraftRef.current?.choice.optionId ?? null)) setInput((current) => current.trim() === draft.input.trim() ? "" : current);
 							setPending((current) => current.filter((file) => !draft.files.includes(file.file)));
+							if (draft.plotDraft && plotDraftRef.current?.choice.optionId === draft.plotDraft.choice.optionId) setPlotDraft(null);
 						}
 						composerSubmissionsRef.current.delete(frame.messageId);
 					} else pushToast("warning", frame.reason || "输入未受理，草稿已保留，可复制后重试");
 					break;
 				}
 				case "hello": {
+					setPlotEpoch(n => n + 1);
 					setServerVersion(readServerVersion(frame));
 					storyHelloSeenRef.current = true;
 					if (!generationModeChosenRef.current && !restoredPromptModeRef.current) {
-						setGenerationMode(resolveGenerationMode(frame.generationMode));
+						setGenerationMode(savedWorkspaceMode.current??resolveGenerationMode(frame.generationMode));
 					}
 					const hydratedMessages = frame.messages.map((m) => {
 						if (!m.timeline || m.timeline.length === 0) return m;
@@ -754,6 +775,8 @@ export default function App() {
 					if (!preserveLiveTurn) setMessages(hydratedMessages);
 					setMsgEdit(null); // 会话对齐后关闭内联编辑
 					setWorldState(frame.state);
+					setLedgerStatus(frame.ledgerStatus ?? null);
+					setLedgerScope(frame.ledgerStatus?.scope);
 					setStats(frame.stats);
 					// 一档皮肤:优先用 hello 同帧载荷(与消息同步),杜绝 REST 缓存/时序导致的漏皮
 					if (frame.cardfront) {
@@ -779,6 +802,7 @@ export default function App() {
 					}
 					// 切到别的会话：清空会话内数据（同会话的命令后重放则保留）
 					if (sessionIdRef.current !== frame.sessionId) {
+						if(sessionIdRef.current)setPlotDraft(null);
 						sessionIdRef.current = frame.sessionId;
 						setReadingSessionId(frame.sessionId);
 						setWarnings([]);
@@ -955,6 +979,8 @@ export default function App() {
 					break;
 				case "state":
 					setWorldState(frame.state);
+					setLedgerStatus(frame.ledgerStatus ?? null);
+					setLedgerScope(frame.ledgerStatus?.scope);
 					break;
 				case "panels": {
 					// agent 自建面板（柱 2）：新面板自动展开到左栏（agent 持有前端，建了就给用户看）；
@@ -1290,8 +1316,9 @@ export default function App() {
 		return buildStoryPromptFrame(text, mode);
 	}, [generationMode]);
 
-	const send = useCallback(() => {
-		const typed = input.trim();
+	const send = useCallback((injectedText?: string) => {
+		const typed = (injectedText ?? input).trim();
+		if (injectedText !== undefined) setInput(injectedText);
 		if (restoredPromptModeRef.current && restoredPromptModeRef.current.text !== typed) {
 			restoredPromptModeRef.current = null;
 			setRestoredModeHint(null);
@@ -1301,25 +1328,29 @@ export default function App() {
 		if (!text) return;
 		if (/^\/store\s*$/i.test(typed) && pending.length === 0) { openStoreModal(); setInput(""); return; }
 		if (/^\/line\s*$/i.test(typed) && pending.length === 0) { setCenterMenu(null); openLeft("worldline"); setInput(""); return; }
-		const result = ws.send(storyPromptForText(text, typed));
-		if (!result.accepted) return; // 拒绝/存储失败不清输入
+		if (plotDraft && typed.startsWith("/")) { pushToast("warning", "剧情方向不能随命令提交，请先取消草稿引导"); return; }
+		const result = ws.send({ ...storyPromptForText(text, typed), ...(plotDraft ? { plotChoice: plotDraft.choice } : {}) });
+		if (!result.accepted) return result; // 拒绝/存储失败不清输入
 		if (restoredPromptModeRef.current) {
 			restoredPromptModeRef.current = null;
 			setRestoredModeHint(null);
 		}
-		if (result.messageId) composerSubmissionsRef.current.set(result.messageId, { input: typed, files: pending.map((p) => p.file), sessionId: result.sessionId });
+		if (result.messageId) composerSubmissionsRef.current.set(result.messageId, { input: typed, files: pending.map((p) => p.file), sessionId: result.sessionId, plotDraft });
 		setWelcome(false); setAtHome(false); touchVisit();
 		if (looksBackstage(typed)) { setAsstUnread(false); openRight("assistant"); }
 		while (composerSubmissionsRef.current.size > 32) composerSubmissionsRef.current.delete(composerSubmissionsRef.current.keys().next().value!);
 		atBottomRef.current = true; setAtBottom(true);
-	}, [input, pending, ws, openStoreModal, openRight, openLeft, storyPromptForText]);
+		return result;
+	}, [input, pending, ws, openStoreModal, openRight, openLeft, storyPromptForText, plotDraft, pushToast]);
 
 	// 卡 HTML（如 某卡 开场表单）调用 triggerSlash(`/send …|/trigger`)
 	// 须接到输入框 / WS，否则界面显示「档案已发送」但聊天栏空白
 	const inputRefForBridge = useRef(input);
 	inputRefForBridge.current = input;
+	const sendPromptRef = useRef(send); sendPromptRef.current = send;
 	useEffect(() => {
 		registerTavernChatBridge({
+			getInput: () => inputRef.current ? inputRef.current.value : inputRefForBridge.current,
 			setInput: (text) => {
 				setWelcome(false);
 				setAtHome(false);
@@ -1335,26 +1366,18 @@ export default function App() {
 				});
 			},
 			sendPrompt: (text) => {
-				const body = (text || inputRefForBridge.current || "").trim();
+				const body = (text || (inputRef.current ? inputRef.current.value : inputRefForBridge.current) || "").trim();
 				if (!body) {
 					pushToast("warning", "没有可发送的内容");
-					return;
+					return { accepted: false, reason: "没有可发送的内容" };
 				}
-				setWelcome(false);
-				setAtHome(false);
-				touchVisit();
-				setInput(body);
-				const result = ws.send(storyPromptForText(body));
-				if (!result.accepted) return;
-				if (restoredPromptModeRef.current) {
-					restoredPromptModeRef.current = null;
-					setRestoredModeHint(null);
-				}
-				if (result.messageId) composerSubmissionsRef.current.set(result.messageId, { input: body, files: [], sessionId: result.sessionId });
+				const result = sendPromptRef.current(body);
+				if (!result?.accepted) return result ?? { accepted: false, reason: "输入未提交，草稿仍保留" };
 				atBottomRef.current = true;
 				setAtBottom(true);
 				if (inputRef.current) inputRef.current.style.height = "auto";
 				pushToast("info", "已从界面提交，等待输入确认（草稿保留）");
+				return result;
 			},
 			 runCommand: (cmd) => {
 				const result = ws.send({ type: "prompt", text: cmd });
@@ -1554,11 +1577,24 @@ export default function App() {
 		};
 	}, [welcome]);
 
-	const renderPanel = (id: PanelId) => {
+	const prepareWorkspaceSwitch = useCallback(() => {
+  if(uploading || pending.length){pushToast("warning","请先发送或移除当前附件，再切换主窗口；文字草稿会保留。" );return false;}
+  if(!workspaceStale()&&ws.outbox.some(item=>item.state!=="rejected")){pushToast("warning","还有未确认输入，请等待受理或在恢复栏处理后再切换。" );return false;}
+  if(!saveDraft(input)){pushToast("error","浏览器未能保存当前草稿，未切换；请先保留草稿。" );return false;}
+  try{sessionStorage.setItem(workspaceStorageKey("plot-draft"),JSON.stringify(plotDraft));sessionStorage.setItem(workspaceStorageKey("mode"),generationMode);}catch{pushToast("error","浏览器未能保存编辑状态，未切换。" );return false;}
+  return true;
+ },[input,plotDraft,generationMode,uploading,pending,ws.outbox]);
+ useEffect(()=>{
+  const reload=()=>{if(prepareWorkspaceSwitch())location.assign('/');};
+  window.addEventListener(WORKSPACE_RELOAD_EVENT,reload);
+  return()=>window.removeEventListener(WORKSPACE_RELOAD_EVENT,reload);
+ },[prepareWorkspaceSwitch]);
+ const renderPanel = (id: PanelId) => {
 		switch (id) {
 			case "sessions":
 				return (
 					<SessionsPanel
+      prepareWorkspaceSwitch={prepareWorkspaceSwitch}
 						sessions={sessions}
 						stats={stats}
 						atHome={welcome}
@@ -1614,6 +1650,7 @@ export default function App() {
 			case "card":
 				return (
 					<CardPanel
+      prepareWorkspaceSwitch={prepareWorkspaceSwitch}
 						toast={pushToast}
 						onEnterChat={dismissWelcome}
 						onGoHome={showWelcome}
@@ -1833,6 +1870,8 @@ export default function App() {
 	return (
 		<PanelRefreshContext.Provider value={agentTick}>
 		<div className="app">
+   <WorkspaceBar prepare={prepareWorkspaceSwitch} onParallel={()=>setPlaySlotsOpen(true)}/>
+			{playSlotsOpen && <Suspense fallback={<div className="play-slots-backdrop" role="status">正在打开多卡并行…</div>}><PlaySlotsPanel onClose={() => setPlaySlotsOpen(false)} prepareWorkspaceSwitch={prepareWorkspaceSwitch} /></Suspense>}
 			{databaseOpen && <DatabasePluginManager onClose={() => setDatabaseOpen(false)} busy={busy} contextTick={agentTick} />}
 			{requestInspectorOpen&&<RequestInspector onClose={()=>setRequestInspectorOpen(false)} contextTick={agentTick}/>}
    {regexOpen && <RegexManager onClose={() => setRegexOpen(false)} contextTick={agentTick} sample={[...messages].reverse().find(message => message.authorDelivery)?.authorDelivery} />}
@@ -1993,12 +2032,13 @@ export default function App() {
 				</div>
 			</header>
 			<nav className="database-navigation" aria-label="管理入口">
+				<button type="button" className="database-entry" aria-label="多卡并行" onClick={() => { setCenterMenu(null); setPlaySlotsOpen(true); }}>多卡并行</button>
     <button type="button" className="regex-entry" aria-label="提示词查看器" onClick={()=>{setCenterMenu(null);setRequestInspectorOpen(true);}}>提示词查看器</button>
     <button type="button" className="regex-entry" aria-label="正则与渲染" onClick={openRegex}><span aria-hidden="true">.*</span> 正则与渲染</button>
 				<button type="button" className="database-entry" aria-label="数据库" onClick={openDatabase}>
 					<IconCodex size={16} /> 数据库
 				</button>
-				<button type="button" className="tavern-plugin-entry" aria-label="插件中心：酒馆助手、提示词模板、MVU、众生侧写与 Veridis Rewrite" onClick={openTavernPlugins}>
+				<button type="button" className="tavern-plugin-entry" aria-label="插件中心：酒馆助手、提示词模板、MVU、众生侧写、Veridis Rewrite 与 Fish Audio 角色配音" onClick={openTavernPlugins}>
 					<IconPuzzle size={16} /> <span>插件中心</span>
 				</button>
 			</nav>
@@ -2051,6 +2091,16 @@ export default function App() {
 											} catch (error) { pushToast("error", String(error)); }
 											finally { setSettlementRetrying(false); }
 											}}>{settlementRetrying ? "正在恢复结算…" : "重试结算"}</button>
+          <button type="button" className="drawer-btn" disabled={busy||settlementRetrying} onClick={async()=>{
+           const source=[...messages].reverse().find(message=>message.channel==='narrative'&&message.entryId);
+           const receipt=source?.supplementaryDelivery;
+           if(!source?.entryId||source.unfinished||!receipt){pushToast('error','没有可重新生成的完整正文附属收据');return;}
+           const binding={expectedSessionId:sessionIdRef.current,expectedSourceEntryId:source.entryId,expectedReceiptHash:receipt.receiptHash};
+           if(!window.confirm('仅重新生成这轮附属内容，可能产生模型费用。原稿和历史收据保留，新附属替代旧附属显示，不重跑其它结算。是否继续？'))return;
+           setSettlementRetrying(true);
+           try{const result=await apiPost<{error?:string}>('/api/turn/regenerate-supplementary',binding);pushToast(result.error?'error':'info',result.error??'附属已重新生成，原稿未改动');}
+           catch(error){pushToast('error',String(error));}finally{setSettlementRetrying(false);}
+          }}>重新生成附属</button>
 									</section>
 									<PanelDock
 										variant="dropdown"
@@ -2335,12 +2385,17 @@ export default function App() {
 					>
 						{/* 生效世界状态：输入框上方，与输入同宽一排 */}
 						<div className="composer-shell status-above">
-							<StatusStrip state={worldState} toast={pushToast} />
+							<StatusStrip state={worldState} ledgerStatus={ledgerStatus} ledgerScope={ledgerScope} busy={busy || settling} toast={pushToast} />
 						</div>
 						{settling && <div className="composer-shell settlement-note" role="status" aria-live="polite">
 							<span>正文与格式已就绪；可发送下一条，等必要状态更新后开写。<br />{settlementProgress ?? "后台任务并行运行中；完成后会更新对应状态。"}</span>
 							<button type="button" className="act" onClick={() => ws.send({ type: "abort" })} title="只停止未完成结算，保留已交付正文；下一拍前会恢复" aria-label="停止后台整理">停止后台整理</button>
 						</div>}
+						<PlotOptionsBar scope={`${readingSessionId}:${plotEpoch}`} busy={busy} draft={plotDraft} onClear={clearPlotDraft} onChoose={(option, contextKey) => {
+       if ((input.trim() || pending.length) && !window.confirm("选择剧情将替换当前文字草稿，附件保留。是否继续？")) return;
+       setInput(option.draft); setPlotDraft({ choice: { contextKey, optionId: option.id }, title: option.title });
+       requestAnimationFrame(() => inputRef.current?.focus());
+      }} />
 						{ws.storageError && <div className="composer-shell field-hint" role="alert">{ws.storageError}</div>}
 						{(ws.outbox.length > 0 || assistantRecovery) && <details className="composer-shell" aria-label="未确认输入恢复">
 							<summary>未确认输入 {ws.outbox.length + (assistantRecovery ? 1 : 0)} 条 · ACK 前保留，可复制；命令不自动重放</summary>
@@ -2348,7 +2403,7 @@ export default function App() {
 				<div className="field-hint">{item.frame.type === "prompt" ? `剧情 · ${item.frame.generationMode === "direct" ? "直出" : item.frame.generationMode === "director" ? "导演" : "未标注模式"}` : "助手"} · {item.state === "pending" ? "等待确认" : item.reason || "草稿保留"}</div>
 								<textarea readOnly className="field-input" rows={2} value={item.frame.text} aria-label="可复制的未确认草稿" />
 								<button type="button" className="drawer-btn" onClick={() => void copyDraft(item.frame.text)}>复制</button>
-				{item.state === "rejected" && item.frame.type === "prompt" && <button type="button" className="drawer-btn" onClick={() => { if ((input.trim() || pending.length) && !window.confirm("恢复这条草稿将替换当前输入和附件选择，是否继续？")) return; const restored = item.frame.type === "prompt" ? restoredPromptMode(item.frame.text, item.frame.generationMode) : null; restoredPromptModeRef.current = restored; setRestoredModeHint(restored?.generationMode ?? null); setInput(item.frame.text); setPending([]); inputRef.current?.focus(); }}>恢复到输入框</button>}
+				{item.state === "rejected" && item.frame.type === "prompt" && <button type="button" className="drawer-btn" onClick={() => { if ((input.trim() || pending.length) && !window.confirm("恢复这条草稿将替换当前输入和附件选择，是否继续？")) return; const restored = item.frame.type === "prompt" ? restoredPromptMode(item.frame.text, item.frame.generationMode) : null; restoredPromptModeRef.current = restored; setRestoredModeHint(restored?.generationMode ?? null); setInput(item.frame.text); setPlotDraft(item.frame.type === "prompt" && item.frame.plotChoice ? { choice: item.frame.plotChoice, title: "恢复的已选剧情" } : null); setPending([]); inputRef.current?.focus(); }}>恢复到输入框</button>}
 								{item.state === "rejected" && <button type="button" className="drawer-btn" onClick={() => ws.discard(item.frame.messageId)}>移除本机草稿</button>}
 							</div>)}
 							{assistantRecovery && <div><div className="field-hint">助手未发送，请复制到助手框重试</div><textarea readOnly className="field-input" rows={2} value={assistantRecovery} /><button type="button" className="drawer-btn" onClick={() => setAssistantRecovery(null)}>关闭副本</button></div>}
@@ -2503,16 +2558,22 @@ export default function App() {
 										void doUpload(e.clipboardData.files);
 									}
 								}}
-								onChange={(e) => {
-									if (restoredPromptModeRef.current && restoredPromptModeRef.current.text !== e.target.value) {
-										restoredPromptModeRef.current = null;
-										setRestoredModeHint(null);
-									}
-									setInput(e.target.value);
-									setCmdDismissed(false);
-									setCmdIndex(0);
-									e.target.style.height = "auto";
-									e.target.style.height = `${Math.min(e.target.scrollHeight, 88)}px`;
+								onInput={(e) => {
+									const textarea = e.currentTarget;
+									const update = () => {
+										if (restoredPromptModeRef.current && restoredPromptModeRef.current.text !== textarea.value) {
+											restoredPromptModeRef.current = null;
+											setRestoredModeHint(null);
+										}
+										setInput(textarea.value);
+										setCmdDismissed(false);
+										setCmdIndex(0);
+									};
+									// Cards set .value, dispatch input and click Send in one stack. onChange
+									// can miss the tracked setter; commit the untrusted input before that click.
+									if (e.nativeEvent.isTrusted) update(); else flushSync(update);
+									textarea.style.height = "auto";
+									textarea.style.height = `${Math.min(textarea.scrollHeight, 88)}px`;
 								}}
 								onKeyDown={(e) => {
 									if (suggestions.length > 0) {
@@ -2545,7 +2606,7 @@ export default function App() {
 									}
 									if (!coarse && e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
 										e.preventDefault();
-										send();
+										send(inputRef.current?.value ?? input);
 									}
 								}}
 							/>
@@ -2593,23 +2654,8 @@ export default function App() {
 									id="send_but"
 									className="btn btn-send"
 									onClick={() => {
-										// ST 程序卡常直接赋值 #send_textarea 后立刻 click #send_but。
-										// React 尚未来得及重渲染时，闭包里的 input 仍是旧值，须以 DOM 当前值直发。
-										const injected = inputRef.current?.value.trim() ?? "";
-										if (injected && injected !== input.trim()) {
-											setWelcome(false);
-											setAtHome(false);
-							touchVisit();
-							setInput(injected);
-							const result = ws.send(storyPromptForText(injected));
-							if (result.accepted && restoredPromptModeRef.current) {
-								restoredPromptModeRef.current = null;
-								setRestoredModeHint(null);
-							}
-							if (result.accepted && result.messageId) composerSubmissionsRef.current.set(result.messageId, { input: injected, files: [], sessionId: result.sessionId });
-											return;
-										}
-										send();
+										// DOM-backed card scripts and ordinary edits share binding, attachments, guards and ACK ownership.
+										send(inputRef.current?.value ?? input);
 									}}
 									disabled={uploading || (!input.trim() && pending.length === 0)}
 									title="发送"

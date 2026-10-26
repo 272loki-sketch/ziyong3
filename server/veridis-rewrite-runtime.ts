@@ -4,6 +4,7 @@ import { lstatSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { isAbsolute, relative, sep } from 'node:path';
 import { abortable } from '../src/async-abort.ts';
+import { classifyModelFailure } from '../src/stage/model-failure.ts';
 import type { VeridisRewriteCandidate } from './veridis-rewrite-source.ts';
 
 export interface VeridisRewriteSourceLike {
@@ -13,6 +14,7 @@ export interface VeridisRewriteSourceLike {
 export interface VeridisRewriteGenerateRequest {
   messages: { role: string; content: string }[];
   maxTokens: number;
+  useProviderDefaultMaxTokens?: boolean;
   temperature?: number;
 }
 export interface VeridisRewriteRunInput {
@@ -54,7 +56,6 @@ export function defaultVeridisHostSettings(): Record<string, unknown> {
 interface Range { start: number; end: number }
 interface Target extends Range { id: string; text: string }
 interface WorkerResult { text: string; settings?: Record<string, unknown>; hits: number; targets?: Target[]; replacements?: Record<string, string>; errors: string[]; skipped?: boolean; skipReason?: string }
-const MAX_CALLS = 8;
 const MAX_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_SETTINGS_BYTES = 4 * 1024 * 1024;
 const MAX_RUN_MS = 15 * 60 * 1000;
@@ -166,17 +167,25 @@ globalThis.TavernHelper = {
     const result = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
     parentPort.postMessage({ type: 'generate', id, generationId: config.generation_id, request: {
       messages: config.ordered_prompts,
-      maxTokens: Number.isFinite(Number(config.custom_api?.max_tokens)) ? Number(config.custom_api.max_tokens) : 4096,
+      maxTokens: config.custom_api?.max_tokens === 'unset' ? 0 : Number(config.custom_api?.max_tokens),
+      ...(config.custom_api?.max_tokens === 'unset' ? { useProviderDefaultMaxTokens: true } : {}),
       temperature: config.custom_api?.temperature,
     }});
     const response = await result;
     // Never infer group identity from template/example strings. The original
     // runtime validates exact per-group IDs itself; retain only upstream-parsed
     // values referring to actual prepared targets for complement verification.
+    let responseReason = 'schema';
+    try {
     const returned = responseModule.parseAiRewriteResponseObject(response);
     const returnedIds = new Set(Object.keys(returned));
+    if (!returnedIds.size) { responseReason = 'empty-targets'; throw new Error('Empty target receipt'); }
     const parsed = responseModule.parseAiResponse(response, new Map(prepared.items.filter(item => returnedIds.has(item.id)).map(item => [item.id, item])));
     parsed.forEach((text, key) => accepted[key] = text);
+    } catch (error) {
+      parentPort.postMessage({ type: 'response-error', reason: error instanceof SyntaxError ? 'json' : responseReason });
+      throw error;
+    }
     return response;
   },
   stopGenerationById: generationId => parentPort.postMessage({ type: 'stop', generationId }),
@@ -221,13 +230,14 @@ const accepted = Object.create(null);
     return;
   }
   prepared = { ...checked.task, items };
-  const result = await engine.runAiRewriteForMessageNow({ messageId: 0 }, { manual: true, preparedTask: prepared });
-  const success = result?.status === 'applied' || result?.status === 'no-change';
+   const result = await engine.runAiRewriteForMessageNow({ messageId: 0 }, { manual: true, preparedTask: prepared });
+   const success = result?.status === 'applied' || result?.status === 'no-change';
+   if (!success && sequence > 0 && items.some(item => !Object.hasOwn(accepted, item.id))) parentPort.postMessage({ type: 'response-error', reason: 'missing-targets' });
   parentPort.postMessage({ type: 'done', result: {
     text: success ? message.mes : workerData.authorDraft,
     hits: items.length, settings: persistedSettings,
     targets: items.map(item => ({ id: item.id, start: item.start, end: item.end, text: workerData.authorDraft.slice(item.start, item.end) })),
-    replacements: accepted, errors: success ? [] : ['原改写引擎未完成有效 AI 改写；保留完整原稿'],
+     replacements: accepted, errors: success ? [] : ['原改写引擎未完成有效 AI 改写；保留完整原稿'],
   }});
 })().catch(error => {
   // Preserve a safe machine-readable cause for host diagnostics without
@@ -265,6 +275,8 @@ export class VeridisRewriteRuntime {
     this.#operations.add(controller);
     let worker: Worker | undefined;
     let calls = 0;
+    let managedFailure: Error | undefined;
+    let responseFailure: string | undefined;
     const requests = new Map<number, { generationId: string; controller: AbortController }>();
     const ensureCurrent = async () => {
       if (controller.signal.aborted || this.#closed) throw new Error('Veridis Rewrite 已取消或关闭');
@@ -319,12 +331,17 @@ export class VeridisRewriteRuntime {
         worker!.on('message', (message: unknown) => {
           if (!record(message) || typeof message.type !== 'string') { finish(() => reject(new Error('原改写 Worker 返回未知协议'))); return; }
           if (message.type === 'done') { finish(() => resolvePromise(message.result as WorkerResult)); return; }
+          if (message.type === 'response-error') {
+            const reasons: Record<string, string> = { json: 'JSON 解析失败', schema: 'schema 目标回执校验失败', 'empty-targets': 'schema 目标回执为空', 'missing-targets': 'schema 缺少目标回执' };
+            responseFailure ??= typeof message.reason === 'string' && Object.hasOwn(reasons, message.reason) ? reasons[message.reason] : 'JSON/schema 响应协议未通过';
+            return;
+          }
           if (message.type === 'fatal') {
             const safeName = (value: unknown) => typeof value === 'string' && (SAFE_WORKER_ERROR_NAMES as readonly string[]).includes(value) ? value : undefined;
             const safeCode = (value: unknown) => typeof value === 'string' && (SAFE_WORKER_ERROR_CODES as readonly string[]).includes(value) ? value : undefined;
             const details = [safeName(message.errorName), safeCode(message.errorCode)].filter((value): value is string => !!value);
             const cause = details.length ? new Error(`Worker ${details.join(' ')}`) : undefined;
-            finish(() => reject(new Error('原改写模块初始化或执行失败，拒绝显示投影', cause ? { cause } : undefined)));
+            finish(() => reject(new Error(`原改写模块初始化或执行失败，拒绝显示投影${details.length ? `（${details.join(' ')}）` : ''}`, cause ? { cause } : undefined)));
             return;
           }
           if (message.type === 'stop') {
@@ -341,10 +358,9 @@ export class VeridisRewriteRuntime {
               await ensureCurrent();
               const request = message.request as VeridisRewriteGenerateRequest;
               if (!request || !Array.isArray(request.messages) || request.messages.length > 64 || request.messages.some(item => !item || !['system', 'user', 'assistant'].includes(item.role) || typeof item.content !== 'string') ||
-                  !Number.isInteger(request.maxTokens) || request.maxTokens < 0 || request.maxTokens > 65536 || request.temperature !== undefined && (!Number.isFinite(request.temperature) || request.temperature < 0 || request.temperature > 2)) throw new Error('原改写 Worker 请求格式无效');
+                  !Number.isInteger(request.maxTokens) || request.maxTokens < 0 || request.maxTokens > 65536 || (request.useProviderDefaultMaxTokens === true ? request.maxTokens !== 0 : request.maxTokens === 0) || request.temperature !== undefined && (!Number.isFinite(request.temperature) || request.temperature < 0 || request.temperature > 2)) throw new Error('原改写 Worker 请求格式无效');
               const serialized = JSON.stringify(request);
               if (Buffer.byteLength(serialized) > MAX_TEXT_BYTES || safeSettings.secrets.some(secret => serialized.includes(secret))) throw new Error('原改写请求包含凭据或超出宿主预算');
-              if (calls >= MAX_CALLS) throw new Error('Veridis Rewrite 单来源受管生成额度已用尽');
               calls++;
               const stop = () => callController.abort(new Error('Veridis Rewrite 已取消'));
               controller.signal.addEventListener('abort', stop, { once: true });
@@ -354,8 +370,15 @@ export class VeridisRewriteRuntime {
                 await ensureCurrent();
                 worker?.postMessage({ id, text });
               } finally { controller.signal.removeEventListener('abort', stop); }
-            } catch {
-              worker?.postMessage({ id, error: '受管改写请求失败或来源过期', status: calls >= MAX_CALLS ? 400 : undefined });
+            } catch (error) {
+              // Keep only classification facts, never provider text/headers/credentials.
+              const status = error && typeof error === 'object' ? (error as { status?: unknown; statusCode?: unknown }).statusCode ?? (error as { status?: unknown }).status : undefined;
+              const httpStatus = Number.isInteger(status) && Number(status) >= 400 && Number(status) <= 599 ? Number(status) : undefined;
+              const classified = classifyModelFailure(error);
+              const failure = classified.kind === 'unknown' && httpStatus ? classifyModelFailure(`HTTP ${httpStatus}`) : classified;
+              const labels = { auth: 'authentication 认证失败', model: '模型不可用', quota: 'quota exceeded 额度耗尽', 'rate-limit': 'HTTP 429 限流', timeout: '请求超时', transport: '网络传输失败', format: 'JSON/schema 协议失败', 'content-filter': 'Provider finish_reason: content_filter', unknown: '请求失败（原因未分类）' };
+              managedFailure = new Error(failure.kind === 'content-filter' ? labels[failure.kind] : `受管改写${labels[failure.kind]}${httpStatus ? ` [HTTP ${httpStatus}]` : failure.statusCode ? ` [HTTP ${failure.statusCode}]` : ''}；保留完整原稿`);
+              worker?.postMessage({ id, error: managedFailure.message, status: httpStatus ?? failure.statusCode });
               if (controller.signal.aborted) finish(() => reject(new Error('Veridis Rewrite 已取消')));
             } finally { requests.delete(id as number); }
           })().catch(() => finish(() => reject(new Error('原改写请求桥接失败'))));
@@ -365,6 +388,8 @@ export class VeridisRewriteRuntime {
       const current = this.#sources.active();
       if (!current || current.commit !== candidate.commit || current.sha256 !== candidate.sha256 || ENGINE_PATHS.some(path => !this.#sources.resolveAsset(path, candidate))) throw new Error('原改写版本或字节已变化，拒绝迟到显示投影');
       if (!result || typeof result.text !== 'string' || !Array.isArray(result.errors) || result.errors.some(error => typeof error !== 'string') || !Number.isInteger(result.hits)) throw new Error('原改写 Worker 结果结构无效');
+      if (result.errors.length && managedFailure) result.errors = [managedFailure.message];
+      else if (result.errors.length && responseFailure) result.errors = [`原改写 ${responseFailure}；保留完整原稿`];
       const settings = { ...(result.settings ?? {}), ...(input.settings ?? {}), aiRewrite: { ...(record(result.settings?.aiRewrite) ? result.settings.aiRewrite : {}), ...(record(input.settings?.aiRewrite) ? input.settings.aiRewrite : {}) } };
       if (result.errors.length || result.skipped) return { ...base, calls, errors: result.errors, settings, hits: result.hits, ...(result.skipped ? { skipped: true, skipReason: result.skipReason } : {}) };
       const text = targetProjection(input.authorDraft, result, allowed, protectedSpans);

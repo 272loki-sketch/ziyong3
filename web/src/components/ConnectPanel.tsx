@@ -806,14 +806,14 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 	const enableProfile = (id: string) =>
 		run(async () => {
 			await apiPost("/api/agent-profiles/enable", { id });
-			reloadAll();
+			await refreshAfterToolsSave();
 		}, `已启用配置「${id}」`);
 
 	/** 启用中的配置：从仓库重读 → agent.json → models.json → 重绑（改完不必再点启用） */
 	const refreshProfile = (id: string) =>
 		run(async () => {
 			await apiPost("/api/agent-profiles/refresh", { id });
-			reloadAll();
+			await refreshAfterToolsSave();
 		}, `已刷新「${id}」并重传到运行时`);
 
 	const deleteProf = (id: string) =>
@@ -1352,6 +1352,7 @@ export function ConnectPanel({ toast }: { toast: (level: "info" | "warning" | "e
 			{/* ② 配置仓库：名 + 右侧 启用|刷新 / 修改 / 删除；点击行展开修改 */}
 			<section className="sp-section conn-block">
 				<div className="conn-section-label">配置仓库</div>
+				<div className="field-hint">启用配置会切换主用模型，并保留已经接入的其他渠道和岗位绑定；不会自动接入尚未启用的仓库渠道。</div>
 				<PanelStatus loading={profilesData.loading} error={profilesData.error} hasData={!!profilesData.data} />
 				{profiles.length === 0 && <div className="sp-empty">仓库为空 — 用下方生成器创建</div>}
 				{profiles.map((p) => {

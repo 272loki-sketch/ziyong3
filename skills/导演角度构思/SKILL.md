@@ -4,7 +4,7 @@ description: 按主 Agent 指定的不同角度提出独立结构候选，不代
 workflow: director-ideas
 license: AGPL-3.0-only
 upstream-author: Luker Team
-attribution: docs/PROMPT-SOURCES.md
+attribution: docs/materials.md
 resident: false
 每轮: false
 ---

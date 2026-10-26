@@ -1,5 +1,5 @@
 /**
- * 外部插件协议识别（PLAN-RP-AGENT-EXEC M-C2 / docs/PRESET-SPLIT-TAXONOMY.md H 类）。
+ * 外部插件协议识别（见 docs/materials.md）。
  *
  * 酒馆生态里，卡与世界书常自带**第三方插件协议**：一段提示词要求模型
  * 「回复末尾必须输出 <UpdateVariable> + JSON Patch」之类，指望酒馆装了对应插件去解析。

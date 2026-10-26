@@ -58,3 +58,14 @@ test("database wall time and skipped legacy paths survive safe projection",()=>{
  assert.equal(data.phases["prep.database"]?.calls,0);
  assert.equal(data.phases["prep.memoryRecall"]?.status,"skipped");
 });
+
+test('performance reasons explain merged/skipped roles without exposing arbitrary text',()=>{
+ const collector=new TurnPerformanceCollector();
+ collector.status('prep.director','skipped','merged-database-recall');
+ collector.status('prep.memoryRecall','skipped','upstream-plugin-managed');
+ const raw=collector.finish('synthetic');
+ assert.equal(projectTurnPerformance(raw,'synthetic')?.phases['prep.director']?.reason,'merged-database-recall');
+ assert.equal(projectTurnPerformance(raw,'synthetic')?.phases['prep.memoryRecall']?.reason,'upstream-plugin-managed');
+ raw.phases['prep.director']!.reason='private arbitrary text' as any;
+ assert.equal(projectTurnPerformance(raw,'synthetic')?.phases['prep.director']?.reason,undefined);
+});

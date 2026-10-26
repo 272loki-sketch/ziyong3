@@ -107,6 +107,18 @@ function limitedRead(root: string, path: string, maxBytes: number, expectedBytes
 	if (bytes.length > maxBytes || (expectedBytes !== undefined && bytes.length !== expectedBytes)) throw new Error(`插件资源大小或完整性失败：${path}`);
 	return bytes;
 }
+/** Return the exact bytes that passed integrity checks, not a path to reopen later. */
+export function readTavernCandidateAsset(candidate: TavernPluginCandidate, relativePath: string, maxBytes = MAX_BYTES): { path: string; bytes: Buffer } | null {
+	if (!safeRelative(relativePath)) return null;
+	try {
+		const entry = candidate.files.find(file => file.path === relativePath);
+		if (!entry) return null;
+		const bytes = limitedRead(candidate.root, relativePath, maxBytes, entry.bytes);
+		if (digest(bytes) !== entry.sha256) return null;
+		return { path: join(candidate.root, relativePath), bytes };
+	} catch { return null; }
+}
+
 function defaultPointer(): Pointer {
 	return { version: 1, plugins: { helper: { enabled: false, autoUpdate: true }, template: { enabled: false, autoUpdate: true } } };
 }
@@ -299,18 +311,19 @@ export class TavernPluginSources {
 		try { return this.#verifyKey(id, this.#read().plugins[id].active); } catch (error) { return { ok: false, errors: [this.#safeError(error)] }; }
 	}
 	/** Original bytes only. Invalid paths, symlinks, missing or altered assets are never served. */
-	resolveAsset(value: TavernPluginId, relativePath: string): string | null {
+	readAsset(value: TavernPluginId, relativePath: string): { path: string; bytes: Buffer } | null {
 		const id = idOf(value);
 		if (!safeRelative(relativePath)) return null;
 		try {
 			const key = this.#read().plugins[id].active;
 			if (!key) return null;
-			const candidate = this.#candidate(id, key), file = candidate.files.find((entry) => entry.path === relativePath);
-			if (!file) return null;
-			const path = regularFile(candidate.root, relativePath), bytes = limitedRead(candidate.root, relativePath, this.#options.maxBytes ?? MAX_BYTES, file.bytes);
-			return bytes.length === file.bytes && digest(bytes) === file.sha256 ? path : null;
+			return readTavernCandidateAsset(this.#candidate(id, key), relativePath, this.#options.maxBytes ?? MAX_BYTES);
 		} catch { return null; }
 	}
+	resolveAsset(value: TavernPluginId, relativePath: string): string | null {
+		return this.readAsset(value, relativePath)?.path ?? null;
+	}
+
 	#manifest(bytes: Uint8Array, paths: Set<string>): TavernPluginManifest {
 		const manifest = JSON.parse(Buffer.from(bytes).toString("utf8")) as TavernPluginManifest;
 		if (typeof manifest.version !== "string" || !/^[0-9][0-9A-Za-z.+-]{0,99}$/.test(manifest.version)

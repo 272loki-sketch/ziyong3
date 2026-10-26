@@ -1,3 +1,7 @@
+import {NpcAdmissionAction} from './NpcAdmissionAction.tsx';
+import {displayPrepPhases} from '../../../src/stage/merged-prep-view.ts';
+import { FishTtsMessage } from "./FishTtsPlayer.tsx";
+import { workspaceStale, requestWorkspaceReload, workspaceContext, scopedUrl } from "../workspace.ts";
 import {ActionOptionsCard} from "../options-card.tsx";
 import {parseGlobalActionOptions,hideGlobalActionOptionsBlockForDisplay} from "../../../src/regex-options.ts";
 import type {VeridisRewriteReceipt} from "../../../src/stage/veridis-rewrite.ts";
@@ -12,6 +16,7 @@ import type {NpcParallelReceipt} from "../../../src/stage/npc-parallel.ts";
 
 import { createContext, memo, useContext, useEffect, useMemo, useState } from "react";
 import { apiGet } from "../api.ts";
+import { NovelAiImageControls } from "./NovelAiImageControls.tsx";
 import { attachmentUrl, splitAttachments } from "../attachments.ts";
 import { applyCardSkin } from "../cardSkin.ts";
 import { isFullInterface } from "../htmlEmbed.ts";
@@ -74,8 +79,10 @@ export function ZoomImg({ src, alt, title }: { src: string; alt: string; title?:
 }
 
 function HistoricalImage({ prompt, title, incomplete }: { prompt: string; title: string; incomplete?: boolean }) {
+	const readOnly = useContext(ReadOnlyMessagesContext);
 	const [src, setSrc] = useState("");
-	const browserCacheKey = `liyuan:nai:${prompt.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim()}`;
+	const workspace = workspaceContext()?.workspace;
+	const browserCacheKey = `${workspace && workspace !== "primary" ? `liyuan.play-slot.${workspace}.` : ""}liyuan:nai:${prompt.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim()}`;
 	useEffect(() => {
 		let alive = true;
 		setSrc("");
@@ -92,7 +99,8 @@ function HistoricalImage({ prompt, title, incomplete }: { prompt: string; title:
 	}, [prompt, browserCacheKey, incomplete]);
 	return (
 		<div className="historical-image-slot">
-			{src && <ZoomImg src={src} alt={title} title={title} />}
+			{src && <ZoomImg src={scopedUrl(src)} alt={title} title={title} />}
+			<NovelAiImageControls prompt={prompt} title={title} incomplete={incomplete} readOnly={readOnly} hasImage={!!src} onGenerated={setSrc} />
 			<details><summary>历史图片提示 · {title}</summary><pre>{prompt}</pre></details>
 		</div>
 	);
@@ -831,7 +839,7 @@ export function Bubble({
 	const unfilteredDisplayBody = !isUser && presentation
         ? stripProjectedFormats(body, { options: !!presentation.options?.length }) : body;
     const concreteOptionsUi=/<(?:select|button)\b[^>]*(?:option|choice|w2g)|class=["'][^"']*(?:option|choice|w2g)/i.test(unfilteredDisplayBody);
-    const globalOptionsSource=msg.authorDelivery??msg.text;
+     const globalOptionsSource=parseGlobalActionOptions(msg.text).status==="valid"?msg.text:msg.authorDelivery??msg.text;
     const globalOptions=!isUser&&!concreteOptionsUi&&!presentation?.options?.length&&parseGlobalActionOptions(globalOptionsSource).status==="valid";
     const displayBody=globalOptions?hideGlobalActionOptionsBlockForDisplay(unfilteredDisplayBody):unfilteredDisplayBody;
 	const bodyOwnsOptions = /class=["'][^"']*(?:option|choice|w2g)|<(?:select|button)\b[^>]*(?:option|choice|w2g)|(?:行动选项|选择支|选项卡)/i.test(displayBody);
@@ -937,7 +945,7 @@ export function Bubble({
 					{/* 时间线态的工具步骤已内联在各自发生位置，不再末端重挂一份 */}
 					{!timeline && msg.activities && msg.activities.length > 0 && <ActivityBar activities={msg.activities} />}
 					{generationWorkflow && <GenerationWorkflowCard workflow={generationWorkflow} />}
-					{msg.presentationDelivery && <details className="generation-workflow-card"><summary>作者交付 · {msg.presentationDelivery.origin === "author" ? "原稿保留（不检查格式）" : msg.presentationDelivery.status === "complete" ? "历史格式交付" : "历史收据待恢复"}</summary><div className="world-state-body">{msg.presentationDelivery.origin === "author" ? <p>作者原稿直接保存；无拍后格式模型调用、格式检查或补交。</p> : <p>历史格式资料 {msg.presentationDelivery.inputSourceCount ?? 0} 份 · {msg.presentationDelivery.inputChars?.toLocaleString() ?? 0} 字 · 重交 {msg.presentationDelivery.retryCount ?? 0} 次</p>}{msg.presentationDelivery.formatNames?.length ? <p>本次核对：{msg.presentationDelivery.formatNames.join("、")}</p> : null}<p>正文与卡格式由正文 Agent 一并输出，程序只应用绑定的原正则展示；不再拍后调用模型补格式。</p></div></details>}
+					{msg.presentationDelivery && <details className="generation-workflow-card"><summary>作者交付 · {msg.presentationDelivery.origin === "author" ? "原稿保留（正文先行）" : msg.presentationDelivery.status === "complete" ? "历史格式交付" : "历史收据待恢复"}</summary><div className="world-state-body">{msg.presentationDelivery.origin === "author" ? <p>作者原稿直接保存并先行显示；补充内容在后台异步交付，不替换或改写原稿。</p> : <p>历史格式资料 {msg.presentationDelivery.inputSourceCount ?? 0} 份 · {msg.presentationDelivery.inputChars?.toLocaleString() ?? 0} 字 · 重交 {msg.presentationDelivery.retryCount ?? 0} 次</p>}{msg.presentationDelivery.formatNames?.length ? <p>本次核对：{msg.presentationDelivery.formatNames.join("、")}</p> : null}<p>补充内容按角色卡与启用资料决定，不设固定面板白名单；仅在来源及原稿、正文校验通过后追加展示，不写回故事事实。</p></div></details>}
 					{msg.modelDiagnostics?.length ? <ModelDiagnosticsCard calls={msg.modelDiagnostics} /> : null}
 					{workflow && !generationWorkflow && <BeatWorkflowCard workflow={workflow} />}
 					{(!workflow || generationWorkflow) && msg.performance && <PerformanceRows performance={msg.performance} />}
@@ -1058,6 +1066,7 @@ export function Bubble({
 					)}
 				</>
 			)}
+			{!readOnly && !editing && !msg.unfinished && (msg.channel === "narrative" || msg.channel === "greeting") && <FishTtsMessage text={msg.authorDelivery ?? msg.text} entryId={msg.entryId} entryScope={msg.entryScope} />}
 		</div>
 	);
 }
@@ -1092,7 +1101,7 @@ function WorldRows({ label, rows }: { label: string; rows: string[] }) {
 	return <div className="world-state-section"><div className="world-state-label">{label}</div><ul>{rows.map((row, index) => <li key={`${label}-${index}`}>{row}</li>)}</ul></div>;
 }
 
-function PerformanceRows({ performance }: { performance: WireTurnPerformance }) {
+export function PerformanceRows({ performance }: { performance: WireTurnPerformance }) {
 	const databaseRequests = performance.requests?.filter(request => ["database", "database.before", "database.after"].includes(request.phase));
 	return <div className="bwf-performance">
 		<div className="bwf-metrics"><span><small>含后台结算</small><b>{(performance.totalMs / 1000).toFixed(1)} 秒</b></span>
@@ -1107,10 +1116,10 @@ function PerformanceRows({ performance }: { performance: WireTurnPerformance }) 
 			{inputs.length > 0 && ` · 已知输入 ${inputs.reduce((sum, request) => sum + request.inputTokens!, 0).toLocaleString()} 词元`}{outputs.length > 0 && ` · 已知输出 ${outputs.reduce((sum, request) => sum + request.outputTokens!, 0).toLocaleString()} 词元`}
 			{rows.every(request => request.durationMs !== undefined) && ` · 请求耗时累计 ${(rows.reduce((sum, request) => sum + request.durationMs!, 0) / 1000).toFixed(3)} 秒`}</div>;
 		})}这里只证明已观测请求及回执，不把成功当作召回命中或内容送达证明；逐次请求见下方。</div> : <div className="field-hint">本拍没有可用的数据库逐次请求记录，不能据此判断未召回。</div>}
-		{Object.entries(performance.phases).map(([id, phase]) => phase && <div className="field-hint" key={id}>
+		{displayPrepPhases(performance.phases).map(([id, phase]) => phase && <div className="field-hint" key={id}>
 			<strong title={id}>{phaseLabel(id)}</strong> · {(phase.durationMs / 1000).toFixed(3)} 秒 · {phase.calls} 次框架调用 · {databaseRequests?.length && ["prep.memoryRecall", "prep.memoryArcs"].includes(id) && phase.durationMs === 0 && phase.calls === 0 && phase.status === "success" ? "旧记录未区分是否执行" : requestStatusLabel(phase.status)} · 用量回执 {phase.usageCalls??0}/{phase.calls}
 			{phase.inputTokens !== undefined && ` · 回执输入 ${phase.inputTokens.toLocaleString()} 词元`}{phase.outputTokens !== undefined && ` · 回执输出 ${phase.outputTokens.toLocaleString()} 词元`}
-			<br/>{phase.status === "skipped" && ["prep.memoryRecall", "prep.memoryArcs"].includes(id) ? "旧记忆路径未执行；数据库启用时由原插件接管，不表示数据库未召回。" : phasePurpose(id)}
+			<br/>{phase.reason === "merged-database-recall" ? "本拍有效导演候选由数据库召回交付；仅跳过重复的独立导演请求，不是跳过文学导演职责。" : phase.reason === "missing-director-candidate" ? "数据库合并任务未交付有效文学导演候选，本拍已降级；不另发重复导演请求。" : phase.status === "skipped" && ["prep.memoryRecall", "prep.memoryArcs"].includes(id) ? "旧记忆路径未执行；数据库启用时由原插件接管，不表示数据库未召回，也不是尚未到召回时机。" : phase.status === "skipped" && id === "prep.director" && performance.phases["prep.database"] ? "独立文学导演未执行；历史记录未单列合并原因，须核对本拍导演候选与数据库召回，不据此断言职责未执行或候选有效。" : phasePurpose(id)}
 		</div>)}
 		{performance.requests&&<details className="generation-workflow-card"><summary>本拍逐次实际请求 · {performance.requests.length} 次</summary>{performance.requests.map((request,index)=><div className="field-hint" key={request.id}><b title={request.phase}>#{index+1} {phaseLabel(request.phase)} · {request.model}</b><br/>{phasePurpose(request.phase)}<br/>{requestStatusLabel(request.status)} · {request.durationMs===undefined?"耗时未记录":(request.durationMs/1000).toFixed(3)+" 秒"} · 输入 {request.inputTokens===undefined?"未返回":request.inputTokens.toLocaleString()} / 输出 {request.outputTokens===undefined?"未返回":request.outputTokens.toLocaleString()} / 总计 {request.totalTokens===undefined?"未返回":request.totalTokens.toLocaleString()} 词元<br/><code>{request.id}</code>（请求编号，在提示词查看器按此编号核对）</div>)}</details>}
   <div className="bwf-privacy">{TOKEN_HELP} 阶段可能并行，不能相加为总耗时；调用次数是应用框架的调用尝试，供应商内部重试未知。数据库请求走独立通道，0 次框架调用及回执 0/0 不代表没有 API 请求或没有费用。仅展示已有用量回执，首字不含工具旁白。成功只表示请求或阶段完成，不代表文学质量或审阅通过。</div>
@@ -1264,13 +1273,18 @@ export function EcologyStateCard({ ecology }: { ecology: EcologyWireView }) {
 	const cognition = ecology.spoilers.cognition ?? [];
 	const advances = ecology.spoilers.actorAdvances ?? [];
 	const propagation = ecology.propagation ?? [];
+	const historyEvents = ecology.public.historyEvents ?? [];
+	const freshness = ecology.snapshot?.status;
 	const spoilerCount = ecology.spoilers.actors.length + ecology.spoilers.events.length + ecology.spoilers.secrets.length + cognition.length + advances.length;
 	return <details className="turn-dossier">
-		<DossierHeader title="鲜活世界" domain="生态卷宗 · 当前快照" meta={`第 ${ecology.round} 轮`} digest={ecology.digest} />
+		<DossierHeader title="鲜活世界" domain="生态卷宗 · 最近已提交快照" meta={`第 ${ecology.round} 轮`} digest={ecology.digest} />
 		<div className="world-state-body">
+			{freshness !== "current" && <p role="status">{freshness === "pending" || freshness === "failed" || ecology.degraded ? "本轮生态尚未更新，暂时显示上次结果。" : freshness === "stale" ? "暂时显示上次生态结果。" : "生态更新状态未知。"}</p>}
+			{ecology.degraded && <p>降级延续（{ecology.degraded.stage}）：{ecology.degraded.error}</p>}
 			<p className="world-state-summary">{ecology.digest}</p>
 			{ecology.public.locations.length > 0 && <WorldRows label="公开场所动态" rows={ecology.public.locations} />}
-			{ecology.public.events.length > 0 && <WorldRows label="公开事件" rows={ecology.public.events} />}
+			<WorldRows label="公开事件 · 进行中 / 待发生" rows={ecology.public.events.length ? ecology.public.events : ["此快照没有进行中或待发生的公开事件。"]} />
+			{historyEvents.length > 0 && <details className="ecology-history"><summary>已结束公开事件 · {historyEvents.length}</summary><WorldRows label="公开事件历史" rows={historyEvents} /></details>}
 			{propagation.length > 0 && <details className="ecology-discovered ecology-propagation"><summary>社会传播面 · {propagation.length}</summary>{propagation.map((item) => <div className="ecology-propagation-item" key={item.occurrenceId}><strong>{item.headline || item.eventName}</strong><span>{item.sourceType === "official" ? "官方" : item.sourceType === "mixed" ? "混合来源" : "非官方"} · {item.claimStatus === "fact" ? "已证实" : item.claimStatus === "rumor" ? "传闻" : "信息混杂"}</span><p>{item.publicity === "trace" ? item.trace : item.summary || item.trace}</p></div>)}</details>}
 			{ecology.public.actors.length > 0 && <WorldRows label="活跃人物" rows={ecology.public.actors} />}
 			{(ecology.discovered.events.length > 0 || ecology.discovered.actors.length > 0) && <details className="ecology-discovered"><summary>可探索信息</summary>
@@ -1294,11 +1308,21 @@ export function EcologyStateCard({ ecology }: { ecology: EcologyWireView }) {
 
 /** Text-only derived views, explicitly revealed by the reader; never fed back as author text. */
 export function NpcParallelViews({receipt}:{receipt:NpcParallelReceipt}) {
+ const candidates=receipt.entries.length?receipt.entries:receipt.retainedEntries??[];
+ const readOnly=useContext(ReadOnlyMessagesContext);
+ const [stale,setStale]=useState(workspaceStale);
+ useEffect(()=>{const changed=()=>setStale(true);window.addEventListener('liyuan:workspace-changed',changed);return()=>window.removeEventListener('liyuan:workspace-changed',changed);},[]);
+ const outdated=!readOnly&&stale;
  const labels={accepted:"鲜活世界已采纳",rejected:"冲突批次未采纳",empty:"本轮无侧写",failed:"接入未完成"};
-  return <details className="turn-dossier npc-parallel-views"><DossierHeader title="众生侧写 · 幕后视角" domain="人物卷宗 · 来源绑定收据" meta={labels[receipt.status]} /><div className="world-state-body">
+  return <details className="turn-dossier npc-parallel-views"><DossierHeader title="众生侧写 · 幕后视角" domain="人物卷宗 · 来源绑定收据" meta={outdated?'收据已过期，需刷新核对':labels[receipt.status]} /><div className="world-state-body">
+   {outdated&&<p role="status">服务重启或工作区已变化，此处是刷新前的旧收据，不代表当前接入结果。<button type="button" className="drawer-btn" onClick={requestWorkspaceReload}>保留草稿并刷新结算状态</button></p>}
    <p className="turn-dossier-note">读者可见不代表用户角色知情。侧写独立保存，不改作者原稿；只有已采纳状态进入鲜活世界。</p>
-  {receipt.reason && <p role={receipt.status==="failed"?"alert":undefined}>{receipt.reason}</p>}
+   <p role="status">本次{receipt.admissionOnly?"复用":"生成"}候选 {receipt.entries.length} 份 · 已采纳 {receipt.entries.filter(entry=>entry.status==="accepted").length} 份。{receipt.status==="failed"&&receipt.entries.length>0?"文字已生成，但整批校验／生态接入尚未完成；完整可读不等于已经入账。":""}</p>
+  {!readOnly&&!outdated&&receipt.status==='failed'&&receipt.sessionId&&candidates.length>0&&<NpcAdmissionAction sessionId={receipt.sessionId} sourceEntryId={receipt.sourceEntryId} candidateHashes={candidates.map(e=>e.hash)}/>}
+  {receipt.admissionOnly&&<p className="turn-dossier-note">本次复用了已保存侧写，仅执行生态采纳；正文和侧写原文未重写。</p>}
+  {receipt.reason && <p role={!outdated&&receipt.status==="failed"?"alert":undefined}>{outdated?'旧记录：':''}{receipt.reason}</p>}
   {receipt.entries.map(entry=><details key={entry.id}><summary>{entry.name} · {entry.status==="accepted"?"已采纳":"候选，未入账"}</summary><p style={{whiteSpace:"pre-wrap"}}>{entry.text}</p>{entry.info&&<p style={{whiteSpace:"pre-wrap"}}>{entry.info}</p>}{entry.reason&&<p>{entry.reason}</p>}</details>)}
+   {!!receipt.retainedEntries?.length&&<details className="npc-retained-candidates"><summary>此前尝试已生成的候选 · {receipt.retainedEntries.length} 份（未采纳）</summary><p>后续重试失败不会删除此前内容；以下不属于本次结果，不进入人物历史或生态事实。</p>{receipt.retainedEntries.map(entry=><details key={entry.hash}><summary>{entry.name} · 此前候选，未入账</summary><p style={{whiteSpace:"pre-wrap"}}>{entry.text}</p>{entry.info&&<p style={{whiteSpace:"pre-wrap"}}>{entry.info}</p>}</details>)}</details>}
    <small className="turn-dossier-source">上游 {receipt.upstreamVersion} · {receipt.upstreamCommit.slice(0,7)} · 正文来源 {receipt.sourceEntryId}</small>
  </div></details>;
 }

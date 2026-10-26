@@ -1,3 +1,4 @@
+import { scopedUrl } from "../workspace.ts";
 import {useEffect,useRef,useState} from 'react';
 import '../npc-parallel.css';
 import {PluginLeaveError,usePluginLeave} from '../plugins/usePluginLeave.tsx';
@@ -31,7 +32,7 @@ export function VeridisRewriteOriginalSettings({contextTick,onBack}:{contextTick
   <PluginLeaveError error={leaveError} discard={discard}/>
   {error&&<p className="npc-parallel-feedback is-error" role="alert">{error}</p>}
   <div className={`npc-parallel-frame-wrap${phase!=='ready'?' is-not-ready':''}`}>
-   <iframe key={`${contextTick}:${attempt}`} ref={frame} title="Veridis Rewrite 原版规则工作台" src={`/veridis-rewrite-host.html?theme=${theme}&attempt=${attempt}`} sandbox="allow-scripts allow-same-origin allow-downloads allow-modals" aria-hidden={phase!=='ready'} inert={phase!=='ready'} />
+   <iframe key={`${contextTick}:${attempt}`} ref={frame} title="Veridis Rewrite 原版规则工作台" src={scopedUrl(`/veridis-rewrite-host.html?theme=${theme}&attempt=${attempt}`)} sandbox="allow-scripts allow-same-origin allow-downloads allow-modals" aria-hidden={phase!=='ready'} inert={phase!=='ready'} />
    {phase!=='ready'&&<div className={`npc-parallel-frame-state${phase==='error'?' is-error':''}`} role={phase==='error'?'alert':'status'}><strong>{phase==='loading'?'正在等待原版工作台报告就绪…':'原版工作台尚未就绪'}</strong>{phase==='error'&&<><span>{error}</span><button type="button" className="npc-parallel-button" onClick={reload}>重新载入并重试</button></>}</div>}
   </div>
  </section>;

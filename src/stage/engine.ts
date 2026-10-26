@@ -1,8 +1,13 @@
+import { requestFailure } from "./request-failure.ts";
+import { abortable, abortableEvents } from "../async-abort.ts";
+import { analysisRequestTimeoutMs, createRequestDeadline, isLocalRequestTimeout, LocalRequestTimeoutError, requestAbortError } from "../request-budget.ts";
+import type { PlotChoiceInput, PlotSelection } from "../plot-options/types.ts";
 import {hasLegacyUnsettledNpcValidation} from "./npc-parallel.ts";
 import {computeVeridisRewrite,VERIDIS_REWRITE_ENTRY_TYPE,type VeridisRewriteProvider} from "./veridis-rewrite.ts";
 import {computeNpcEcology} from "./npc-ecology.ts";
-import {NPC_PARALLEL_ENTRY_TYPE, type NpcParallelProvider} from "./npc-parallel.ts";
-import { RequestJournal, type RequestScope } from "./request-journal.ts";
+import {SUPPLEMENTARY_ENTRY_TYPE,supplementaryHash,parseSupplementaryResponse,supplementaryInput,supplementaryHasRequirements,supplementaryNeedsMvu,supplementaryMvuRequirement,supplementaryMvuMissing,supplementarySystemPrompt,supplementaryMaterialView,projectSupplementaryMaterials} from './supplementary.ts';
+import {NPC_PARALLEL_ENTRY_TYPE, validateNpcAdmissionRequest, type NpcAdmissionRequest, type NpcParallelProvider} from "./npc-parallel.ts";
+import { RequestJournal, requestPayloadSnapshot, withRequestTransport, type RequestScope } from "./request-journal.ts";
 import { createHash, randomUUID } from "node:crypto";
 /**
  * 台上引擎（PLAN-RP-HARNESS M1）——RP 原生回合循环（R1 循环自持）。
@@ -18,12 +23,13 @@ import { createHash, randomUUID } from "node:crypto";
  */
 
 import { join } from "node:path";
-import { selectDatabasePluginWorldbookEntries, databasePluginWorldbookParts, insertDatabasePluginDepthEntries, placeDatabasePluginCharacterEntries, type DatabasePluginPreparedPrompt } from "./database-plugin-prompt.ts";
+import { selectDatabasePluginWorldbookEntries, databasePluginWorldbookParts, insertDatabasePluginDepthEntries, placeDatabasePluginCharacterEntries, type DatabasePluginPreparedPrompt, type DatabasePluginLiteraryDirector } from "./database-plugin-prompt.ts";
 import { existingEcologyReference } from "./passive-ecology.ts";
 import { originalAuthorPresentation } from "./agent-presentation.ts";
 import { projectPresentation } from "../presentation.ts";
 import { runAgentTurn } from "./agent-turn.ts";
-import { classifyModelFailure, isNativeToolsUnsupported, type ModelAttemptDiagnostic } from "./model-failure.ts";
+import { classifyModelFailure, isNativeToolsUnsupported, isProviderContentRejection, modelResponseFailure, type ModelAttemptDiagnostic } from "./model-failure.ts";
+import { settlementRetry, settlementFailureRetryable } from "./settlement-retry.ts";
 import { executeDirectorBatch, directorMainSkill, type DirectorContext, type DirectorReport } from "./agent-director.ts";
 import { isGenerationMode, type GenerationMode, type GenerationWorkflow } from "./generation-mode.ts";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -41,11 +47,12 @@ import { loadCodexEntries } from "../codex.ts";
 import { formatPanelIndex, formatPanelSnapshot, loadPanels } from "../panels.ts";
 import { dir } from "../paths.ts";
 import { classifyTag, scanTaggedBlocks } from "../postprocess.ts";
-import { formatRosterIndex, formatState, saveState } from "../state.ts";
+import { applyPatch, formatRosterIndex, formatState, saveState } from "../state.ts";
 import { isBackstageText } from "../stance.ts";
 import type { LorebookEntry } from "../types.ts";
 import {
 	buildStageInjection,
+	buildStagePresetMessages,
 	buildStageSystemPrompt,
 	codexNamesFromBranch,
 	detectsLanguageMismatch,
@@ -56,7 +63,9 @@ import {
 } from "./assemble.ts";
 import {
 	assemblePresetAfter,
- projectStageWorldbookEntries,
+	 projectStageWorldbookEntries,
+	projectStageDatabaseWorldbook,
+	stageDatabaseWorldbookEntries,
 	constantLoreOf,
 	loadStageConfig,
 	loadStageMaterials,
@@ -71,9 +80,10 @@ import {
 	type CompactOutcome,
 	type RpSummaryData,
 } from "./compact.ts";
+import { ledgerFailureForSource, ledgerStatusFromBranch, ledgerCompletionReceipt, planLedgerConfirmation, type LedgerConfirmationExpected } from "./ledger-status.ts";
 import { repairKnownCharacterIdentityState, runScribeTurn, STATE_ENTRY_TYPE } from "./scribe-run.ts";
 import { WriterContextPreflight, isConfirmedContextOverflow } from "./context-preflight.ts";
-import { TurnPerformanceCollector, TURN_PERFORMANCE_ENTRY_TYPE, type PerformancePhase, type PerformanceStatus } from "./performance.ts";
+import { TurnPerformanceCollector, TURN_PERFORMANCE_ENTRY_TYPE, type PerformancePhase, type PerformanceStatus, type DatabaseRequestObservation } from "./performance.ts";
 import {
 	LITERARY_PROFILE_ENTRY_TYPE,
 	buildCharacterProfilePrompt,
@@ -85,6 +95,8 @@ import {
 	type LiteraryProfileData,
 } from "./literary-profile.ts";
 import {
+	buildDatabaseLiteraryDirectorPrompt,
+	parseDatabaseLiteraryDirection,
 	buildLiteraryDirectorPrompt,
 	formatLiteraryDirection,
 	parseLiteraryDirection,
@@ -184,11 +196,9 @@ import { createResearchEvidenceCache } from "../tools/research-cache.ts";
 import { createResearchTurnScope } from "../tools/research-scope.ts";
 import {
 	WORLD_MANIFEST_ENTRY_TYPE,
-	buildWorldProfilePrompt,
-	defaultCardWorldProfile,
+	analyzeCardWorldProfile,
 	loadCardWorldProfile,
 	manifestFromProfile,
-	normalizeCardWorldProfile,
 	profileNeedsAnalysis,
 	saveCardWorldProfile,
 	worldManifestFromBranch,
@@ -248,6 +258,16 @@ export interface StageSessionManager {
 const isSessionMetadataEntry = (entry: BranchEntryLike): boolean =>
 	entry.type === "model_change" || entry.type === "thinking_level_change" || (entry.type === "custom" && entry.customType === "rp-database-memory");
 
+function assertSettlementAuthorComplete(source: BranchEntryLike, branch: BranchEntryLike[]): void {
+	const details = source.message?.details as Record<string, unknown> | undefined;
+	const workflow = details?.rpGenerationWorkflow as GenerationWorkflow | undefined;
+	const receipts = branch.filter(e => e.customType === "rp-turn-settlement" && (e.data as {narrativeEntryId?: string})?.narrativeEntryId === source.id);
+	const incomplete = receipts.some(e => (e.data as {authorComplete?: boolean})?.authorComplete === false);
+	const modern = isGenerationMode(details?.rpGenerationMode) || workflow !== undefined || receipts.some(e => (e.data as {authorComplete?: boolean})?.authorComplete !== undefined);
+	if (incomplete || workflow?.recovery && workflow.recovery.status !== "success" || modern && source.message?.stopReason !== "stop")
+		throw Error("作者半稿尚未完成，后台结算保持pending；未调用任何后台岗位");
+}
+
 const turnLeafIsStable = (sm: StageSessionManager, anchorId: string | null): boolean => {
 	if (!anchorId) return false;
 	if (sm.getLeafId() === anchorId) return true;
@@ -305,10 +325,14 @@ export interface StageModelLike {
 }
 
 /** @liyuan/ai streamSimple 的结构子集 */
+export interface StageStreamOptions extends Record<string, unknown> {
+  maxTokens?: number;
+  useProviderDefaultMaxTokens?: boolean;
+}
 export type StageStreamFn = (
 	model: StageModelLike,
 	context: { systemPrompt?: string; messages: unknown[] },
-	options?: Record<string, unknown>,
+	options?: StageStreamOptions,
 ) => AsyncIterable<StageStreamEvent> & { result(): Promise<AssistantMsgLike> };
 
 export interface AssistantMsgLike {
@@ -336,13 +360,18 @@ export interface StageStreamEvent {
 }
 
 export interface StageSubmission {
+	plotChoice?: PlotChoiceInput;
 	generationMode?: GenerationMode;
 	clientMessageId?: string;
 	expectedSessionId?: string;
 	onAccepted?: (entryId: string) => void;
+	/** Trusted pre-persistence failure (plot validation, native worldbook filter timeout); never rejects a saved input. */
+	onRejected?: (reason: string) => void;
 }
 
 interface StageRequestObservation {
+ guard?: () => void;
+ sourceEntryId?: string;
 	diagnostics?: ModelAttemptDiagnostic[];
  requestGroupId?:string;
  requestScope?:RequestScope;
@@ -390,6 +419,7 @@ export interface StageEvents {
 	onDraftResync?: (segments: string[]) => void;
 	/** 正文与作者原格式已 flush，可立即展示；后台结算尚未完成，不能据此解开分支写锁。 */
 	onAuthorReady?: (info: { entryId: string }) => void;
+	onSupplementaryReady?: (info: { entryId: string }) => void;
 	onTurnEnd?: (info: StageTurnEndInfo) => void;
 	/** 面向用户的告警（宏降级等）；每种只发一次 */
 	onNotify?: (level: "info" | "warning" | "error", text: string) => void;
@@ -398,6 +428,7 @@ export interface StageEvents {
 }
 
 export interface StageEngineDeps {
+	plotOptions?: { resolve(choice: PlotChoiceInput): PlotSelection; reference(): string | undefined };
 	cwd: string;
 	getSessionManager: () => StageSessionManager;
 	getModel: () => StageModelLike | undefined;
@@ -418,12 +449,14 @@ export interface StageEngineDeps {
 		before(packet: {systemPrompt:string;messages:unknown[];worldbookEntries?:LorebookEntry[];card?:string}, signal?:AbortSignal):Promise<{systemPrompt:string;messages:unknown[];retainedWorldbookIndices?:number[]}>;
 		after(entryId:string, signal?:AbortSignal):Promise<void>;
 	};
+	/** Pre-save native worldbook filter bound in ms; defaults to TAVERN_WORLDBOOK_FILTER_TIMEOUT_MS (tests inject small values). */
+	tavernPluginFilterTimeoutMs?: number;
 	npcParallel?: NpcParallelProvider;
 	veridisRewrite?:VeridisRewriteProvider;
 	databasePluginMemory?: {
 		enabled(): boolean;
-		before(userText: string, signal?: AbortSignal): Promise<DatabasePluginPreparedPrompt>;
-		after(sourceEntryId?: string, signal?: AbortSignal): Promise<void>;
+		before(userText: string, signal?: AbortSignal, director?: DatabasePluginLiteraryDirector, observation?: DatabaseRequestObservation): Promise<DatabasePluginPreparedPrompt>;
+		after(sourceEntryId?: string, signal?: AbortSignal, observation?: DatabaseRequestObservation): Promise<void>;
 		recentHistoryMessages(): number;
 	};
 	/**
@@ -679,6 +712,21 @@ export function extractPureTextNarrative(text: string): string {
 }
 
 const WRITER_STREAM_TIMEOUT_MS = 900_000;
+/**
+ * Native worldbook filtering runs before the user row is saved, so it needs its own finite bound.
+ * It covers browser launch, host page load, the existing 45 s MVU-ready wait and the filter evaluate.
+ */
+export const TAVERN_WORLDBOOK_FILTER_TIMEOUT_MS = 120_000;
+
+/** Settle when the signal aborts even if `work` never answers; `work` keeps running unobserved. */
+function settleBeforeAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => { work.catch(() => {}); reject(requestAbortError(signal, "酒馆插件世界书过滤已取消")); };
+		if (signal.aborted) { onAbort(); return; }
+		signal.addEventListener("abort", onAbort, { once: true });
+		work.then(value => { signal.removeEventListener("abort", onAbort); resolve(value); }, error => { signal.removeEventListener("abort", onAbort); reject(error); });
+	});
+}
 
 export function streamWithTimeout(
 	stream: AsyncIterable<StageStreamEvent>,
@@ -687,7 +735,7 @@ export function streamWithTimeout(
 	requestController = new AbortController(),
 ): AsyncGenerator<StageStreamEvent> {
 	const requestSignal = signal ? AbortSignal.any([signal, requestController.signal]) : requestController.signal;
-	const timeoutError = new Error(`主演请求超时（${timeoutMs}ms）`);
+	const timeoutError = new LocalRequestTimeoutError("writer", timeoutMs, "主演请求");
 	const timer = setTimeout(() => requestController.abort(timeoutError), timeoutMs);
 	const onParentAbort = () => requestController.abort(signal?.reason);
 	if (signal?.aborted) onParentAbort();
@@ -696,11 +744,11 @@ export function streamWithTimeout(
 	const output = (async function* (): AsyncGenerator<StageStreamEvent> {
 	try {
 		while (true) {
-			if (requestSignal.aborted) throw requestSignal.reason === timeoutError ? timeoutError : new Error("主演请求已取消");
+			if (requestSignal.aborted) throw requestAbortError(requestSignal, "主演请求已取消");
 			let onAbort: (() => void) | undefined;
 			try {
 				const stopped = new Promise<never>((_resolve, reject) => {
-					onAbort = () => reject(requestSignal.reason === timeoutError ? timeoutError : new Error("主演请求已取消"));
+					onAbort = () => reject(requestAbortError(requestSignal, "主演请求已取消"));
 					if (requestSignal.aborted) onAbort();
 					else requestSignal.addEventListener("abort", onAbort, { once: true });
 				});
@@ -708,7 +756,7 @@ export function streamWithTimeout(
 					iterator.next(),
 					stopped,
 				]);
-				if (requestSignal.aborted) throw requestSignal.reason === timeoutError ? timeoutError : new Error("主演请求已取消");
+				if (requestSignal.aborted) throw requestAbortError(requestSignal, "主演请求已取消");
 				if (result.done) return;
 				const terminal = result.value.type === "done" || result.value.type === "error";
 				if (terminal) { clearTimeout(timer); requestController.abort(); }
@@ -1047,6 +1095,9 @@ export const mergeFinalText = (draft: string, text: string): string => {
 };
 
 export class StageEngine {
+	#loadMaterials(options: { nativeTavernPlugins?: boolean } = {}): StageMaterials {
+		return loadStageMaterials(this.#deps.cwd, { ...options, sessionId: this.#deps.getSessionManager().getSessionId() });
+	}
     readonly #researchEvidenceCache = createResearchEvidenceCache();
 	#deps: StageEngineDeps;
 	#backgroundController: AbortController | null = null;
@@ -1089,7 +1140,7 @@ export class StageEngine {
 
 	/** 用户新输入开一拍：先落 user 消息再开演；忙时排队（流式中送达的输入不打断叙事） */
 	async performTurn(userText: string, submission?: StageSubmission): Promise<void> {
-		submission = submission ? { ...submission } : undefined;
+		submission = submission ? { ...submission, ...(submission.plotChoice ? { plotChoice: { ...submission.plotChoice } } : {}) } : undefined;
 		const submittedMode = submission?.generationMode ?? loadStageConfig(this.#deps.cwd).generationMode;
 		if (isGenerationMode(submittedMode)) submission = { ...submission, generationMode: submittedMode };
 		this.#validateSubmission(submission);
@@ -1138,7 +1189,7 @@ export class StageEngine {
 				ev.onNotify?.("error", "当前回复没有独立正文工件。");
 				return;
 			}
-			const materials = loadStageMaterials(this.#deps.cwd);
+			const materials = this.#loadMaterials();
 			if (isGenerationMode(details.rpGenerationMode)) {
 				const result = await this.#deliverAgentPresentation(materials, sm, String(target.id), narrative,
 					typeof details?.rpAuthorDraft === "string" ? details.rpAuthorDraft : narrative,
@@ -1205,11 +1256,20 @@ export class StageEngine {
 
 	async #recoverPendingDatabaseMemory(sm: StageSessionManager, ev: StageEvents, stable: (anchor: string | null) => boolean): Promise<void> {
 		const provider = this.#deps.databasePluginMemory;
-		if (!provider?.enabled()) return;
 		const branch = sm.getBranch() as BranchEntryLike[];
+		const latestSource = [...branch].reverse().find(e => e.message?.role === "assistant");
+		if (latestSource) assertSettlementAuthorComplete(latestSource, branch);
 		const receipt = [...branch].reverse().find(e => e.customType === "rp-database-memory")?.data as { sourceEntryId?: string; status?: string } | undefined;
+		const checkpoint = [...branch].reverse().find(e => e.customType === "rp-turn-settlement" && (e.data as {narrativeEntryId?: string})?.narrativeEntryId === latestSource?.id)?.data as {degradedDomains?: string[]} | undefined;
+		if (checkpoint?.degradedDomains?.includes("memory") && (!receipt || receipt.sourceEntryId !== latestSource?.id)) throw Error("memory: 缺失来源收据，无法确认适用性，保留待恢复标记");
+		if (checkpoint?.degradedDomains?.includes("memory") && receipt?.status !== "pending") throw Error("memory: 来源收据与失败标记冲突，未确认恢复完成");
+		if (!provider?.enabled()) {
+			if (checkpoint?.degradedDomains?.includes("memory")) throw Error("memory: 原失败领域当前未启用，保留待恢复标记");
+			return;
+		}
 		if (receipt?.status !== "pending") return;
 		const source = branch.find(e => e.id === receipt.sourceEntryId && e.type === "message" && e.message?.role === "assistant");
+		if (source) assertSettlementAuthorComplete(source, branch);
 		const details = source?.message?.details as Record<string, unknown> | undefined;
 		const workflow = details?.rpGenerationWorkflow as GenerationWorkflow | undefined;
 		if (!receipt.sourceEntryId || source?.message?.stopReason !== "stop" ||
@@ -1219,7 +1279,13 @@ export class StageEngine {
 		const anchor = sm.getLeafId();
 		if (this.#abort?.signal.aborted || !stable(anchor)) throw Error("数据库恢复已取消或来源改变");
 		ev.onActivity?.("仅补办已保存正文的数据库记忆整理，不重写正文或重复已完成领域");
-		await provider.after(receipt.sourceEntryId, this.#abort?.signal);
+		try { await provider.after(receipt.sourceEntryId, this.#abort?.signal); }
+		catch (error) {
+			if (!this.#abort?.signal.aborted && stable(anchor)) {
+				sm.appendCustomEntry("rp-database-memory", { sourceEntryId: receipt.sourceEntryId, status: "pending", failure: requestFailure(error), recovered: false }); sm.flush();
+			}
+			throw error;
+		}
 		if (this.#abort?.signal.aborted || !stable(anchor)) throw Error("数据库恢复已取消或来源改变");
 		sm.appendCustomEntry("rp-database-memory", { sourceEntryId: receipt.sourceEntryId, status: "complete", recovered: true });
 		const settlement = [...branch].reverse().find(e => e.customType === "rp-turn-settlement" &&
@@ -1233,17 +1299,250 @@ export class StageEngine {
 		sm.flush();
 	}
 
-	async retryPendingSettlement(): Promise<StageTurnEndInfo> {
+	editLedger(patch: Record<string, unknown>, legacyState?: import("../types.ts").WorldState) {
+  if (this.#busy || this.#queue.length) throw new Error("剧情或后台正在处理，请等待完成后编辑账本");
+  const sm = this.#deps.getSessionManager(), branch = sm.getBranch() as BranchEntryLike[];
+  const base = branch.some(e => e.customType === STATE_ENTRY_TYPE) ? stateFromBranch(branch) : legacyState ?? stateFromBranch(branch);
+  const result = applyPatch(base, patch);
+  const state = { ...result.state, _ledgerOrigin: "user-edit" };
+  sm.appendCustomEntry(STATE_ENTRY_TYPE, state); sm.flush();
+  const file = this.#deps.getStateFile?.(sm.getSessionId());
+  if (file) { try { saveState(file, state); } catch { /* Tree remains authoritative. */ } }
+  return { applied: result.applied, warnings: result.warnings };
+ }
+
+	confirmLedger(expected: LedgerConfirmationExpected, patch: Record<string, unknown>) {
+  if (this.#busy || this.#queue.length) throw new Error("剧情或后台正在处理，请等待完成后核对账本");
+  const sm = this.#deps.getSessionManager(), config = loadStageConfig(this.#deps.cwd);
+  if (!expected || expected.sessionId !== sm.getSessionId() || expected.card !== config.card)
+   throw Object.assign(new Error("会话或角色卡已变化，请刷新后核对账本"), { statusCode: 409 });
+  const planned = planLedgerConfirmation(sm.getBranch() as BranchEntryLike[], expected.sourceEntryId, expected.revision, patch);
+  sm.appendCustomEntry(STATE_ENTRY_TYPE, planned.state);
+  sm.appendCustomEntry("rp-turn-diagnostic", planned.diagnostic);
+  sm.appendCustomEntry("rp-turn-settlement", planned.settlement); sm.flush();
+  const file = this.#deps.getStateFile?.(sm.getSessionId());
+  if (file) { try { saveState(file, planned.state); } catch { /* Tree remains authoritative. */ } }
+  this.#deps.events?.onNotify?.("info", "本轮账本已由用户核对确认，未调用模型；其它未完成领域保留");
+  return { applied: planned.result.applied, warnings: planned.result.warnings };
+ }
+
+ /** Explicit, one-request recovery of the latest saved ledger only. Never enters general settlement. */
+ async retryLedger(expected: LedgerConfirmationExpected): Promise<StageTurnEndInfo & {ledgerUpdated?: boolean; noChanges?: boolean}> {
+  if (this.#busy || this.#queue.length) throw Object.assign(new Error("剧情或后台正在处理，请稍后补写账本"), {statusCode:409});
+  const sm = this.#deps.getSessionManager(), materials = this.#loadMaterials(), {config, card} = materials;
+  const branch = sm.getBranch() as BranchEntryLike[], view = ledgerStatusFromBranch(branch);
+  if (!expected || expected.sessionId !== sm.getSessionId() || expected.card !== config.card || expected.sourceEntryId !== view.sourceEntryId || expected.revision !== view.revision)
+   throw Object.assign(new Error("会话、卡、正文或账本已变化，请刷新后补写"), {statusCode:409});
+  if (!view.canRetry) throw Object.assign(new Error("没有待补写的完整正文账本；半稿或已完成账本不能重复补写"), {statusCode:409});
+  const source = branch.find(e => e.id === expected.sourceEntryId)!, details = source.message!.details as Record<string, unknown>;
+  const priorUser = branch.slice(0, branch.indexOf(source)).reverse().find(e => e.message?.role === "user");
+  const content = priorUser?.message?.content;
+  const userText = typeof content === "string" ? content : Array.isArray(content) ? content.filter(p => p.type === "text").map(p => p.text ?? "").join("") : "";
+  const baseState = stateFromBranch(branch);
+  const identityHints = Object.fromEntries(Object.keys(baseState.characters).flatMap(name => materials.entries
+   .filter(entry => entry.enabled && !entry.constant && entry.keys.some(key => key === name || name.includes(key) || key.includes(name))).slice(0,2).map(entry => [name,entry.content.slice(0,1200)])));
+  const modelBinding = (ref: {provider:string;id:string} | undefined) => JSON.stringify([ref ?? null, ref ? this.#deps.findModel?.(ref.provider,ref.id) ?? null : null]);
+  const modelKey = modelBinding(config.stepModels?.scribe), materialKey = worldProfileFingerprint({...materials,greetingIndex:config.greetingIndex}), anchor = sm.getLeafId();
+  const controller = new AbortController(), calls: ModelAttemptDiagnostic[] = [], ev = this.#deps.events ?? {};
+  const stable = () => {
+   try {
+    if(this.#deps.getSessionManager() !== sm || sm.getSessionId() !== expected.sessionId || !turnLeafIsStable(sm,anchor))return false;
+    const current=this.#loadMaterials();
+    return current.config.card === expected.card && modelBinding(current.config.stepModels?.scribe) === modelKey &&
+     worldProfileFingerprint({...current,greetingIndex:current.config.greetingIndex}) === materialKey && ledgerStatusFromBranch(sm.getBranch() as BranchEntryLike[]).revision === expected.revision;
+   } catch { return false; }
+  };
+  const guard = () => { if (controller.signal.aborted || !stable()) throw Object.assign(new Error("补写账本已取消或来源已变化，未采用迟到结果"), {statusCode:409}); };
+  const observation: StageRequestObservation = {phase:"settlement.scribe", diagnostics:calls, requestScope:{sessionId:expected.sessionId,card:expected.card}, sourceEntryId:expected.sourceEntryId, guard};
+  let result: StageTurnEndInfo & {ledgerUpdated?: boolean; noChanges?: boolean} = {aborted:false};
+  let computed: ReturnType<typeof stateFromBranch> | undefined;
+  clearTimeout(this.#backgroundTimer); this.#backgroundController?.abort(); this.#backgroundController = null; this.#pendingBackground = null;
+  this.#busy = true; this.#abort = controller;
+  const timeoutMs = analysisRequestTimeoutMs(config), timer = setTimeout(() => controller.abort(new LocalRequestTimeoutError("analysis", timeoutMs, "补写账本")), timeoutMs);
+  try {
+   ev.onTurnStart?.(); ev.onActivity?.("仅补写当前已保存正文的账本，不重跑世界、生态、记忆或正文"); guard();
+   const outcome = await abortable(runScribeTurn({sideText:(sp,ut) => this.#sideText("scribe",sp,ut,2048,"off",controller.signal,observation,false,undefined,false,true),
+    identityHints,appendStateEntry: state => {computed=state;},getLeafId:()=>sm.getLeafId(),isLeafStable:()=>stable(),onActivity:text=>{if(!controller.signal.aborted&&stable())ev.onActivity?.(text)}},
+    {state:baseState,userText,assistantText:String(details.rpNarrative),charName:card.name,userName:config.userName,trustedNarrative:true,strictPatch:true}),controller.signal);
+   guard();
+   if (outcome.kind === "failed") throw new Error(outcome.error);
+   if (outcome.kind === "stale") throw new Error("账本来源已变化，未采用结果");
+   if (outcome.kind === "skipped" && outcome.reason !== "empty-patch") throw new Error("缺少可补写的正文，未完成账本");
+   if (computed) sm.appendCustomEntry(STATE_ENTRY_TYPE,{...computed,_diagnosticSourceEntryId:expected.sourceEntryId,_ledgerOrigin:"scribe-retry"});
+   sm.appendCustomEntry("rp-turn-diagnostic",{version:1,sourceEntryId:expected.sourceEntryId,stage:"scribe",kind:outcome.kind,origin:"ledger-only-retry",...(outcome.kind==="skipped"?{reason:outcome.reason}:{})});
+   sm.appendCustomEntry("rp-turn-settlement",ledgerCompletionReceipt(branch,expected.sourceEntryId,"scribe-retry"));
+   if(calls.length)sm.appendCustomEntry("rp-model-diagnostics",{version:1,narrativeEntryId:expected.sourceEntryId,calls});sm.flush();
+   if(computed){const file=this.#deps.getStateFile?.(sm.getSessionId());if(file){try{saveState(file,computed)}catch{/* Tree remains authoritative. */}}}
+   result={aborted:false,ledgerUpdated:!!computed,noChanges:outcome.kind==="skipped"};
+  } catch(error) {
+   result={aborted:controller.signal.aborted,error:classifyModelFailure(error).reason};
+   if(stable()){
+    if(!controller.signal.aborted){
+     sm.appendCustomEntry("rp-turn-diagnostic",{version:1,sourceEntryId:expected.sourceEntryId,stage:"scribe",kind:"failed",origin:"ledger-only-retry",error:result.error,failureKind:classifyModelFailure(error).kind});
+     const checkpoint = [...branch].reverse().find(e=>e.customType==="rp-turn-settlement"&&(e.data as Record<string,unknown>|undefined)?.narrativeEntryId===expected.sourceEntryId)?.data as Record<string,unknown>|undefined;
+     sm.appendCustomEntry("rp-turn-settlement",{...checkpoint,version:1,narrativeEntryId:expected.sourceEntryId,status:"pending",ledgerDone:false,degradedDomains:[...new Set([...(Array.isArray(checkpoint?.degradedDomains)?checkpoint.degradedDomains:[]),"ledger"])]});
+    }
+    if(calls.length)sm.appendCustomEntry("rp-model-diagnostics",{version:1,narrativeEntryId:expected.sourceEntryId,calls});sm.flush();
+   }
+   ev.onNotify?.("error",result.error??"账本补写失败，原账本保留");
+  } finally {
+   clearTimeout(timer);this.#busy=false;this.#abort=null;
+   // No entryId: this is not a new story turn, so the host cannot trigger memory/outline work.
+   ev.onTurnEnd?.(result);
+  }
+  if(result.error){for(const item of this.#queue.splice(0))item.reject(new Error("账本补写未完成，排队输入未受理；草稿保留"));}
+  else void this.#drain();
+  return result;
+ }
+
+	async #retrySettlement(materials: StageMaterials, sm: StageSessionManager, ev: StageEvents,
+		stable: (anchor: string | null) => boolean, observation?: StageRequestObservation, initialErrors?: string[], npcAdmission?:NpcAdmissionRequest, supplementarySourceId?:string): Promise<void> {
+		let anchor = sm.getLeafId();
+		const signal = this.#abort!.signal;
+		const guard = () => { if (signal.aborted) throw requestAbortError(signal, "后台恢复已取消或来源改变"); if (!stable(anchor)) throw Error("后台恢复已取消或来源改变（切支）"); };
+		const branch = sm.getBranch() as BranchEntryLike[];
+		const source = [...branch].reverse().find(e => e.message?.role === "assistant");
+		if (source) assertSettlementAuthorComplete(source, branch);
+		const failures = new Map<string, string>();
+		for (const error of initialErrors ?? []) failures.set(error.split(":")[0], error);
+		const supplementaryReceipts=new Map<string,{status?:string}>();
+		for(const entry of branch)if(entry.customType===SUPPLEMENTARY_ENTRY_TYPE&&entry.data&&typeof entry.data==='object'){
+		 const receipt=entry.data as {sourceEntryId?:string;status?:string};
+		 if(receipt.sourceEntryId)supplementaryReceipts.set(receipt.sourceEntryId,receipt);
+		}
+		// Explicit recovery includes all visible ancestors; automatic retries stay on this turn.
+		const supplementarySources=branch.filter(entry=>entry.message?.role==='assistant'&&entry.id&&
+		 ['pending','failed'].includes(supplementaryReceipts.get(entry.id)?.status??'')&&(!initialErrors&&!supplementarySourceId||entry.id===(supplementarySourceId??source?.id)));
+		const tasks = [
+			...supplementarySources.map(saved=>[initialErrors?'supplementary':`supplementary:${saved.id}`,async()=>{
+    guard();assertSettlementAuthorComplete(saved,sm.getBranch() as BranchEntryLike[]);
+    const details=saved.message?.details as Record<string,unknown>;
+    if(typeof details?.rpNarrative!=='string'||typeof details.rpAuthorDraft!=='string')throw Error('Supplementary saved author source is unavailable');
+    await this.#generateSupplementary(materials,sm,saved.id!,details.rpNarrative,details.rpAuthorDraft,guard,observation?{...observation,sourceEntryId:saved.id}:undefined,()=>{anchor=sm.getLeafId();});
+   }] as const),
+			["memory", () => this.#recoverPendingDatabaseMemory(sm, ev, stable)],
+			...["ledger", "world", "ecology", "presentation"].map(domain => [domain, () => this.#recoverPendingTurn(materials, sm, ev, stable, observation, !initialErrors, domain, npcAdmission)] as const),
+			["Tavern/MVU", () => this.#recoverPendingProjections(materials, sm, stable, observation, "Tavern/MVU")],
+			["Veridis", () => this.#recoverPendingProjections(materials, sm, stable, observation, "Veridis")],
+		] as const;
+		for (const [domain,recover] of tasks) {
+		 if(initialErrors&&!failures.has(domain))continue;
+		 const dependencyReady = domain === "Tavern/MVU" && failures.get(domain)?.includes("Supplementary dependency pending") &&
+		  ["complete", "skipped"].includes(String(([...(sm.getBranch() as BranchEntryLike[])].reverse().find(e => e.customType === SUPPLEMENTARY_ENTRY_TYPE && (e.data as any)?.sourceEntryId === source?.id)?.data as any)?.status));
+		 if(dependencyReady)failures.delete(domain);
+		 for (let attempt = 0; attempt < (initialErrors ? 3 : 4); attempt++) {
+			guard();
+			if ((initialErrors && !dependencyReady) || attempt) {
+				if (!settlementFailureRetryable(failures.get(domain)??'')) break;
+				ev.onActivity?.(`后台结算 ${domain} 将在5秒后独立重试 ${initialErrors ? attempt + 1 : attempt}/3`);
+				await settlementRetry.wait(signal); guard();
+			}
+			// Each owner keeps its receipt and cumulative accounting; do not replay already completed facts.
+			{
+				const previous = failures.get(domain);
+				if (previous && !settlementFailureRetryable(previous)) continue;
+				guard();
+				ev.onActivity?.(`后台整理：恢复中，正在核对并补办 ${domain}`);
+				try { await recover(); failures.delete(domain); } catch (error) { failures.set(domain, error instanceof Error ? error.message : String(error)); }
+				// Recovery performs guarded, serial tree commits; those are not navigation.
+				const currentBranch = sm.getBranch() as BranchEntryLike[], at = currentBranch.findIndex(e => e.id === anchor);
+				if (!signal.aborted && at >= 0 && currentBranch.slice(at + 1).every(e => isSessionMetadataEntry(e) || e.type === "custom" && [STATE_ENTRY_TYPE, WORLD_MANIFEST_ENTRY_TYPE, WORLD_AUDIT_ENTRY_TYPE, LITERARY_WORLD_ENTRY_TYPE, LITERARY_ECOLOGY_ENTRY_TYPE, NPC_PARALLEL_ENTRY_TYPE, VERIDIS_REWRITE_ENTRY_TYPE, "rp-turn-settlement", "rp-tavern-plugin-settlement", "rp-presentation-delivery"].includes(e.customType ?? ""))) anchor = sm.getLeafId();
+				guard();
+				if(!failures.has(domain))break;
+			}
+		 }
+		}
+		guard();
+		this.#closeSupplementaryDomain(sm, supplementarySources.map(saved => saved.id!));
+		anchor = sm.getLeafId();
+		if(failures.size)throw Error([...failures.values()].join("；"));
+	}
+
+	/** A recovered supplementary receipt closes only its own degraded domain; other domains keep their flags. */
+	#closeSupplementaryDomain(sm: StageSessionManager, sourceIds: string[]): void {
+		let changed = false;
+		for (const id of new Set(sourceIds)) {
+			const branch = sm.getBranch() as BranchEntryLike[];
+			const supplementary = [...branch].reverse().find(e => e.customType === SUPPLEMENTARY_ENTRY_TYPE && (e.data as { sourceEntryId?: string })?.sourceEntryId === id)?.data as { status?: string } | undefined;
+			if (!["complete", "skipped"].includes(supplementary?.status ?? "")) continue;
+			const latest = [...branch].reverse().find(e => e.customType === "rp-turn-settlement" && (e.data as { narrativeEntryId?: string })?.narrativeEntryId === id)?.data as Record<string, unknown> | undefined;
+			const domains = Array.isArray(latest?.degradedDomains) ? latest.degradedDomains as string[] : [];
+			if (!latest || !domains.includes("supplementary") || latest.status === "settling") continue;
+			const degraded = domains.filter(x => x !== "supplementary");
+			const done = latest.ledgerDone !== false && latest.worldDone !== false && latest.ecologyDone !== false && latest.presentationDone !== false;
+			sm.appendCustomEntry("rp-turn-settlement", { ...latest, degradedDomains: degraded, status: !degraded.length && done ? "complete" : latest.status });
+			changed = true;
+		}
+		if (changed) sm.flush();
+	}
+
+	async #recoverPendingProjections(materials: StageMaterials, sm: StageSessionManager,
+		stable: (anchor: string | null) => boolean, observation?: StageRequestObservation, target?: string): Promise<void> {
+		const branch = sm.getBranch() as BranchEntryLike[];
+		let anchor = sm.getLeafId();
+		const source = [...branch].reverse().find(e => e.message?.role === "assistant" && (e.message.details as Record<string, unknown> | undefined)?.rpNarrative);
+		const details = source?.message?.details as Record<string, unknown> | undefined;
+		if (source) assertSettlementAuthorComplete(source, branch);
+		if (!source?.id || source.message?.stopReason !== "stop" || !isGenerationMode(details?.rpGenerationMode)) return;
+		const guard = () => { if (this.#abort?.signal.aborted || !stable(anchor)) throw Error("派生恢复已取消或来源已变化"); };
+		const errors: string[] = [];
+		const checkpoint = [...branch].reverse().find(e => e.customType === "rp-turn-settlement" && (e.data as {narrativeEntryId?: string})?.narrativeEntryId === source.id)?.data as {degradedDomains?: string[]} | undefined;
+		const tavern = target === "Veridis" ? undefined : [...branch].reverse().find(e => e.customType === "rp-tavern-plugin-settlement" && (e.data as {entryId?: string})?.entryId === source.id)?.data as {status?: string} | undefined;
+		if (target !== "Veridis" && !tavern && checkpoint?.degradedDomains?.includes("tavern-plugins")) errors.push("Tavern/MVU: 缺失来源收据，无法确认适用性，保留待恢复标记");
+		if (tavern && !["pending", "complete"].includes(tavern.status ?? "")) errors.push("Tavern/MVU: 来源收据状态无效，保留待恢复标记");
+		if (tavern?.status === "pending" && !this.#deps.tavernPlugins?.enabled()) errors.push("Tavern/MVU: 待恢复来源当前未启用，保留收据");
+		if (tavern?.status === "pending" && this.#deps.tavernPlugins?.enabled()) {
+			try {
+				this.#assertSupplementarySettled(sm, source.id);
+				guard(); await this.#deps.tavernPlugins.after(source.id, this.#abort?.signal); guard();
+				sm.appendCustomEntry("rp-tavern-plugin-settlement", {entryId: source.id, status: "complete", recovered: true}); sm.flush();
+				anchor = sm.getLeafId();
+			} catch (error) { errors.push(`Tavern/MVU: ${error instanceof Error ? error.message : String(error)}`); }
+		}
+		const rewrite = target === "Tavern/MVU" ? undefined : [...branch].reverse().find(e => e.customType === VERIDIS_REWRITE_ENTRY_TYPE && (e.data as {sourceEntryId?: string})?.sourceEntryId === source.id)?.data as {status?: string} | undefined;
+		if (target !== "Tavern/MVU" && !rewrite && checkpoint?.degradedDomains?.includes("rewrite")) errors.push("Veridis: 缺失来源收据，无法确认适用性，保留待恢复标记");
+		if (rewrite && !["failed", "complete", "skipped"].includes(rewrite.status ?? "")) errors.push("Veridis: 来源收据状态无效，保留待恢复标记");
+		const provider = this.#deps.veridisRewrite;
+		if (rewrite?.status === "failed" && !provider?.enabled()) errors.push("Veridis: 待恢复来源当前未启用，保留原稿与失败收据");
+		if (rewrite?.status === "failed" && provider?.enabled() && typeof details?.rpAuthorDraft === "string") {
+			guard();
+			const scope = {sessionId: sm.getSessionId(), card: materials.config.card, sourceEntryId: source.id, visibleEntryIds: branch.flatMap(e => e.id ? [e.id] : [])};
+			const receipt = await computeVeridisRewrite(provider, {scope, authorDraft: details.rpAuthorDraft, narrative: String(details.rpNarrative), signal: this.#abort?.signal, guard,
+				generate: async (request, signal) => {
+					guard(); provider.claimRequest(scope, guard); guard();
+					const system = request.messages.filter(m => m.role === "system").map(m => m.content).join("\n\n"), messages = request.messages.filter(m => m.role !== "system");
+					const result = await this.#sideText("veridisRewrite", system, messages.length === 1 ? messages[0].content : JSON.stringify(messages), request.maxTokens, "off", signal ? AbortSignal.any([signal, this.#abort!.signal]) : this.#abort?.signal, observation, false, request.temperature, false, false, false, request.useProviderDefaultMaxTokens);
+					guard(); if (typeof result !== "string") throw Error(result.error); return result;
+				}});
+			guard(); sm.appendCustomEntry(VERIDIS_REWRITE_ENTRY_TYPE, receipt); sm.flush();
+			anchor = sm.getLeafId();
+			if (receipt.status === "failed") errors.push(`Veridis: ${receipt.error}`);
+		}
+		guard();
+		const latest = [...(sm.getBranch() as BranchEntryLike[])].reverse().find(e => e.customType === "rp-turn-settlement" && (e.data as {narrativeEntryId?: string})?.narrativeEntryId === source.id)?.data as Record<string, unknown> | undefined;
+		if (!errors.length && latest) {
+			const degraded = (Array.isArray(latest.degradedDomains) ? latest.degradedDomains : []).filter(x => !(x === "tavern-plugins" && tavern) && !(x === "rewrite" && rewrite));
+			sm.appendCustomEntry("rp-turn-settlement", {...latest, degradedDomains: degraded, status: !degraded.length && latest.ledgerDone && latest.worldDone && latest.ecologyDone && latest.presentationDone ? "complete" : latest.status}); sm.flush();
+		}
+		if (errors.length) throw Error(errors.join("；"));
+	}
+
+	async retryPendingSettlement(admission?:NpcAdmissionRequest): Promise<StageTurnEndInfo> {
 		if(this.#busy)return {aborted:false,error:"正在生成，请先等待或停止"};
 		const sm=this.#deps.getSessionManager(),sessionId=sm.getSessionId(),ev=this.#deps.events??{};
-		const calls:ModelAttemptDiagnostic[]=[],obs:StageRequestObservation={phase:"settlement.recovery",diagnostics:calls};
+		if(admission){
+   try{admission=validateNpcAdmissionRequest(admission);}catch(error){return{aborted:false,error:error instanceof Error?error.message:String(error)};}
+   const source=[...(sm.getBranch() as BranchEntryLike[])].reverse().find(e=>e.message?.role==='assistant'&&typeof (e.message.details as Record<string,unknown>|undefined)?.rpNarrative==='string');
+   if(admission.expectedSessionId!==sessionId||admission.expectedSourceEntryId!==source?.id)return{aborted:false,error:'会话或正文来源已变化，未执行候选采纳'};
+  }
+		const calls:ModelAttemptDiagnostic[]=[],obs:StageRequestObservation={phase:"settlement.recovery",diagnostics:calls,...(admission?{sourceEntryId:admission.expectedSourceEntryId,requestScope:{sessionId,card:loadStageConfig(this.#deps.cwd).card}}:{})};
 		this.#busy=true;this.#abort=new AbortController();ev.onTurnStart?.();let result:StageTurnEndInfo={aborted:false};
-		const timer=setTimeout(()=>this.#abort?.abort(),(loadStageConfig(this.#deps.cwd).generationTimeoutMinutes??60)*60000);
+		const retryTimeoutMs=(loadStageConfig(this.#deps.cwd).generationTimeoutMinutes??60)*60000;
+		const timer=setTimeout(()=>this.#abort?.abort(new LocalRequestTimeoutError("generation",retryTimeoutMs,"后台恢复总体预算")),retryTimeoutMs);
 		try {
-			const materials=loadStageMaterials(this.#deps.cwd);
+			const materials=this.#loadMaterials();
 			const stable=(anchor:string|null)=>this.#deps.getSessionManager()===sm&&sm.getSessionId()===sessionId&&turnLeafIsStable(sm,anchor)&&loadStageConfig(this.#deps.cwd).card===materials.config.card;
-			await this.#recoverPendingDatabaseMemory(sm, ev, stable);
-			await this.#recoverPendingTurn(materials,sm,ev,stable,obs);
+			await this.#retrySettlement(materials, sm, ev, stable, obs, undefined, admission);
 		}
 		catch(e){result={aborted:!!this.#abort?.signal.aborted,error:e instanceof Error?e.message:String(e)};ev.onNotify?.("error",result.error??"恢复失败");}
 		finally{
@@ -1282,7 +1581,8 @@ export class StageEngine {
 		clearTimeout(this.#backgroundTimer); this.#backgroundController?.abort(); this.#backgroundController = null; this.#pendingBackground = null;
 		this.#busy = true; this.#abort = controller;
 		let result: StageTurnEndInfo = { aborted: false };
-		const timer = setTimeout(() => controller.abort(), (config.generationTimeoutMinutes ?? 60) * 60000);
+		const retryTimeoutMs = (config.generationTimeoutMinutes ?? 60) * 60000;
+		const timer = setTimeout(() => controller.abort(new LocalRequestTimeoutError("generation", retryTimeoutMs, "后台恢复总体预算")), retryTimeoutMs);
 		try {
 			ev.onTurnStart?.();
 			const receipt = await computeVeridisRewrite(provider, {
@@ -1291,7 +1591,7 @@ export class StageEngine {
 					guard(); provider.claimRequest(scope, guard); guard();
 					const system = request.messages.filter(m => m.role === "system").map(m => m.content).join("\n\n");
 					const messages = request.messages.filter(m => m.role !== "system");
-					const text = await this.#sideText("veridisRewrite", system, messages.length === 1 ? messages[0].content : JSON.stringify(messages), request.maxTokens, "off", signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, observation, false, request.temperature);
+					const text = await this.#sideText("veridisRewrite", system, messages.length === 1 ? messages[0].content : JSON.stringify(messages), request.maxTokens, "off", signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, observation, false, request.temperature, false, false, false, request.useProviderDefaultMaxTokens);
 					guard(); if (typeof text !== "string") throw Error(text.error); return text;
 				},
 			});
@@ -1412,37 +1712,49 @@ export class StageEngine {
 			this.#worldProfileReady = null;
 			return;
 		}
-		saveCardWorldProfile(this.#deps.cwd, materials.config.card, ready.profile, materials.card);
-		if (!worldManifestFromBranch(branch, ready.profile.cardKey)) sm.appendCustomEntry(WORLD_MANIFEST_ENTRY_TYPE, manifestFromProfile(ready.profile));
+		const fingerprint = worldProfileFingerprint({ ...this.#loadMaterials(), greetingIndex: materials.config.greetingIndex });
+		const saved = loadCardWorldProfile(this.#deps.cwd, materials.config.card, materials.card.name, fingerprint, materials.card, branch);
+		if (ready.profile.sourceFingerprint !== fingerprint || saved?.revision !== ready.profile.revision) { this.#worldProfileReady = null; return; }
+		if (worldManifestFromBranch(branch, ready.profile.cardKey)?.profileRevision !== ready.profile.revision || worldManifestFromBranch(branch, ready.profile.cardKey)?.contentKey !== ready.profile.contentKey) sm.appendCustomEntry(WORLD_MANIFEST_ENTRY_TYPE, manifestFromProfile(ready.profile));
 		sm.flush();
 		this.#worldProfileReady = null;
 		this.#deps.events?.onActivity?.("角色卡世界画像：后台候选已在本拍采用");
 	}
 
+	async #analyzeWorldProfile(materials: StageMaterials, branch: BranchEntryLike[], signal?: AbortSignal, observation?: StageRequestObservation) {
+		const canonical = this.#loadMaterials();
+		const { config, card } = canonical;
+		if (config.card !== materials.config.card) throw new Error("世界画像分析前角色卡已变化");
+		const skill = workflowSkill(canonical.skillFiles, "world-profile");
+		if (!skill) throw new Error("缺少角色卡世界画像 Skill，世界未运行");
+		const fingerprint = worldProfileFingerprint({ ...canonical, greetingIndex: config.greetingIndex });
+		const previous = loadCardWorldProfile(this.#deps.cwd, config.card, card.name, fingerprint, card, branch);
+		return analyzeCardWorldProfile({ ...canonical, cwd: this.#deps.cwd, cardPath: config.card, skillBody: skill.body, greetingIndex: config.greetingIndex,
+			previous, completedTurns: countCompletedNarrativeTurns(branch), recentHistory: rebuildHistory(branch).history,
+			guard: () => signal?.throwIfAborted(), run: (sp, ut, nonStreaming) => this.#sideText("worldProfile", sp, ut, 12288, "off", signal, observation, false, undefined, nonStreaming) });
+	}
+
 	#startWorldProfilePrep(materials: StageMaterials, branch: BranchEntryLike[]): void {
 		if (this.#worldProfilePrepRunning || this.#worldProfileReady || materials.config.literaryWorldEnabled !== true) return;
-		const { config, card } = materials;
-		const fingerprint = worldProfileFingerprint({ card, entries: materials.entries, preset: materials.preset, greetingIndex: config.greetingIndex });
-		const profile = loadCardWorldProfile(this.#deps.cwd, config.card, card.name, fingerprint, card);
+		const canonical = this.#loadMaterials();
+		const { config, card } = canonical;
+		const fingerprint = worldProfileFingerprint({ ...canonical, greetingIndex: config.greetingIndex });
+		const profile = loadCardWorldProfile(this.#deps.cwd, config.card, card.name, fingerprint, card, branch);
 		if (!profileNeedsAnalysis(profile, fingerprint, countCompletedNarrativeTurns(branch))) return;
-		const skill = workflowSkill(materials.skillFiles, "world-profile");
-		const sm = this.#deps.getSessionManager();
-		const sourceLeafId = sm.getLeafId();
-		if (!skill || !sourceLeafId) return;
-		const sessionId = sm.getSessionId();
-		const prompt = buildWorldProfilePrompt({ skillBody: skill.body, card, entries: materials.entries, preset: materials.preset, greetingIndex: config.greetingIndex, previous: profile, recentHistory: rebuildHistory(branch).history });
+		const sm = this.#deps.getSessionManager(), sessionId = sm.getSessionId(), sourceLeafId = sm.getLeafId();
+		if (!sourceLeafId) return;
+		const signal = this.#backgroundController?.signal;
 		this.#worldProfilePrepRunning = true;
 		this.#deps.events?.onActivity?.("角色卡世界画像：已在后台分析，完成后下一拍生效");
-		void this.#sideText("worldProfile", prompt.systemPrompt, prompt.userText, 12288, "off", this.#backgroundController?.signal).then((result) => {
-			if (typeof result !== "string") { this.#deps.events?.onActivity?.(`角色卡世界画像：后台分析失败（${result.error}）`); return; }
-			const base = profile ?? defaultCardWorldProfile(this.#deps.cwd, config.card, card.name, fingerprint, card);
-			const next = normalizeCardWorldProfile(result, base, { preserveStatus: !!profile, sourceFingerprint: fingerprint, analyzedTurns: countCompletedNarrativeTurns(branch) });
-			if (next) {
-				// 卡级画像不是分支运行态，生成成功即原子落盘；Manifest 仍在下一拍按来源叶采用。
-				saveCardWorldProfile(this.#deps.cwd, config.card, next, card);
-				this.#worldProfileReady = { sessionId, cardPath: config.card, sourceLeafId, profile: next };
-			} else this.#deps.events?.onActivity?.("角色卡世界画像：输出不可解析，未覆盖旧画像");
-		}).catch((error) => console.error(`[world-profile] 后台分析失败：${error instanceof Error ? error.message : String(error)}`)).finally(() => { this.#worldProfilePrepRunning = false; });
+		void this.#analyzeWorldProfile(materials, branch, signal).then(next => {
+			const current = this.#loadMaterials();
+			const saved = loadCardWorldProfile(this.#deps.cwd, config.card, card.name, fingerprint, card, sm.getBranch() as BranchEntryLike[]);
+			if (signal?.aborted || this.#deps.getSessionManager() !== sm || sm.getSessionId() !== sessionId || !this.#branchContains(sm.getBranch() as BranchEntryLike[], sourceLeafId) || current.config.card !== config.card || worldProfileFingerprint({ ...current, greetingIndex: current.config.greetingIndex }) !== fingerprint || saved?.revision !== profile?.revision) return;
+			saveCardWorldProfile(this.#deps.cwd, config.card, next, card);
+			this.#worldProfileReady = { sessionId, cardPath: config.card, sourceLeafId, profile: next };
+			this.#deps.events?.onActivity?.("角色卡世界画像：已保存，下一拍采用");
+		}).catch(error => { if (!signal?.aborted) this.#deps.events?.onNotify?.("warning", error instanceof Error ? error.message : String(error)); })
+		.finally(() => { this.#worldProfilePrepRunning = false; });
 	}
 
 	#startEcologyPoolPrep(input: {
@@ -1509,7 +1821,7 @@ export class StageEngine {
 		const minutes = typeof cfg.generationTimeoutMinutes === "number" ? Math.max(1, Math.min(120, cfg.generationTimeoutMinutes)) : requestedMode === "director" ? 60 : 30;
 		const controller = new AbortController(); this.#abort = controller;
 		let budgetExpired = false;
-		const budgetTimer = setTimeout(() => { budgetExpired = true; controller.abort(); ev.onNotify?.("error", `本拍总体预算${minutes}分钟已到，保留已有正文与未完成收据，不跳过失败阶段。`); }, minutes * 60_000);
+		const budgetTimer = setTimeout(() => { budgetExpired = true; controller.abort(new LocalRequestTimeoutError("generation", minutes * 60_000, "本拍总体预算")); ev.onNotify?.("error", `本拍总体预算${minutes}分钟已到，保留已有正文与未完成收据，不跳过失败阶段。`); }, minutes * 60_000);
 		try {
 			endInfo = await this.#turn(userText, rerollPrep, submission);
 		} catch (err) {
@@ -1536,10 +1848,12 @@ export class StageEngine {
 		const sm = this.#deps.getSessionManager();
 		this.#abort ??= new AbortController();
 		const turnSessionId = sm.getSessionId();
+		const ownDisplayCommits=new Set<string>();
 		const ownsSession = () => this.#deps.getSessionManager() === sm && sm.getSessionId() === turnSessionId;
 		let discardPerformance = false;
 		const stableLeaf = (anchor: string | null) => {
-			const stable = ownsSession() && turnLeafIsStable(sm, anchor) && loadStageConfig(cwd).card === requestScope.card;
+			const branch=sm.getBranch() as BranchEntryLike[],at=branch.findIndex(e=>e.id===anchor);
+			const stable = ownsSession() && (turnLeafIsStable(sm, anchor)||at>=0&&branch.slice(at+1).every(e=>isSessionMetadataEntry(e)||!!e.id&&ownDisplayCommits.has(e.id))) && loadStageConfig(cwd).card === requestScope.card;
 			if (!stable) discardPerformance = true;
 			return stable;
 		};
@@ -1576,13 +1890,14 @@ export class StageEngine {
 
 		// 素材现读：改卡/改预设/挂书即时生效
 		const nativeTavernPlugins = this.#deps.tavernPlugins?.enabled() === true;
-		let materials = loadStageMaterials(cwd, { nativeTavernPlugins });
+		let materials = this.#loadMaterials({ nativeTavernPlugins });
 		const { config, card } = materials;
 		const selectedMode = submission?.generationMode ?? rerollPrep?.generationMode ?? config.generationMode;
 		// 无模式的 SDK 调用暂保留历史工具协议；Web 宿主始终绑定两种新模式之一。
 		const generationMode = isGenerationMode(selectedMode) ? selectedMode : undefined;
 		let agentWorkflow: GenerationWorkflow | undefined;
 		const settlementWarnings: string[] = [];
+		const settlementErrors: string[] = [];
 		const pendingOwnerTools: Array<{ name: string; args: Record<string, unknown> }> = [];
 		let databaseMemorySettled = false;
 		let tavernPluginsSettled = false;
@@ -1591,11 +1906,27 @@ export class StageEngine {
 		if (generationMode) await this.#recoverPendingTurn(materials, sm, ev, stableLeaf, observation("settlement.recovery"));
 		if (generationMode && nativeTavernPlugins) {
 			const previous = [...(sm.getBranch() as BranchEntryLike[])].reverse().find(e => e.customType === "rp-tavern-plugin-settlement")?.data as {entryId?:string;status?:string}|undefined;
-			if (previous?.status === "pending" && previous.entryId) { const anchor = sm.getLeafId(); try { await this.#deps.tavernPlugins!.after(previous.entryId, this.#abort?.signal); } catch (error) { throw new Error(`上一拍酒馆插件/MVU整理仍未恢复，本条输入未受理；已保存正文保留：${error instanceof Error ? error.message : String(error)}`); } if (this.#abort?.signal.aborted || !stableLeaf(anchor)) throw new Error("插件恢复已取消或来源改变"); sm.appendCustomEntry("rp-tavern-plugin-settlement", {entryId:previous.entryId,status:"complete"}); sm.flush(); }
+			if (previous?.status === "pending" && previous.entryId) {
+				try { await this.#retrySettlement(materials, sm, ev, stableLeaf, observation("settlement.recovery"), undefined, undefined, previous.entryId); }
+				catch (error) { throw new Error(`上一拍酒馆插件/MVU整理仍未恢复，本条输入未受理；已保存正文保留：${error instanceof Error ? error.message : String(error)}`); }
+			}
 		}
   if(generationMode&&nativeTavernPlugins){
    const anchor=sm.getLeafId();
-   const selection=await this.#deps.tavernPlugins!.before({systemPrompt:'',messages:[],worldbookEntries:materials.entries,card:config.card},this.#abort?.signal);
+   // Bounded pre-save step. The deadline aborts the same turn signal the plugin already observes,
+   // so the runtime keeps its turn identity and discards its page/browser exactly as on user stop.
+   this.#abort??=new AbortController();const turnAbort=this.#abort;
+   const filterTimeoutMs=this.#deps.tavernPluginFilterTimeoutMs??TAVERN_WORLDBOOK_FILTER_TIMEOUT_MS;
+   const filterTimeout=new Error(`酒馆插件世界书过滤超时（本地时限 ${filterTimeoutMs>=1000?`${Math.round(filterTimeoutMs/1000)} 秒`:`${filterTimeoutMs}ms`}），本条输入未受理，草稿保留，请重试`);
+   const filterTimer=setTimeout(()=>turnAbort.abort(filterTimeout),filterTimeoutMs);
+   ev.onActivity?.("正在准备酒馆插件世界书过滤…");
+   let selection:Awaited<ReturnType<NonNullable<StageEngineDeps["tavernPlugins"]>["before"]>>;
+   try{selection=await settleBeforeAbort(this.#deps.tavernPlugins!.before({systemPrompt:'',messages:[],worldbookEntries:materials.entries,card:config.card},turnAbort.signal),turnAbort.signal);}
+   catch(error){
+    if(turnAbort.signal.reason!==filterTimeout)throw error;
+    try{submission?.onRejected?.(filterTimeout.message);}catch{ev.onActivity?.("世界书过滤超时；拒绝回执回调失败");}
+    throw filterTimeout;
+   }finally{clearTimeout(filterTimer);}
    const sourceStable=anchor?stableLeaf(anchor):ownsSession()&&sm.getLeafId()===anchor;
    if(this.#abort?.signal.aborted||!sourceStable||loadStageConfig(cwd).card!==config.card)throw new Error('Worldbook filter source changed or cancelled');
    if(!selection.retainedWorldbookIndices)throw new Error('Native worldbook filter did not return a selection');
@@ -1649,9 +1980,9 @@ export class StageEngine {
 		let branch = sm.getBranch() as BranchEntryLike[];
 		// 卡级画像已存在但当前分支尚无 Manifest 时，在新 user 落树之前播种。
 		// assistant 必须保持为 user 的直接子节点，否则 reroll/swipe 无法识别 sibling 变体。
-		const profileFingerprint = worldProfileFingerprint({ card, entries: materials.entries, preset: materials.preset, greetingIndex: config.greetingIndex });
-		const existingWorldProfile = loadCardWorldProfile(cwd, config.card, card.name, profileFingerprint, card);
-		if (userText !== null && config.literaryWorldEnabled === true && existingWorldProfile && !worldManifestFromBranch(branch, existingWorldProfile.cardKey)) {
+		const profileFingerprint = worldProfileFingerprint({ ...this.#loadMaterials(), greetingIndex: config.greetingIndex });
+		const existingWorldProfile = loadCardWorldProfile(cwd, config.card, card.name, profileFingerprint, card, branch);
+		if (userText !== null && config.literaryWorldEnabled === true && existingWorldProfile && (worldManifestFromBranch(branch, existingWorldProfile.cardKey)?.profileRevision !== existingWorldProfile.revision || worldManifestFromBranch(branch, existingWorldProfile.cardKey)?.contentKey !== existingWorldProfile.contentKey)) {
 			sm.appendCustomEntry(WORLD_MANIFEST_ENTRY_TYPE, manifestFromProfile(existingWorldProfile));
 			sm.flush();
 			branch = sm.getBranch() as BranchEntryLike[];
@@ -1661,7 +1992,15 @@ export class StageEngine {
 		if (userText !== null) {
 			// 接受回执只代表 user 已可靠落树，不代表主演已生成成功。
 			this.#validateSubmission(submission);
-			expectedTurnLeafId = sm.appendMessage({ ...nowMsg(userText), ...((submission?.clientMessageId !== undefined || generationMode) ? { details: { ...(submission?.clientMessageId !== undefined ? { rpClientMessageId: submission.clientMessageId } : {}), ...(generationMode ? { rpGenerationMode: generationMode } : {}) } } : {}) });
+			let plotSelection: PlotSelection | undefined;
+			try {
+				plotSelection = submission?.plotChoice ? this.#deps.plotOptions?.resolve(submission.plotChoice) : undefined;
+				if (submission?.plotChoice && !plotSelection) throw new Error("剧情选项模块不可用，草稿保留");
+			} catch (error) {
+				try { submission?.onRejected?.(error instanceof Error ? error.message : String(error)); } catch { ev.onActivity?.("剧情草稿未受理；拒绝回执回调失败"); }
+				throw error;
+			}
+			expectedTurnLeafId = sm.appendMessage({ ...nowMsg(userText), ...((submission?.clientMessageId !== undefined || generationMode) ? { details: { ...(plotSelection ? { rpPlotSelection: plotSelection } : {}), ...(submission?.clientMessageId !== undefined ? { rpClientMessageId: submission.clientMessageId } : {}), ...(generationMode ? { rpGenerationMode: generationMode } : {}) } } : {}) });
 			sm.flush();
 			try { submission?.onAccepted?.(expectedTurnLeafId); } catch { ev.onActivity?.("输入已落树，但接受回执回调失败"); }
 		}
@@ -1690,7 +2029,7 @@ export class StageEngine {
 		const latestUserEntryId = latestUserEntry?.id;
 		const userContent = latestUserEntry?.message?.content;
 		const latestUserOriginalText = typeof userContent === "string" ? userContent : Array.isArray(userContent) ? userContent.filter(part => part && typeof part === "object" && part.type === "text" && typeof part.text === "string").map(part => part.text).join("") : userText ?? "";
-		const branchWorldManifest = worldManifestFromBranch(branch, worldCardKey(cwd,config.card,card));
+		const branchWorldManifest = worldManifestFromBranch(branch, existingWorldProfile?.cardKey ?? worldCardKey(cwd,config.card,card));
   const adoptWorldManifestAfterAuthor = !branchWorldManifest && config.literaryWorldEnabled === true && !!existingWorldProfile;
   const worldManifest = branchWorldManifest ?? (adoptWorldManifestAfterAuthor ? manifestFromProfile(existingWorldProfile!) : undefined);
 		const modularWorld = modularWorldFromBranch(branch, worldManifest);
@@ -1718,7 +2057,7 @@ export class StageEngine {
 			.slice(-config.scanDepth)
 			.map((m) => m.text)
 			.join("\n");
-		const activated = scanEntries(materials.entries, windowText, config.maxLoreInjections);
+		const activated = databasePluginEnabled ? [] : scanEntries(materials.entries, windowText, config.maxLoreInjections);
 		const identityReference = Object.entries(identityHints).map(([name, content]) => `${name}：${content}`).join("\n\n").slice(0, 6000);
 
 		// 面板快照（M1 读磁盘缓存；写侧与分支化随 M3）
@@ -1742,17 +2081,32 @@ export class StageEngine {
 		const prepLeafId = sm.getLeafId();
 		// Mandatory native database preparation runs before optional side timers.
 		// A failed/cancelled recall must not leave their ten-minute timer running.
+		const selectedDailyPlot = this.#deps.plotOptions?.reference();
 		let databasePreparedPrompt: DatabasePluginPreparedPrompt | undefined;
 		if (databasePluginEnabled) {
-			ev.onActivity?.("原数据库插件：执行原生召回与本轮输入写回");
-			databasePreparedPrompt = await measureAwait("prep.database", this.#deps.databasePluginMemory!.before(lastUserText, this.#abort?.signal));
+			const directorSkill = workflowSkill(materials.skillFiles, "director")?.body;
+			const mergedDirector = (directorRequested || generationMode === "director") && directorSkill
+				? buildDatabaseLiteraryDirectorPrompt({
+					state, history, summary, literaryProfile, continuity: literaryContinuity,
+					ecology: config.literaryEcologyEnabled === true ? [formatLiteraryEcologyInjection(literaryEcology), passiveEcology].filter(Boolean).join("\n\n") || undefined : undefined,
+					activatedLore: activated, userText: lastUserText, charName: card.name, userName: config.userName,
+					characterIdentityIndex: identityReference || undefined, characterCard: card, userPersona: config.userPersona,
+					outline: { ...(selectedDailyPlot ? { selectedDailyPlot: JSON.parse(selectedDailyPlot) } : {}), ...projectOutline(outlineFromBranch(branch), "director") },
+				}, directorSkill) : undefined;
+			ev.onActivity?.(mergedDirector ? "原数据库插件：合并记忆召回与文学导演，执行原生输入写回" : "原数据库插件：执行原生召回与本轮输入写回");
+			databasePreparedPrompt = await measureAwait("prep.database", this.#deps.databasePluginMemory!.before(lastUserText, this.#abort?.signal, mergedDirector, { collector, phase: "prep.database" }));
 			if (!stableLeaf(prepLeafId)) return { aborted: true };
 			if (typeof databasePreparedPrompt?.userInput !== "string" || !Array.isArray(databasePreparedPrompt.worldbookEntries)) throw new Error("数据库没有交付原生发送前处理结果");
 		}
+		const databaseSourceEntries=databasePreparedPrompt?stageDatabaseWorldbookEntries(materials):[];
 		const databaseWorldbookEntries = databasePreparedPrompt
-			? selectDatabasePluginWorldbookEntries(databasePreparedPrompt.worldbookEntries, (history.at(-1)?.role === "user" ? history.slice(0, -1) : history).map(m => m.text), databasePreparedPrompt.userInput) : [];
+			? selectDatabasePluginWorldbookEntries([...databaseSourceEntries, ...databasePreparedPrompt.worldbookEntries], (history.at(-1)?.role === "user" ? history.slice(0, -1) : history).map(m => m.text), databasePreparedPrompt.userInput) : [];
 		const databaseWorldbook = databasePluginWorldbookParts(databaseWorldbookEntries);
-		const databaseSystemSlots = placeDatabasePluginCharacterEntries(materials.presetBefore, databaseWorldbook);
+		if (databasePreparedPrompt) materials = projectStageDatabaseWorldbook(materials, databaseWorldbook);
+		const databaseSystemSlots = placeDatabasePluginCharacterEntries(materials.presetBefore, {
+			before: materials.declaredMarkers.has("worldInfoBefore") ? "" : databaseWorldbook.before,
+			after: materials.declaredMarkers.has("worldInfoAfter") ? "" : databaseWorldbook.after,
+		});
 		const databaseSourceTexts = databasePreparedPrompt ? [databasePreparedPrompt.userInput, ...databaseWorldbookEntries.map(e => e.content)] : [];
 		const writerUserInput = databasePreparedPrompt?.userInput ?? lastUserText;
 		// 拍前旁路共享总预算；建议工件超时只会降级，不得阻塞正文入口。
@@ -1867,8 +2221,8 @@ export class StageEngine {
 			memoryRecallRequested && (!generationMode || memoryRecallMode === "point") ? measureAwait("prep.memoryRecall", memoryRecallPromise) : memoryRecallPromise,
 			memoryRecallRequested && memoryRecallMode === "sweep" && this.#deps.recallArcsForTurn ? measureAwait("prep.memoryArcs", memoryArcPromise) : memoryArcPromise,
 		]);
-		if (!memoryRecallRequested || (generationMode && memoryRecallMode !== "point")) collector.status("prep.memoryRecall", "skipped");
-		if (!memoryRecallRequested || memoryRecallMode !== "sweep" || !this.#deps.recallArcsForTurn) collector.status("prep.memoryArcs", "skipped");
+		if (!memoryRecallRequested || (generationMode && memoryRecallMode !== "point")) collector.status("prep.memoryRecall", "skipped", databasePluginEnabled ? "upstream-plugin-managed" : undefined);
+		if (!memoryRecallRequested || memoryRecallMode !== "sweep" || !this.#deps.recallArcsForTurn) collector.status("prep.memoryArcs", "skipped", databasePluginEnabled ? "upstream-plugin-managed" : undefined);
 		if (stableLeaf(prepLeafId)) {
 			if (arrivalCandidate) literaryEcology = arrivalCandidate;
 			if (continuityCandidate) literaryContinuity = continuityCandidate;
@@ -1948,8 +2302,21 @@ export class StageEngine {
 				ev.onActivity?.(`生态剧情适配：生成失败（${result.error}），正文按原流程继续`);
 			}
 		}
+		const mergedLiteraryDirection = databasePreparedPrompt?.literaryDirectorHandled === true
+			? parseDatabaseLiteraryDirection(databasePreparedPrompt.literaryDirection) : undefined;
+		// Native recall owns this role whenever enabled, including retries with no valid candidate.
+		if (databasePluginEnabled) { literaryDirectionData = undefined; literaryDirection = undefined; }
+		// Both Web modes receive the same candidate; the director team's fixed 3/2/2 is unchanged.
+		if (mergedLiteraryDirection) {
+			literaryDirectionData = mergedLiteraryDirection;
+			literaryDirection = formatLiteraryDirection(mergedLiteraryDirection);
+		}
 		const directorPromise = (async () => {
-		if (directorRequested) {
+		if (databasePluginEnabled && (directorRequested || generationMode === "director")) {
+			// No second director call, including missing/invalid/disabled native candidates.
+			collector.status("prep.director", mergedLiteraryDirection ? "skipped" : "degraded", mergedLiteraryDirection ? "merged-database-recall" : "missing-director-candidate");
+			ev.onActivity?.(mergedLiteraryDirection ? "文学导演：已并入原数据库召回与剧情推进，不重复请求" : "召回／剧情推进：本拍未交付有效导演候选，按现有事实继续，不另调文学导演");
+		} else if (directorRequested) {
 			ev.onActivity?.("文学导演：规划当前单拍边界");
 			const sourceLeafId = sm.getLeafId();
 			const prompt = buildLiteraryDirectorPrompt({
@@ -1967,7 +2334,7 @@ export class StageEngine {
 				characterIdentityIndex: identityReference || undefined,
 				characterCard: generationMode === "direct" ? card : undefined,
 				userPersona: generationMode === "direct" ? config.userPersona : undefined,
-				outline: projectOutline(outlineFromBranch(branch), "director"),
+				outline: { ...(selectedDailyPlot ? { selectedDailyPlot: JSON.parse(selectedDailyPlot) } : {}), ...projectOutline(outlineFromBranch(branch), "director") },
 			});
 			const result = await turnSideText(
 				"prep.director", "literaryDirector",
@@ -2034,7 +2401,7 @@ export class StageEngine {
         const researchSession = createResearchSession(JSON.stringify([sm.getSessionId(), expectedTurnLeafId, config.card]), lastUserText,
             () => {
                 if (!stableLeaf(expectedTurnLeafId) || this.#abort?.signal.aborted) return false;
-                const m = loadStageMaterials(cwd);
+                const m = this.#loadMaterials();
                 return JSON.stringify(m.rawCard) === JSON.stringify(materials.rawCard)
                     && m.config.webResearchMode === config.webResearchMode
                     && JSON.stringify(m.config.webResearchPublicTerms ?? []) === JSON.stringify(config.webResearchPublicTerms ?? [])
@@ -2080,7 +2447,7 @@ export class StageEngine {
 			config,
 			constantLore: constantLoreOf(materials),
 			// 预设装配段：原文原序，marker 已按预设作者的位置填入梨园材料
-			presetBefore: databaseSystemSlots.presetBefore,
+			presetBefore: generationMode ? undefined : databaseSystemSlots.presetBefore,
 			databaseWorldbook: databaseSystemSlots.remaining,
 			declaredMarkers: materials.declaredMarkers,
 			// skill 素材位（M-R2）：常驻包全文 + 拉取包 L1 索引，无包零痕迹
@@ -2096,7 +2463,7 @@ export class StageEngine {
 			activatedLore: activated,
 			card,
 			config,
-			presetTail: phAll.map((p) => p.text),
+			presetTail: generationMode ? undefined : phAll.map((p) => p.text),
 			languageMismatch,
 			panelIndex,
 			...(wsDeps.rules.wordRange ? { wordRange: wsDeps.rules.wordRange } : {}),
@@ -2105,7 +2472,7 @@ export class StageEngine {
 			literaryCharacterProfile: literaryProfile?.character,
 			literaryPersonaProfile: literaryProfile?.persona,
 			literaryDirection,
-			plotAdaptation: formatPlotAdaptation(plotAdaptation),
+			plotAdaptation: [formatPlotAdaptation(plotAdaptation), selectedDailyPlot].filter(Boolean).join("\n") || undefined,
 			sceneConductor: formatSceneConductor(sceneConductor),
 			literaryWorld: adaptiveWorldEnabled ? formatModularWorldInjection(modularWorld, worldManifest) : undefined,
 			literaryEcology: config.literaryEcologyEnabled === true ? formatLiteraryEcologyInjection(literaryEcology) : undefined,
@@ -2136,7 +2503,8 @@ export class StageEngine {
 		const injWithCard = !generationMode && tools.length > 0 ? `${injection}\n\n${PLAN_CARD}` : injection;
 		const tailText = endsWithUser ? `${injWithCard}\n\n${writerUserInput}` : injWithCard;
 
-		const buildWriterMessages = (tail: string): unknown[] => insertDatabasePluginDepthEntries([
+		const buildWriterMessages = (tail: string): unknown[] => {
+			const historyMessages = [
 			// M4 前情提要：被 rp-summary 覆盖的早期剧情在此回读（历史里那段已整体不存在）。
 			// 以 user 角色打头，措辞与 system「消息流约定」里的【前情提要】对上。
 			...(summary
@@ -2166,7 +2534,11 @@ export class StageEngine {
 						},
 			),
 			{ role: "user", content: [{ type: "text", text: tail }], timestamp: Date.now() },
-		], databaseWorldbook.depthEntries);
+			];
+			return generationMode
+				? buildStagePresetMessages(historyMessages, databaseSystemSlots.pieces, phAll, materials.presetDepth, databaseWorldbook.depthEntries)
+				: insertDatabasePluginDepthEntries(historyMessages, databaseWorldbook.depthEntries);
+		};
 		const messages = buildWriterMessages(tailText);
 		const writerInput = {
 			systemChars: systemPrompt.length,
@@ -2183,7 +2555,7 @@ export class StageEngine {
 				card,
 				config,
 				constantLore: constantLoreOf(materials),
-				presetBefore: databaseSystemSlots.presetBefore,
+				presetBefore: generationMode ? undefined : databaseSystemSlots.presetBefore,
 				databaseWorldbook: databaseSystemSlots.remaining,
 				declaredMarkers: materials.declaredMarkers,
 				skills: materials.skillFiles,
@@ -2255,11 +2627,13 @@ export class StageEngine {
 				const text = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.filter(part => part.type === "text").map(part => part.text ?? "").join("") : "";
 				return text ? [{ id: entry.id, text }] : [];
 			});
+			const expertWorld = config.literaryWorldEnabled === true ? formatModularWorldInjection(modularWorld, worldManifest) : undefined;
+			const expertEcology = config.literaryEcologyEnabled === true ? formatLiteraryEcologyInjection(literaryEcology) : undefined;
 			const expertContext: DirectorContext = {
 				sessionId: sm.getSessionId(), leafId: expectedTurnLeafId,
 				userText: lastUserText, userPersona: config.userPersona, card: { name: card.name, description: card.description, personality: card.personality, scenario: card.scenario },
-				state, history, summary: [summary, ...databaseSourceTexts, ...(memoryRecallBlocks ?? []).map(x => x.text)].filter(Boolean).join("\n\n") || undefined, world: formatModularWorldInjection(modularWorld, worldManifest), ecology: { committed: formatLiteraryEcologyInjection(literaryEcology), existingCandidates: passiveEcology },
-				outline: projectOutline(outlineFromBranch(branch), "director"), lore: activated,
+				state, history, summary: [summary, ...databaseSourceTexts, ...(memoryRecallBlocks ?? []).map(x => x.text)].filter(Boolean).join("\n\n") || undefined, world: expertWorld, ecology: config.literaryEcologyEnabled === true ? { committed: expertEcology, existingCandidates: passiveEcology } : undefined,
+				outline: { ...(selectedDailyPlot ? { selectedDailyPlot: JSON.parse(selectedDailyPlot) } : {}), ...projectOutline(outlineFromBranch(branch), "director") }, lore: activated,
 				presetText: [...materials.presetBefore.map(p => p.text), ...phAll.map(p => p.text)].join("\n\n"),
 				writerPresetText:[...materials.presetBefore.filter(p=>p.source==="block").map(p=>p.text),...phAll.filter(p=>p.source==="block").map(p=>p.text)].join("\n\n"),
 				constantLore:constantLoreOf(materials).map((entry,index)=>({id:`constant:${index}`,title:entry.comment,content:entry.content})),
@@ -2268,8 +2642,8 @@ export class StageEngine {
 					{ id: "card", text: [card.description, card.personality, card.scenario].join("\n") },
 					{ id: "persona", text: config.userPersona },
 					{ id: "state", text: JSON.stringify(state) },
-					{ id: "world", text: formatModularWorldInjection(modularWorld, worldManifest) ?? "" },
-					{ id: "ecology", text: formatLiteraryEcologyInjection(literaryEcology) ?? "" },
+					...(expertWorld ? [{ id: "world", text: expertWorld }] : []),
+					...(expertEcology ? [{ id: "ecology", text: expertEcology }] : []),
 					...sourceEntries.slice(-8).reverse(),
 					...(summary ? [{ id: "summary", text: summary }] : []),
 					...databaseSourceTexts.map((text, index) => ({ id: `memory:database:${index}`, text })),
@@ -2643,6 +3017,7 @@ export class StageEngine {
 				...(narrativeText ? { rpNarrative: narrativeText } : {}),
 				...(curtainText.trim() ? { rpCurtain: curtainText.trim() } : {}),
 					rpPrep: {
+					...(databasePluginEnabled ? { recallDirectorMerged: true } : {}),
 					...(literaryContinuity ? { literaryContinuity } : {}),
 					...(literaryDirection ? { literaryDirection } : {}),
 					...(literaryDirectionData ? { literaryDirectionData } : {}),
@@ -2652,7 +3027,7 @@ export class StageEngine {
 					...(config.literaryEcologyEnabled === true ? { literaryEcology } : {}),
 					workflowStatus: {
 						continuity: rerollPrep?.literaryContinuity ? "reused" : continuityRequested ? (literaryContinuity ? "success" : "degraded") : "skipped",
-						director: rerollPrep && (rerollPrep.literaryDirection || rerollPrep.literaryDirectionData) ? "reused" : directorRequested ? (literaryDirection ? "success" : "degraded") : "skipped",
+						director: databasePluginEnabled && directorRequested ? (mergedLiteraryDirection ? "success" : "degraded") : mergedLiteraryDirection ? "success" : rerollPrep && (rerollPrep.literaryDirection || rerollPrep.literaryDirectionData) ? "reused" : directorRequested ? (literaryDirection ? "success" : "degraded") : "skipped",
 					plotAdaptation: rerollPrep?.plotAdaptation ? "reused" : plotAdaptationRequested ? (plotAdaptation ? "success" : "degraded") : "skipped",
 					sceneConductor: rerollPrep?.sceneConductor ? "reused" : sceneConductorRequested ? (sceneConductor ? "success" : "degraded") : "skipped",
 						ecologyArrival: rerollPrep?.literaryEcology ? "reused" : arrivalRequested ? (arrivalCandidate ? "success" : "degraded") : "skipped",
@@ -2814,17 +3189,18 @@ export class StageEngine {
 		}
 
         const activeSettlement = new Set<string>();
+        const settlementDetails = new Map<string, string>();
+        const reportSettlement = () => ev.onActivity?.(`后台整理：${activeSettlement.size ? `仍在等待 ${[...activeSettlement].map(label => settlementDetails.has(label) ? `${label}（${settlementDetails.get(label)}）` : label).join("、")}` : "计算已结束，正在核对来源并保存收据"}`);
         const trackSettlement = <T>(label: string, phase: PerformancePhase, task: Promise<T>): Promise<T> => {
             if (!generationMode) return task;
             activeSettlement.add(label);
             const end = collector.beginPhase(phase);
-            const report = () => ev.onActivity?.(`后台整理：${activeSettlement.size ? `仍在等待 ${[...activeSettlement].join("、")}` : "计算已结束，正在核对来源并保存收据"}`);
-            report();
+            reportSettlement();
             return task.then(value => {
-                end(); activeSettlement.delete(label); report(); return value;
+                end(); activeSettlement.delete(label); settlementDetails.delete(label); reportSettlement(); return value;
             }, error => {
                 end(this.#abort?.signal.aborted ? "aborted" : "failed");
-                activeSettlement.delete(label); report(); throw error;
+                activeSettlement.delete(label); settlementDetails.delete(label); reportSettlement(); throw error;
             });
         };
         const rewriteScope = entryId ? {sessionId:sm.getSessionId(),card:config.card,sourceEntryId:entryId,visibleEntryIds:(sm.getBranch() as BranchEntryLike[]).flatMap(e=>e.id?[e.id]:[])} : undefined;
@@ -2838,11 +3214,24 @@ export class StageEngine {
                 generate:async(request,signal)=>{
                     guard();this.#deps.veridisRewrite!.claimRequest(rewriteScope,guard);
                     const sp=request.messages.filter(m=>m.role==="system").map(m=>m.content).join("\n\n"),messages=request.messages.filter(m=>m.role!=="system");
-                    const result=await turnSideText("settlement.rewrite","veridisRewrite",sp,messages.length===1?messages[0].content:JSON.stringify(messages),request.maxTokens,"off",signal??this.#abort?.signal,request.temperature);
+                    const result=await this.#sideText("veridisRewrite",sp,messages.length===1?messages[0].content:JSON.stringify(messages),request.maxTokens,"off",signal??this.#abort?.signal,observation("settlement.rewrite"),false,request.temperature,false,false,false,request.useProviderDefaultMaxTokens);
                     guard();if(typeof result!=="string")throw Error(result.error);return result;
                 }});
         })()) : Promise.resolve(undefined);
         settlementTasks.push(rewritePromise);
+        let supplementaryPromise:Promise<void>=Promise.resolve();
+        if(entryId&&generationMode&&!aborted){
+         const supplementalAnchor=sm.getLeafId(),sourceId=entryId;
+         // MVU retention is not activation: reuse the author's constant/keyword source set.
+          const supplementaryMaterials={...materials,entries:materials.entries.filter((e,index)=>databasePreparedPrompt?databaseWorldbookEntries.includes(databaseSourceEntries[index]):e.enabled&&(e.constant||activated.includes(e)))};
+         supplementaryPromise=this.#generateSupplementary(supplementaryMaterials,sm,sourceId,narrativeText,authorDraft||finalText,
+          ()=>{if(!stableLeaf(supplementalAnchor)||this.#abort?.signal.aborted)throw Error('附属交付来源已取消或切支');},
+          observation('settlement.supplementary'),id=>ownDisplayCommits.add(id),databasePreparedPrompt?databaseWorldbookEntries:undefined).catch(error=>{
+           const reason=error instanceof Error?error.message:String(error);
+           settlementWarnings.push('supplementary');settlementErrors.push(`supplementary: ${reason}`);
+          });
+         settlementTasks.push(supplementaryPromise);
+        }
         let rewriteReceiptCommitted=false;
 		// 新模式场记只计算；所有并发任务退出并通过同一来源守卫后再落树。
 		let computedLedger: typeof state | undefined;
@@ -2886,7 +3275,7 @@ export class StageEngine {
 				stage: "scribe",
 				kind: r.kind,
 				...(r.kind === "skipped" ? { reason: r.reason } : {}),
-				...(r.kind === "failed" ? { error: r.error.slice(0, 240) } : {}),
+				...(r.kind === "failed" ? { error: classifyModelFailure(r.error).reason, failureKind: classifyModelFailure(r.error).kind } : {}),
 			});
 			sm.flush();
 		};
@@ -2912,57 +3301,71 @@ export class StageEngine {
 				const currentPools = loadEcologyPools(cwd, config.card, card.name);
 				const factsSkill = workflowSkill(materials.skillFiles, "world-facts");
 				const auditSkill = workflowSkill(materials.skillFiles, "world-audit");
-				const unavailableWorldError = generationMode && config.literaryWorldEnabled && !worldManifest
-     ? "当前分支没有匹配世界画像，本拍世界未运行；待恢复，不假报结算成功"
-     : adaptiveWorldEnabled && (!worldSkill || !factsSkill || !auditSkill) ? "世界事实/推演/审计 Skill 缺失，本拍世界未运行" : undefined;
-    const worldPromise = adaptiveWorldEnabled && worldSkill && factsSkill && auditSkill ? trackSettlement("世界", "settlement.world", (async () => {
+				let initializedWorldProfile: import("./literary-world-profile.ts").CardWorldProfile | undefined;
+				const initialProfileRevision = existingWorldProfile?.revision;
+				const worldPromise = config.literaryWorldEnabled === true && (worldManifest || generationMode) ? trackSettlement("世界", "settlement.world", (async () => {
+					if (!worldSkill || !factsSkill || !auditSkill) return { error: "世界事实/推演/审计 Skill 缺失，本拍世界未运行", state: undefined, audit: undefined };
+					let activeManifest = worldManifest;
+					if (!activeManifest) {
+						try {
+							ev.onActivity?.("角色卡世界画像：正文已就绪，后台建立适配并结算本拍");
+							initializedWorldProfile = await this.#analyzeWorldProfile(materials, postBranch, this.#abort?.signal, observation("settlement.world"));
+							if (this.#abort?.signal.aborted || !stableLeaf(sourceLeafId)) { initializedWorldProfile = undefined; return { error: "世界画像来源已变化", state: undefined, audit: undefined }; }
+							const current = this.#loadMaterials();
+							if (current.config.card !== config.card || worldProfileFingerprint({ ...current, greetingIndex: current.config.greetingIndex }) !== profileFingerprint || loadCardWorldProfile(cwd, config.card, card.name, profileFingerprint, card, postBranch)?.revision !== initialProfileRevision) throw new Error("世界画像素材或版本已变化，本拍保持待恢复");
+							activeManifest = manifestFromProfile(initializedWorldProfile);
+				} catch (error) { const reason = error instanceof Error ? error.message : String(error); initializedWorldProfile = undefined; return { error: `world profile: ${reason}`, state: undefined, audit: worldAuditEntry({ status: "fact-failed", narrativeEntryId: entryId, baseRound: currentModularWorld.round, baseStateHash: worldTransitionHash(currentModularWorld), errors: [`世界画像建立失败，本拍世界待恢复：${reason}`] }) }; }
+					}
 					ev.onActivity?.("后台世界：结算本拍事实与时间");
 					const baseAudit = (status: WorldTransitionAuditEntry["status"], errors: string[], extra: Partial<WorldTransitionAuditEntry> = {}) => worldAuditEntry({
 						status, narrativeEntryId: entryId, baseRound: currentWorld.round,
-						...(worldManifest ? { cardKey: worldManifest.cardKey, manifestRevision: worldManifest.profileRevision } : {}),
+						...(activeManifest ? { cardKey: activeManifest.cardKey, manifestRevision: activeManifest.profileRevision } : {}),
 						baseStateHash: worldTransitionHash(currentWorld), errors, ...extra,
 					});
-					const factPrompt = buildBeatFactPrompt(factsSkill.body, { userText: lastUserText, narrativeText, rpState: postState, world: currentWorld, history, manifest: worldManifest, ...stateBasis });
+					const factPrompt = buildBeatFactPrompt(factsSkill.body, { userText: lastUserText, narrativeText, rpState: postState, world: currentWorld, history, manifest: activeManifest, ...stateBasis });
+					// Extraction failure is not an empty successful envelope. Leave this domain
+					// pending for its existing retry boundary before proposing or committing state.
 					const factText = await turnSideText("settlement.worldFacts", "literaryWorldFacts", factPrompt.systemPrompt, factPrompt.userText, 8192);
-					if (typeof factText !== "string") return { state: undefined, audit: baseAudit("fact-failed", [factText.error]), error: `事实信封失败：${factText.error}` };
-					let factResult = normalizeBeatFactEnvelope(factText, { userText: lastUserText, narrativeText });
-					if (!factResult.envelope) { const repaired=await repairStructured("settlement.worldFacts","literaryWorldFacts",factPrompt,factText,factResult.errors); if(typeof repaired==="string") factResult=normalizeBeatFactEnvelope(repaired,{userText:lastUserText,narrativeText}); }
-					if (!factResult.envelope) return { state: undefined, audit: baseAudit("fact-failed", factResult.errors), error: `事实信封拒绝：${factResult.errors.join("；")}` };
+					let factResult = typeof factText === "string" ? normalizeBeatFactEnvelope(factText, { userText: lastUserText, narrativeText }) : { errors: [factText.error] } as ReturnType<typeof normalizeBeatFactEnvelope>;
+					if (typeof factText === "string" && !factResult.envelope) { const repaired=await repairStructured("settlement.worldFacts","literaryWorldFacts",factPrompt,factText,factResult.errors); if(typeof repaired==="string") factResult=normalizeBeatFactEnvelope(repaired,{userText:lastUserText,narrativeText}); else factResult.errors.push(`事实修复请求失败：${repaired.error}`); }
+					if (!factResult.envelope) return { state: undefined, audit: baseAudit("fact-failed", factResult.errors), error: `世界事实提取失败：${factResult.errors.join("；")}` };
 					const envelope = factResult.envelope;
 					ev.onActivity?.(`后台世界：已确认 ${envelope.facts.length} 条带证据事实`);
-					const dueModules = dueWorldModules(worldManifest, envelope);
-					if (worldManifest && dueModules.length === 0) {
+					const dueModules = dueWorldModules(activeManifest, envelope);
+					if (activeManifest && dueModules.length === 0) {
 						const audit = baseAudit("committed", [], { nextRound: currentModularWorld.round, envelopeHash: worldTransitionHash(envelope), nextStateHash: worldTransitionHash(currentModularWorld), elapsed: envelope.elapsed, audit: { version: 1, verdict: "approve", issues: [], summary: "本拍没有到期的世界模块，世界保持稳定。" } });
 						return { state: undefined, audit, error: undefined };
 					}
 					const modulePacks = worldModuleSkillPacks(materials.skillFiles, dueModules);
-					const proposalPrompt = buildWorldProposalPrompt(worldSkill.body, { envelope, world: currentModularWorld, rpState: postState, manifest: worldManifest, dueModuleIds: dueModules.map((module) => module.id), moduleSkillBodies: modulePacks.map((skill) => ({ name: skill.name, body: skill.body })), ecologySignals: ecologySignalsForWorld(currentEcology), ...stateBasis });
+					const proposalPrompt = buildWorldProposalPrompt(worldSkill.body, { sourceEntryId: entryId, envelope, world: currentModularWorld, rpState: postState, manifest: activeManifest, dueModuleIds: dueModules.map((module) => module.id), moduleSkillBodies: modulePacks.map((skill) => ({ name: skill.name, body: skill.body })), ecologySignals: ecologySignalsForWorld(currentEcology), ...stateBasis });
 					const proposalText = await turnSideText("settlement.worldProposal", "literaryWorld", proposalPrompt.systemPrompt, proposalPrompt.userText, 8192);
 					if (typeof proposalText !== "string") return { state: undefined, audit: baseAudit("proposal-failed", [proposalText.error], { envelopeHash: worldTransitionHash(envelope), elapsed: envelope.elapsed }), error: `世界提案失败：${proposalText.error}` };
-					let proposalResult = normalizeModularWorldProposal(proposalText, currentModularWorld, envelope, worldManifest);
-					if (!proposalResult.proposal) { const repaired=await repairStructured("settlement.worldProposal","literaryWorld",proposalPrompt,proposalText,proposalResult.errors); if(typeof repaired==="string") proposalResult=normalizeModularWorldProposal(repaired,currentModularWorld,envelope,worldManifest); }
+					let proposalResult = normalizeModularWorldProposal(proposalText, currentModularWorld, envelope, activeManifest, entryId);
+					if (!proposalResult.proposal) { const repaired=await repairStructured("settlement.worldProposal","literaryWorld",proposalPrompt,proposalText,proposalResult.errors); if(typeof repaired==="string") proposalResult=normalizeModularWorldProposal(repaired,currentModularWorld,envelope,activeManifest,entryId); else proposalResult.errors.push(`提案修复请求失败：${repaired.error}`); }
 					if (!proposalResult.proposal) return { state: undefined, audit: baseAudit("rejected", proposalResult.errors, { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposalText), elapsed: envelope.elapsed }), error: `世界提案拒绝：${proposalResult.errors.join("；")}` };
 					let proposal = proposalResult.proposal;
 					ev.onActivity?.("后台世界：独立审计因果、主权与信息边界");
-					let auditPrompt = buildWorldAuditPrompt(auditSkill.body, { envelope, proposal, world: currentModularWorld, rpState: postState, manifest: worldManifest, preflightWarnings: proposalResult.warnings, ...stateBasis });
+					let auditPrompt = buildWorldAuditPrompt(auditSkill.body, { envelope, proposal, world: currentModularWorld, rpState: postState, manifest: activeManifest, preflightWarnings: proposalResult.warnings, ...stateBasis });
 					const auditText = await turnSideText("settlement.worldAudit", "literaryWorldAudit", auditPrompt.systemPrompt, auditPrompt.userText, 8192);
 					if (typeof auditText !== "string") return { state: undefined, audit: baseAudit("audit-failed", [auditText.error], { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), elapsed: envelope.elapsed }), error: `世界审计失败：${auditText.error}` };
 					let auditResult = normalizeWorldTransitionAudit(auditText, envelope);
-					if (!auditResult.audit) { const repaired=await repairStructured("settlement.worldAudit","literaryWorldAudit",auditPrompt,auditText,auditResult.errors); if(typeof repaired==="string") auditResult=normalizeWorldTransitionAudit(repaired,envelope); }
+					if (!auditResult.audit) { const repaired=await repairStructured("settlement.worldAudit","literaryWorldAudit",auditPrompt,auditText,auditResult.errors); if(typeof repaired==="string") auditResult=normalizeWorldTransitionAudit(repaired,envelope); else auditResult.errors.push(`审计修复请求失败：${repaired.error}`); }
 					if (!auditResult.audit) return { state: undefined, audit: baseAudit("audit-failed", auditResult.errors, { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), elapsed: envelope.elapsed }), error: `世界审计不可解析：${auditResult.errors.join("；")}` };
 					if(auditResult.audit.verdict!=="approve") {
+						const repairErrors: string[] = [];
 						const feedback=auditResult.audit.issues.filter(x=>x.severity==="error").map(x=>x.message);
 						const fixed=await repairStructured("settlement.worldProposal","literaryWorld",proposalPrompt,JSON.stringify(proposal),feedback.length?feedback:[auditResult.audit.summary]);
 						if(typeof fixed==="string") {
-							const normalized=normalizeModularWorldProposal(fixed,currentModularWorld,envelope,worldManifest);
-							if(normalized.proposal){proposal=normalized.proposal;auditPrompt=buildWorldAuditPrompt(auditSkill.body,{envelope,proposal,world:currentModularWorld,rpState:postState,manifest:worldManifest,preflightWarnings:normalized.warnings,...stateBasis});const checked=await turnSideText("settlement.worldAudit","literaryWorldAudit",auditPrompt.systemPrompt,auditPrompt.userText,8192);if(typeof checked==="string")auditResult=normalizeWorldTransitionAudit(checked,envelope);}
-						}
+							const normalized=normalizeModularWorldProposal(fixed,currentModularWorld,envelope,activeManifest,entryId);
+							if(normalized.proposal){proposal=normalized.proposal;auditPrompt=buildWorldAuditPrompt(auditSkill.body,{envelope,proposal,world:currentModularWorld,rpState:postState,manifest:activeManifest,preflightWarnings:normalized.warnings,...stateBasis});const checked=await turnSideText("settlement.worldAudit","literaryWorldAudit",auditPrompt.systemPrompt,auditPrompt.userText,8192);if(typeof checked==="string")auditResult=normalizeWorldTransitionAudit(checked,envelope);else repairErrors.push(`修复后审计请求失败：${checked.error}`);}
+						} else repairErrors.push(`审计反馈提案修复请求失败：${fixed.error}`);
+						if (repairErrors.length) return {state:undefined, audit:baseAudit("audit-failed", repairErrors), error:repairErrors.join("；")};
 					}
 					if (!auditResult.audit || auditResult.audit.verdict !== "approve") return { state: undefined, audit: baseAudit("rejected", (auditResult.audit?.issues.filter((issue) => issue.severity === "error").map((issue) => issue.message) ?? auditResult.errors), { envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), elapsed: envelope.elapsed, audit: auditResult.audit }), error: `世界提案未通过审计：${auditResult.audit?.summary ?? auditResult.errors.join("；")}` };
 					const auditHash = worldTransitionHash(auditResult.audit);
-					const nextState = commitModularWorldTransition(currentModularWorld, proposal, auditHash, worldManifest);
+					const nextState = commitModularWorldTransition(currentModularWorld, proposal, auditHash, activeManifest);
 					return { state: nextState, audit: baseAudit("committed", [], { nextRound: nextState.round, envelopeHash: worldTransitionHash(envelope), proposalHash: worldTransitionHash(proposal), nextStateHash: worldTransitionHash(nextState), elapsed: envelope.elapsed, audit: auditResult.audit }), error: undefined };
-				})()) : Promise.resolve({state:undefined,audit:unavailableWorldError?worldAuditEntry({status:"fact-failed",narrativeEntryId:entryId,baseRound:currentModularWorld.round,baseStateHash:worldTransitionHash(currentModularWorld),errors:[unavailableWorldError]}):undefined,error:unavailableWorldError});
+				})()) : Promise.resolve({ state: undefined, audit: undefined, error: undefined });
 				settlementTasks.push(worldPromise);
     const ecologyPromise = config.literaryEcologyEnabled === true && ecologyRuntimeSkill ? trackSettlement("鲜活世界／NPC", "settlement.ecology", (async () => {
 					ev.onActivity?.("鲜活世界：推进人物生活与场所事件");
@@ -2976,6 +3379,7 @@ export class StageEngine {
                     side:(step,sp,ut,max,signal,temperature)=>turnSideText("settlement.ecology",step,sp,ut,max,"off",signal??this.#abort?.signal,temperature),
                     repair:(step,prompt,raw,errors,max)=>repairStructured("settlement.ecology",step,prompt,raw,errors,max),
                     activity:text=>ev.onActivity?.(text),
+                    progress:detail=>{if(generationMode){settlementDetails.set("鲜活世界／NPC",detail);if(activeSettlement.has("鲜活世界／NPC"))reportSettlement();}},
                 });
 				})()) : config.literaryEcologyEnabled === true
 					? Promise.resolve({ state: degradedLiteraryEcologyRound(currentEcology, previousEcologyRound, "aftermath", "人物与场所生态 Skill 缺失"), degraded: true, error: "人物与场所生态 Skill 缺失" })
@@ -2984,25 +3388,30 @@ export class StageEngine {
 				// 数据库只读已提交正文；有待执行资料写操作时仍等它们完成再填表。
 				const endMemory = generationMode && databasePluginEnabled && pendingOwnerTools.length === 0
 					? collector.beginPhase("settlement.memory") : undefined;
+				let databaseFailure: ReturnType<typeof requestFailure> | undefined;
 				const memoryPromise = endMemory ? trackSettlement("数据库记忆", "settlement.memory", (async () => {
 					ev.onActivity?.("原数据库插件：与世界/生态并行整理已定稿正文");
 					try {
-						await this.#deps.databasePluginMemory!.after(entryId, this.#abort?.signal);
+						await this.#deps.databasePluginMemory!.after(entryId, this.#abort?.signal, { collector, phase: "settlement.memory" });
 						endMemory(this.#abort?.signal.aborted || !stableLeaf(sourceLeafId) ? "aborted" : "success");
 						return true;
-					} catch {
+					} catch (error) {
+						databaseFailure = requestFailure(error);
+						settlementErrors.push(`memory: ${databaseFailure.reason}`);
 						endMemory(this.#abort?.signal.aborted || !stableLeaf(sourceLeafId) ? "aborted" : "failed");
 						return false;
 					}
 				})()) : Promise.resolve(undefined);
 				settlementTasks.push(memoryPromise);
 				const tavernPromise = generationMode && this.#deps.tavernPlugins && pendingOwnerTools.length === 0 ? trackSettlement("酒馆插件／MVU", "settlement.tavern", (async () => {
-					try { await this.#deps.tavernPlugins!.after(entryId, this.#abort?.signal); return { ok: true as const }; }
+					// 附属补交可能补出作者漏交的变量更新；MVU 等它退出后只解析一次（作者原稿 + 已校验的附属文本）。
+					await supplementaryPromise;
+					try { if(this.#deps.tavernPlugins!.enabled())this.#assertSupplementarySettled(sm, entryId); await this.#deps.tavernPlugins!.after(entryId, this.#abort?.signal); return { ok: true as const }; }
 					catch (error) { return { ok: false as const, error: error instanceof Error ? error.message : String(error) }; }
 				})()) : Promise.resolve(undefined);
 				settlementTasks.push(tavernPromise);
 				// 即使某领域抛错，也等所有已启动任务退出后才释放共享树锁。
-				const results = await Promise.allSettled([worldPromise, ecologyPromise, memoryPromise, scribePromise, tavernPromise, rewritePromise]);
+				const results = await Promise.allSettled([worldPromise, ecologyPromise, memoryPromise, scribePromise, tavernPromise, rewritePromise,supplementaryPromise]);
 				const [worldOutcome, ecologyOutcome, memoryOutcome, scribeOutcome, tavernOutcome] = results;
 				if (endMemory && (this.#abort?.signal.aborted || !stableLeaf(sourceLeafId))) collector.status("settlement.memory", "aborted");
 				if (this.#abort?.signal.aborted) return { aborted: true, entryId };
@@ -3015,29 +3424,44 @@ export class StageEngine {
                         const rewrite= rewriteOutcome.value;
                         sm.appendCustomEntry(VERIDIS_REWRITE_ENTRY_TYPE,rewrite);rewriteReceiptCommitted=true;
                         collector.status("settlement.rewrite",rewrite.status==="failed"?"failed":rewrite.status==="skipped"?"skipped":"success");
-                        if(rewrite.status==="failed")ev.onNotify?.("warning",`原稿已保留，净化显示稿未应用：${rewrite.error}`);
+						if(rewrite.status==="failed") { settlementErrors.push(`Veridis: ${rewrite.error}`); settlementWarnings.push("rewrite"); ev.onNotify?.("warning",`原稿已保留，净化显示稿未应用：${rewrite.error}`); }
                     }
 					if (generationMode) {
-						const ledger = scribeOutcome.status === "fulfilled" ? scribeOutcome.value : { kind: "failed" as const, error: "场记计算失败" };
+						const ledger = scribeOutcome.status === "fulfilled" ? scribeOutcome.value : { kind: "failed" as const, error: `场记计算失败：${String(scribeOutcome.reason)}` };
 						commitLedger(ledger);
+						if (ledger?.kind === "failed") settlementErrors.push(`ledger: ${ledger.error}`);
 						if (ledger?.kind === "failed" || ledger?.kind === "stale") settlementWarnings.push("ledger");
 					}
 					if (tavernOutcome.status === "fulfilled" && tavernOutcome.value !== undefined) {
 						tavernPluginsSettled = true;
 						const result = tavernOutcome.value;
 						sm.appendCustomEntry("rp-tavern-plugin-settlement", { entryId, status: result.ok ? "complete" : "pending" });
-						if (!result.ok) { settlementWarnings.push("tavern-plugins"); ev.onNotify?.("warning", `正文已保存，酒馆插件派生状态整理未完成：${result.error}`); }
+						if (!result.ok) { settlementErrors.push(`Tavern/MVU: ${result.error}`); settlementWarnings.push("tavern-plugins"); ev.onNotify?.("warning", `正文已保存，酒馆插件派生状态整理未完成：${result.error}`); }
 						sm.flush();
 					}
-					const worldResult = worldOutcome.status === "fulfilled" ? worldOutcome.value : { error: "世界计算失败", state: undefined, audit: undefined };
-					const ecologyResult = ecologyOutcome.status === "fulfilled" ? ecologyOutcome.value : { error: "生态计算失败", state: undefined, degraded: true };
+					const worldResult = worldOutcome.status === "fulfilled" ? worldOutcome.value : { error: `世界计算失败：${String(worldOutcome.reason)}`, state: undefined, audit: undefined };
+					if (initializedWorldProfile) {
+						const current = this.#loadMaterials();
+						const saved = loadCardWorldProfile(cwd, config.card, card.name, profileFingerprint, card, postBranch);
+						if (current.config.card !== config.card || worldProfileFingerprint({ ...current, greetingIndex: current.config.greetingIndex }) !== profileFingerprint || saved?.revision !== initialProfileRevision) {
+							worldResult.error = "世界画像提交前素材或版本已变化，世界保持待恢复；其他已完成领域照常保存收据";
+							worldResult.state = undefined;
+							worldResult.audit = worldAuditEntry({ status: "fact-failed", narrativeEntryId: entryId, baseRound: currentModularWorld.round, baseStateHash: worldTransitionHash(currentModularWorld), errors: [worldResult.error] });
+						} else {
+							saveCardWorldProfile(cwd, config.card, initializedWorldProfile, card);
+							sm.appendCustomEntry(WORLD_MANIFEST_ENTRY_TYPE, manifestFromProfile(initializedWorldProfile)); sm.flush();
+						}
+					}
+					const ecologyResult = ecologyOutcome.status === "fulfilled" ? ecologyOutcome.value : { error: `生态计算失败：${String(ecologyOutcome.reason)}`, state: undefined, degraded: true };
+					if (worldResult.error) settlementErrors.push(`world: ${worldResult.error}`);
+					if (ecologyResult.degraded) settlementErrors.push(`ecology: ${ecologyResult.error}`);
 					collector.status("settlement.world", worldResult.error ? "failed" : worldResult.audit ? "success" : "skipped");
 					collector.status("settlement.ecology", ecologyResult.degraded ? "failed" : ecologyResult.state ? "success" : "skipped");
 					collector.status("settlement.tavern", tavernOutcome.status === "rejected" || tavernOutcome.value?.ok === false ? "failed" : tavernOutcome.value ? "success" : "skipped");
 					if (ecologyOutcome.status === "rejected") settlementWarnings.push("ecology");
 					if (memoryOutcome.status === "fulfilled" && memoryOutcome.value !== undefined) {
 						databaseMemorySettled = true;
-						sm.appendCustomEntry("rp-database-memory", { sourceEntryId: entryId, status: memoryOutcome.value ? "complete" : "pending" });
+						sm.appendCustomEntry("rp-database-memory", { sourceEntryId: entryId, status: memoryOutcome.value ? "complete" : "pending", ...(!memoryOutcome.value && databaseFailure ? { failure: databaseFailure } : {}) });
 						if (!memoryOutcome.value) {
 							settlementWarnings.push("memory");
 							ev.onNotify?.("warning", "正文已保存，但原数据库插件记忆整理失败；保留原数据，不假报入库成功");
@@ -3072,7 +3496,7 @@ export class StageEngine {
         if(rewriteResult && !rewriteReceiptCommitted && stableLeaf(rewriteAnchor) && !this.#abort?.signal.aborted){
             sm.appendCustomEntry(VERIDIS_REWRITE_ENTRY_TYPE,rewriteResult);sm.flush();
             collector.status("settlement.rewrite",rewriteResult.status==="failed"?"failed":rewriteResult.status==="skipped"?"skipped":"success");
-            if(rewriteResult.status==="failed")ev.onNotify?.("warning",`原稿已保留，净化显示稿未应用：${rewriteResult.error}`);
+            if(rewriteResult.status==="failed") { settlementErrors.push(`Veridis: ${rewriteResult.error}`); settlementWarnings.push("rewrite"); ev.onNotify?.("warning",`原稿已保留，净化显示稿未应用：${rewriteResult.error}`); }
         }
 		if (entryId && generationMode && !aborted) { sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: entryId, status: "settling", ledgerDone: !settlementWarnings.includes("ledger"), presentationDone, worldDone: !settlementWarnings.includes("world"), ecologyDone: !settlementWarnings.includes("ecology"), degradedDomains: settlementWarnings, mode: generationMode }); sm.flush(); }
 
@@ -3132,19 +3556,22 @@ export class StageEngine {
    ev.onActivity?.("原数据库插件：已定稿正文拍后填表与记忆写入");
    const endDatabaseMemory = collector.beginPhase("settlement.memory");
 			const memoryAnchor = sm.getLeafId();
-			try { await this.#deps.databasePluginMemory!.after(entryId, this.#abort?.signal);
+			try { await this.#deps.databasePluginMemory!.after(entryId, this.#abort?.signal, { collector, phase: "settlement.memory" });
 				if (this.#abort?.signal.aborted || !stableLeaf(memoryAnchor)) { endDatabaseMemory("aborted"); return { aborted: true, entryId }; }
     endDatabaseMemory("success");
 				sm.appendCustomEntry("rp-database-memory", { sourceEntryId: entryId, status: "complete" }); sm.flush(); }
-			catch { if (this.#abort?.signal.aborted || !stableLeaf(memoryAnchor)) { endDatabaseMemory("aborted"); return { aborted: true, entryId }; }
-				endDatabaseMemory("failed"); sm.appendCustomEntry("rp-database-memory", { sourceEntryId: entryId, status: "pending" }); sm.flush(); settlementWarnings.push("memory"); ev.onNotify?.("warning", "正文已保存，但原数据库插件记忆整理失败；保留原数据，不假报入库成功"); }
+			catch (error) { if (this.#abort?.signal.aborted || !stableLeaf(memoryAnchor)) { endDatabaseMemory("aborted"); return { aborted: true, entryId }; }
+				const failure = requestFailure(error);
+				settlementErrors.push(`memory: ${failure.reason}`);
+				endDatabaseMemory("failed"); sm.appendCustomEntry("rp-database-memory", { sourceEntryId: entryId, status: "pending", failure }); sm.flush(); settlementWarnings.push("memory"); ev.onNotify?.("warning", "正文已保存，但原数据库插件记忆整理失败；保留原数据，不假报入库成功"); }
 		}
 		if (entryId && generationMode && !aborted && this.#deps.tavernPlugins && !tavernPluginsSettled) {
 			const tavernAnchor = sm.getLeafId();
-			try { await this.#deps.tavernPlugins.after(entryId, this.#abort?.signal);
+			try { if(this.#deps.tavernPlugins.enabled())this.#assertSupplementarySettled(sm, entryId); await this.#deps.tavernPlugins.after(entryId, this.#abort?.signal);
 				if (this.#abort?.signal.aborted || !stableLeaf(tavernAnchor)) return { aborted: true, entryId };
 				sm.appendCustomEntry("rp-tavern-plugin-settlement", {entryId,status:"complete"}); sm.flush(); }
 			catch (error) { if (this.#abort?.signal.aborted || !stableLeaf(tavernAnchor)) return { aborted: true, entryId };
+				settlementErrors.push(`Tavern/MVU: ${error instanceof Error ? error.message : String(error)}`);
 				sm.appendCustomEntry("rp-tavern-plugin-settlement", {entryId,status:"pending"}); sm.flush(); settlementWarnings.push("tavern-plugins"); ev.onNotify?.("warning", `正文已保存，酒馆插件派生状态整理未完成：${error instanceof Error ? error.message : String(error)}`); }
 		}
 		if (entryId && generationMode && !aborted) {
@@ -3153,15 +3580,18 @@ export class StageEngine {
 			sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: entryId,
 				status: domainFailures.includes("ledger") || strict && domainFailures.length ? "pending" : settlementWarnings.length ? "degraded" : "complete",
 				ledgerDone:!domainFailures.includes("ledger"),worldDone:!domainFailures.includes("world"),ecologyDone:!domainFailures.includes("ecology"),presentationDone,degradedDomains:settlementWarnings,mode:generationMode }); sm.flush();
-			if ((strict && domainFailures.length) || domainFailures.includes("ledger")) {
+			if (settlementErrors.length) {
+				try { await this.#retrySettlement(materials, sm, ev, stableLeaf, observation("settlement.recovery"), settlementErrors); }
+				catch (failure) { return {aborted: this.#abort?.signal.aborted === true || !ownsSession() || loadStageConfig(cwd).card !== config.card || !this.#branchContains(sm.getBranch() as BranchEntryLike[], entryId), entryId, error: failure instanceof Error ? failure.message : String(failure)}; }
+			} else if ((strict && domainFailures.length) || domainFailures.includes("ledger")) {
 				const error = `正文已保存，但${domainFailures.join("/")}结算仍失败；已留待恢复收据，不用旧快照假装本拍完成。下一输入前必须先恢复。`;
 				ev.onNotify?.("error",error); return {aborted:false,entryId,error};
 			}
-			if (generationMode === "director") this.#pendingBackground = () => {
+			this.#pendingBackground = () => {
 				if (!ownsSession() || loadStageConfig(cwd).card !== config.card) return;
 				this.#backgroundController = new AbortController();
 				this.#startWorldProfilePrep(materials,sm.getBranch() as BranchEntryLike[]);
-				if (config.literaryEcologyEnabled && ecologyGlobalSkill && ecologyCardSkill) {
+				if (generationMode === "director" && config.literaryEcologyEnabled && ecologyGlobalSkill && ecologyCardSkill) {
 					const latest = sm.getBranch() as BranchEntryLike[];
 					this.#startEcologyPoolPrep({cardPath:config.card,card,entries:materials.entries,state:stateFromBranch(latest),history:rebuildHistory(latest).history,userText:lastUserText,userName:config.userName,globalSkill:ecologyGlobalSkill,cardSkill:ecologyCardSkill,pools:loadEcologyPools(cwd,config.card,card.name),signal:this.#backgroundController.signal});
 				}
@@ -3186,7 +3616,76 @@ export class StageEngine {
 
 
 
- /** Keep the main author's original delivery; no format identification, validation or extra API call. */
+  async regenerateSupplementary(expectedSessionId:string,expectedSourceEntryId:string,expectedReceiptHash:string):Promise<StageTurnEndInfo>{
+   if(this.#busy||this.#queue.length)return {aborted:false,error:'正在生成或整理，请等待完成'};
+   const sm=this.#deps.getSessionManager(),materials=this.#loadMaterials();
+   const branch=sm.getBranch() as BranchEntryLike[],source=[...branch].reverse().find(e=>e.message?.role==='assistant');
+   const receipt=[...branch].reverse().find(e=>e.customType===SUPPLEMENTARY_ENTRY_TYPE&&(e.data as any)?.sourceEntryId===source?.id)?.data;
+   if(sm.getSessionId()!==expectedSessionId||source?.id!==expectedSourceEntryId||!receipt||supplementaryHash(JSON.stringify(receipt))!==expectedReceiptHash)return {aborted:false,error:'会话、正文或附属收据已变化，请刷新后重试'};
+   try{assertSettlementAuthorComplete(source,branch);}catch(error){return {aborted:false,error:String(error)};}
+   const details=source.message?.details as Record<string,unknown>;
+   if(!isGenerationMode(details?.rpGenerationMode)||typeof details.rpAuthorDraft!=='string'||typeof details.rpNarrative!=='string')return {aborted:false,error:'只能重新生成完整作者交付的附属'};
+   let anchor=sm.getLeafId();const controller=new AbortController(),ev=this.#deps.events??{};
+   const guard=()=>{if(controller.signal.aborted||this.#deps.getSessionManager()!==sm||sm.getSessionId()!==expectedSessionId||loadStageConfig(this.#deps.cwd).card!==materials.config.card||!turnLeafIsStable(sm,anchor))throw Error('附属重新生成已取消或来源变化');};
+   clearTimeout(this.#backgroundTimer);this.#backgroundController?.abort();this.#backgroundController=null;this.#pendingBackground=null;
+   this.#busy=true;this.#abort=controller;this.#settlingEntryId=expectedSourceEntryId;ev.onTurnStart?.();
+   const timeoutMs=(materials.config.generationTimeoutMinutes??60)*60000,timer=setTimeout(()=>controller.abort(new LocalRequestTimeoutError('generation',timeoutMs,'附属重新生成预算')),timeoutMs);
+   let result:StageTurnEndInfo={aborted:false};
+   try{await this.#generateSupplementary(materials,sm,expectedSourceEntryId,details.rpNarrative,details.rpAuthorDraft,guard,{phase:'settlement.supplementary',sourceEntryId:expectedSourceEntryId,requestScope:{sessionId:expectedSessionId,card:materials.config.card},guard},()=>{anchor=sm.getLeafId();},undefined,true);}
+   catch(error){result={aborted:controller.signal.aborted,error:classifyModelFailure(error).reason};}
+   finally{clearTimeout(timer);this.#busy=false;this.#abort=null;this.#settlingEntryId=null;ev.onTurnEnd?.(result);}
+   void this.#drain();return result;
+  }
+
+  #assertSupplementarySettled(sm:StageSessionManager,sourceEntryId:string):void{
+   const receipt=[...(sm.getBranch() as BranchEntryLike[])].reverse().find(e=>e.customType===SUPPLEMENTARY_ENTRY_TYPE&&(e.data as any)?.sourceEntryId===sourceEntryId)?.data as {status?:string;frozenInput?:string}|undefined;
+   if(receipt&&!['complete','skipped'].includes(receipt.status??'')&&(!receipt.frozenInput||supplementaryNeedsMvu(receipt.frozenInput)))throw Error('Supplementary dependency pending: 附属变量补交尚未完成，MVU保留待恢复');
+  }
+
+  async #generateSupplementary(materials:StageMaterials,sm:StageSessionManager,sourceEntryId:string,narrative:string,authorDraft:string,
+   guard:()=>void,observation?:StageRequestObservation,onCommit?:(id:string)=>void,databaseEntries?:import('./database-plugin-prompt.ts').DatabasePluginWorldbookEntry[],regenerate=false):Promise<void>{
+   const latest=[...(sm.getBranch() as BranchEntryLike[])].reverse().find(e=>e.customType===SUPPLEMENTARY_ENTRY_TYPE&&(e.data as any)?.sourceEntryId===sourceEntryId)?.data as any;
+   if(latest&&![1,2,3,4].includes(latest.version))throw Error('Unsupported supplementary receipt version');
+   if(latest&&!latest.materialView)throw Error('Supplementary selection provenance is unavailable; cannot reconstruct saved materials');
+   if(latest?.version>=2&&(latest.sessionId!==sm.getSessionId()||latest.card!==materials.config.card))throw Error('Supplementary source or materials changed');
+   const materialView=latest?.materialView??supplementaryMaterialView(materials,databaseEntries);
+   const currentMaterials=()=>projectSupplementaryMaterials(this.#loadMaterials({nativeTavernPlugins:materialView.nativeTavernPlugins}),materialView);
+   if(latest?.materialView)materials=currentMaterials();
+   const priorInput=supplementaryInput(materials,narrative,authorDraft,latest?.version??4,materialView.databaseEntries);
+   if(latest&&(latest.authorHash!==supplementaryHash(authorDraft)||latest.narrativeHash!==supplementaryHash(narrative)||latest.materialHash!==priorInput.materialHash))throw Error('Supplementary source or materials changed');
+   if(!regenerate&&['complete','skipped'].includes(latest?.status))return;
+   if(latest?.version>=3&&latest.frozenInput!==priorInput.userText)throw Error('Supplementary frozen input changed');
+   const input=supplementaryInput(materials,narrative,authorDraft,4,materialView.databaseEntries);
+   const basis={version:4,sessionId:sm.getSessionId(),card:materials.config.card,sourceEntryId,authorHash:supplementaryHash(authorDraft),narrativeHash:supplementaryHash(narrative),materialHash:input.materialHash,materialView,frozenInput:input.userText};
+   const append=(value:Record<string,unknown>)=>{guard();sm.appendCustomEntry(SUPPLEMENTARY_ENTRY_TYPE,{...basis,...value});const id=sm.getLeafId();if(id)onCommit?.(id);sm.flush();};
+   if(!supplementaryHasRequirements(input.userText)){append({status:'skipped',text:'',response:{version:2,narrative:null,items:[]}});this.#deps.events?.onSupplementaryReady?.({entryId:sourceEntryId});return;}
+   append({status:'pending'});
+   try{
+     const systemPrompt=supplementarySystemPrompt(input.userText),sideObservation=observation?{...observation,guard:()=>{guard();observation.guard?.();}}:undefined;
+     const fresh=()=>{if(supplementaryInput(currentMaterials(),narrative,authorDraft,4,materialView.databaseEntries).materialHash!==input.materialHash)throw Error('附属资料已变化，丢弃过期结果');};
+      const result=await this.#sideText('writer',systemPrompt,input.userText,16384,'off',this.#abort?.signal,sideObservation);
+    guard();if(typeof result!=='string')throw Error(result.error);
+     fresh();
+     let parsed=parseSupplementaryResponse(result,input.userText),missing=supplementaryMvuMissing(input.userText,parsed.response);
+     // A missing variable artifact is never complete/skipped. One bounded correction names it; task-level retries stay unchanged.
+     if(missing){
+      const need=supplementaryMvuRequirement(input.userText)!;
+      const fixed=await this.#repairStructured('writer',{systemPrompt,userText:input.userText},result,[missing,`items must add one paired <${need.tag}>…</${need.tag}> item bound to ${need.sources.join(', ')}; keep valid delivered items; an unchanged-value update is allowed`],16384,sideObservation);
+      guard();if(typeof fixed!=='string')throw Error(`${missing}; repair request failed: ${fixed.error}`);
+      fresh();
+      parsed=parseSupplementaryResponse(fixed,input.userText);missing=supplementaryMvuMissing(input.userText,parsed.response);
+      if(missing)throw Error(missing);
+     }
+     const {text,response}=parsed;
+     append({status:text?'complete':'skipped',text,response});
+    this.#deps.events?.onSupplementaryReady?.({entryId:sourceEntryId});
+   }catch(error){
+    try{append({status:'failed',error:classifyModelFailure(error).reason});this.#deps.events?.onSupplementaryReady?.({entryId:sourceEntryId});}catch{/* Cancelled sources cannot publish. */}
+    throw error;
+   }
+  }
+
+  /** Keep the main author's original delivery independently of supplementary completion. */
  async #deliverAgentPresentation(_materials: StageMaterials, sm: StageSessionManager, entryId: string,
   narrative: string, authorDraft: string, stable: (anchor: string | null) => boolean,
   _observation?: StageRequestObservation): Promise<{ok:true} | {ok:false;error:string}> {
@@ -3201,20 +3700,28 @@ export class StageEngine {
  }
 
 	/** 半稿或结算失败的正文保留在树上；新输入落树前先补齐镜头账本和启用的领域结算。 */
-	async #recoverPendingTurn(materials: StageMaterials, sm: StageSessionManager, ev: StageEvents, stable: (anchor: string | null) => boolean, recoveryObservation?:StageRequestObservation): Promise<void> {
+	async #recoverPendingTurn(materials: StageMaterials, sm: StageSessionManager, ev: StageEvents, stable: (anchor: string | null) => boolean, recoveryObservation?:StageRequestObservation, explicitRetry = false, target?: string, npcAdmission?:NpcAdmissionRequest): Promise<void> {
 		const branch = sm.getBranch() as BranchEntryLike[];
 		const status = new Map<string, { status?: string; ledgerDone?: boolean; worldDone?: boolean; ecologyDone?: boolean; presentationDone?: boolean; degradedDomains?: string[] }>();
 		for (const e of branch) if (e.customType === "rp-turn-settlement" && e.data && typeof e.data === "object") {
 			const d = e.data as { narrativeEntryId?: string; status?: string }; if (d.narrativeEntryId && d.status) status.set(d.narrativeEntryId, d);
 		}
-		const strictRecovery = materials.config.allowDegradedGeneration !== true;
+		const strictRecovery = !!target || materials.config.allowDegradedGeneration !== true;
 		const pending = [...branch].reverse().find(e => {
 			if(e.type!=="message"||e.message?.role!=="assistant"||!e.id)return false;
-			const receipt=status.get(e.id);return hasLegacyUnsettledNpcValidation(branch,e.id) || ["pending","settling"].includes(receipt?.status??"") || (strictRecovery && receipt?.status==="degraded" && receipt.degradedDomains?.some(x=>x==="world"||x==="ecology"));
+			const receipt=status.get(e.id);return hasLegacyUnsettledNpcValidation(branch,e.id) || ["pending","settling"].includes(receipt?.status??"") || (strictRecovery && receipt?.status==="degraded" && receipt.degradedDomains?.some(x=>target ? x===target : x==="world"||x==="ecology"));
 		});
 		if (!pending?.id) return;
+		assertSettlementAuthorComplete(pending, branch);
 		const id = pending.id, legacyNpcValidation=hasLegacyUnsettledNpcValidation(branch,id), savedCheckpoint=status.get(id), recordedCheckpoint=legacyNpcValidation?{...savedCheckpoint,status:"pending",ecologyDone:false,degradedDomains:[...new Set([...(savedCheckpoint?.degradedDomains??[]),"ecology"])]}:savedCheckpoint, details = pending.message?.details as Record<string, unknown> | undefined;
-		const checkpoint = recordedCheckpoint?.status === "degraded" && strictRecovery ? { ...recordedCheckpoint, worldDone:!recordedCheckpoint.degradedDomains?.includes("world"),ecologyDone:!recordedCheckpoint.degradedDomains?.includes("ecology") } : recordedCheckpoint;
+		const checkpoint = recordedCheckpoint?.status === "degraded" && strictRecovery ? { ...recordedCheckpoint, worldDone:!recordedCheckpoint.degradedDomains?.includes("world"),ecologyDone:!recordedCheckpoint.degradedDomains?.includes("ecology") } : recordedCheckpoint ? { ...recordedCheckpoint } : undefined;
+		// Cancellation can leave only the initial settling receipt, without domain flags.
+		// A targeted recovery must not mark the other enabled domains complete.
+		if (target && checkpoint) {
+			checkpoint.worldDone ??= materials.config.literaryWorldEnabled !== true;
+			checkpoint.ecologyDone ??= materials.config.literaryEcologyEnabled !== true;
+			checkpoint.presentationDone ??= branch.some(e => e.customType === "rp-presentation-delivery" && (e.data as { targetEntryId?: string })?.targetEntryId === id);
+		}
 		const narrative = typeof details?.rpNarrative === "string" ? details.rpNarrative : "";
 		const trustedNarrative = ["direct", "director"].includes(String(details?.rpGenerationMode)) ? { entryId: id, text: narrative } : undefined;
 		if (!narrative.trim()) { sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: id, status: "complete", recovered: true }); sm.flush(); return; }
@@ -3229,20 +3736,40 @@ export class StageEngine {
         if(legacyNpcValidation)ev.onActivity?.("识别到旧侧写技术校验失败却标完成的收据：重做接入，不把旧生态快照当本拍成功，也不重复推进已完成世界。");
 		let recoveredLedger: typeof state | undefined;
 		const ledgerAnchor = sm.getLeafId();
-		const ledger = (checkpoint?.ledgerDone || branch.some(e => e.customType === STATE_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?._diagnosticSourceEntryId === id)) ? { kind: "skipped" as const, reason: "already-settled" } : await runScribeTurn({ sideText: (sp, ut) => side("scribe", sp, ut, 2048), appendStateEntry: next => { recoveredLedger = next; }, getLeafId: () => sm.getLeafId(), isLeafStable: stable, onActivity: ev.onActivity }, { state, userText, assistantText: narrative, charName: card.name, userName: config.userName });
-		if (ledger.kind === "failed" || ledger.kind === "stale" || this.#abort?.signal.aborted || !stable(ledgerAnchor) || loadStageConfig(this.#deps.cwd).card !== config.card) throw new Error("上一拍账本恢复尚未完成；本条输入未受理，不读取过期账本");
+  const ledgerAlreadyCommitted = checkpoint?.ledgerDone || branch.some(e => e.customType === STATE_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?._diagnosticSourceEntryId === id);
+  if ((!target || target === "ledger") && !ledgerAlreadyCommitted && !explicitRetry && ledgerFailureForSource(branch, id) === "content-filter")
+   throw new Error("上一拍账本更新被供应商安全策略拒绝；未自动重发场记请求、借用恢复模型或改写正文。请先核对拒绝原因；显式后台恢复才会重试。");
+		const ledger = ledgerAlreadyCommitted || target && target !== "ledger" ? { kind: "skipped" as const, reason: "already-settled" } : await runScribeTurn({ sideText: (sp, ut) => side("scribe", sp, ut, 2048), appendStateEntry: next => { recoveredLedger = next; }, getLeafId: () => sm.getLeafId(), isLeafStable: stable, onActivity: ev.onActivity }, { state, userText, assistantText: narrative, charName: card.name, userName: config.userName });
+		if (ledger.kind === "failed" || ledger.kind === "stale" || this.#abort?.signal.aborted || !stable(ledgerAnchor) || loadStageConfig(this.#deps.cwd).card !== config.card) throw new Error(`上一拍账本恢复尚未完成；本条输入未受理，不读取过期账本${ledger.kind === "failed" ? `：${ledger.error}` : ""}`);
 		if (recoveredLedger) {
 			sm.appendCustomEntry(STATE_ENTRY_TYPE, { ...recoveredLedger, _diagnosticSourceEntryId: id }); sm.flush();
 			const file = this.#deps.getStateFile?.(sm.getSessionId());
 			if (file) { try { saveState(file, recoveredLedger); } catch { /* Tree state remains authoritative. */ } }
 		}
-		sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: id, ...checkpoint, status: "settling", ledgerDone: true }); sm.flush();
+		const ledgerDone = !!ledgerAlreadyCommitted || !target || target === "ledger";
+		sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: id, ...checkpoint, status: "settling", ledgerDone }); sm.flush();
 		let postBranch = sm.getBranch() as BranchEntryLike[];
-  const recoveryCardKey = worldCardKey(this.#deps.cwd,config.card,card);
+  const recoveryFingerprint = worldProfileFingerprint({ ...this.#loadMaterials(), greetingIndex: config.greetingIndex });
+  const recoveryProfile = loadCardWorldProfile(this.#deps.cwd, config.card, card.name, recoveryFingerprint, card, postBranch);
+  const recoveryCardKey = recoveryProfile?.cardKey ?? worldCardKey(this.#deps.cwd,config.card,card);
   const missingWorldManifest = config.literaryWorldEnabled === true && !worldManifestFromBranch(postBranch,recoveryCardKey);
-  if (missingWorldManifest) {
-   const fingerprint = worldProfileFingerprint({card,entries:materials.entries,preset:materials.preset,greetingIndex:config.greetingIndex});
-   const profile = loadCardWorldProfile(this.#deps.cwd,config.card,card.name,fingerprint,card);
+   if (missingWorldManifest && (!target || target === "world")) {
+   const fingerprint = recoveryFingerprint;
+   let profile = recoveryProfile;
+   if (!profile) {
+    const profileAnchor = sm.getLeafId();
+    try { profile = await this.#analyzeWorldProfile(materials, postBranch, this.#abort?.signal, recoveryObservation); }
+    catch (error) {
+     if (!this.#abort?.signal.aborted && stable(profileAnchor)) {
+      sm.appendCustomEntry("rp-turn-settlement", {version:1, narrativeEntryId:id, ...checkpoint, status:"pending", ledgerDone, worldDone:false}); sm.flush();
+     }
+     throw Error(`world profile: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (this.#abort?.signal.aborted || !stable(profileAnchor)) throw new Error("世界画像恢复已取消或来源变化");
+    const current=this.#loadMaterials();
+    if(current.config.card!==config.card || worldProfileFingerprint({...current,greetingIndex:current.config.greetingIndex})!==fingerprint) throw new Error("画像恢复素材已变化");
+    saveCardWorldProfile(this.#deps.cwd,config.card,profile,card);
+   }
    if (profile) {
     sm.appendCustomEntry(WORLD_MANIFEST_ENTRY_TYPE,manifestFromProfile(profile)); sm.flush();
     postBranch = sm.getBranch() as BranchEntryLike[];
@@ -3250,67 +3777,83 @@ export class StageEngine {
    }
   }
   const anchor = sm.getLeafId();
-  const manifest = worldManifestFromBranch(postBranch,recoveryCardKey), world = modularWorldFromBranch(postBranch, manifest);
-		const ecology = literaryEcologyFromBranch(legacyNpcValidation?branch.slice(0,at):postBranch), postState = trustedNarrative ? priorState : stateFromBranch(postBranch);
-		const history = rebuildHistory(postBranch, materials.promptRules).history;
-		const degraded: string[] = (checkpoint?.degradedDomains ?? []).filter(x=>x!=="ledger"&&x!=="world"&&x!=="ecology"&&x!=="presentation");
+  const manifest = worldManifestFromBranch(postBranch,recoveryCardKey), world = modularWorldFromBranch(trustedNarrative ? branch.slice(0, at) : postBranch, manifest);
+		const ecology = literaryEcologyFromBranch(trustedNarrative || legacyNpcValidation ? branch.slice(0,at) : postBranch), postState = trustedNarrative ? priorState : stateFromBranch(postBranch);
+		const history = rebuildHistory(branch.slice(0, at), materials.promptRules).history;
+		const supplementaryResolved = ["complete", "skipped"].includes(String(([...branch].reverse().find(e => e.customType === SUPPLEMENTARY_ENTRY_TYPE && (e.data as { sourceEntryId?: string })?.sourceEntryId === id)?.data as { status?: string } | undefined)?.status));
+		const degraded: string[] = (checkpoint?.degradedDomains ?? []).filter(x => (target ? x !== target : x!=="ledger"&&x!=="world"&&x!=="ecology"&&x!=="presentation") && !(x === "supplementary" && supplementaryResolved));
+		if (target) for (const [domain, done] of [["ledger", checkpoint?.ledgerDone], ["world", checkpoint?.worldDone], ["ecology", checkpoint?.ecologyDone], ["presentation", checkpoint?.presentationDone]] as const)
+			if (domain !== target && done === false && !degraded.includes(domain)) degraded.push(domain);
 		let nextWorld: ReturnType<typeof commitModularWorldTransition> | undefined;
 		let auditEntry: ReturnType<typeof worldAuditEntry> | undefined;
 		let approvedRecoveryAudit: import("./literary-world-transition.ts").WorldTransitionAudit | undefined;
+		let factsFailed = false;
+		const worldRecoveryErrors: string[] = [];
 		const recordedWorld = postBranch.some(e => (e.customType === LITERARY_WORLD_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?._diagnosticSourceEntryId === id) || (e.customType === WORLD_AUDIT_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?.narrativeEntryId === id && (e.data as Record<string,unknown> | undefined)?.status === "committed"));
 		const recordedEcology = !legacyNpcValidation && postBranch.some(e => e.customType === LITERARY_ECOLOGY_ENTRY_TYPE && (e.data as Record<string, unknown> | undefined)?._diagnosticSourceEntryId === id && !(e.data as Record<string,unknown> | undefined)?.degraded);
-		if ((!checkpoint?.worldDone || missingWorldManifest) && !recordedWorld && config.literaryWorldEnabled && manifest) {
+		if ((!target || target === "world") && (!checkpoint?.worldDone || missingWorldManifest) && !recordedWorld && config.literaryWorldEnabled && manifest) {
 			const facts = workflowSkill(materials.skillFiles, "world-facts"), rules = workflowSkill(materials.skillFiles, "world"), audit = workflowSkill(materials.skillFiles, "world-audit");
 			if (facts && rules && audit) {
 				const fp = buildBeatFactPrompt(facts.body, { userText, narrativeText: narrative, rpState: postState, world: projectLiteraryWorldV1(world), history, manifest, ...stateBasis });
 				const f = await side("literaryWorldFacts", fp.systemPrompt, fp.userText);
-				let parsed = typeof f === "string" ? normalizeBeatFactEnvelope(f, { userText, narrativeText: narrative }) : undefined;
-				if(typeof f==="string"&&!parsed?.envelope){const fixed=await this.#repairStructured("literaryWorldFacts",fp,f,parsed?.errors??["事实信封无效"],8192,recoveryObservation);if(typeof fixed==="string")parsed=normalizeBeatFactEnvelope(fixed,{userText,narrativeText:narrative});}
-				if (parsed?.envelope) {
+				let parsed = typeof f === "string" ? normalizeBeatFactEnvelope(f, { userText, narrativeText: narrative }) : { errors: [`事实请求失败：${f.error}`] } as ReturnType<typeof normalizeBeatFactEnvelope>;
+				if(typeof f==="string"&&!parsed.envelope){const fixed=await this.#repairStructured("literaryWorldFacts",fp,f,parsed.errors.length?parsed.errors:["事实信封无效"],8192,recoveryObservation);if(typeof fixed==="string")parsed=normalizeBeatFactEnvelope(fixed,{userText,narrativeText:narrative});else parsed.errors.push(`事实修复请求失败：${fixed.error}`);}
+				if (!parsed.envelope) {
+					factsFailed = true;
+					degraded.push("world");
+					worldRecoveryErrors.push(`世界事实提取失败：${parsed.errors.join("；")}`);
+				} else {
 					const env = parsed.envelope, due = dueWorldModules(manifest, env);
 					if (due.length) {
-						const pp = buildWorldProposalPrompt(rules.body, { envelope: env, world, rpState: postState, manifest, dueModuleIds: due.map(m => m.id), moduleSkillBodies: worldModuleSkillPacks(materials.skillFiles, due).map(x => ({ name: x.name, body: x.body })), ecologySignals: ecologySignalsForWorld(ecology), ...stateBasis });
+						const pp = buildWorldProposalPrompt(rules.body, { sourceEntryId: id, envelope: env, world, rpState: postState, manifest, dueModuleIds: due.map(m => m.id), moduleSkillBodies: worldModuleSkillPacks(materials.skillFiles, due).map(x => ({ name: x.name, body: x.body })), ecologySignals: ecologySignalsForWorld(ecology), ...stateBasis });
 						const pt = await side("literaryWorld", pp.systemPrompt, pp.userText);
-						let proposal = typeof pt === "string" ? normalizeModularWorldProposal(pt, world, env, manifest) : undefined;
-						if(typeof pt==="string"&&!proposal?.proposal){const fixed=await this.#repairStructured("literaryWorld",pp,pt,proposal?.errors??["世界提案无效"],8192,recoveryObservation);if(typeof fixed==="string")proposal=normalizeModularWorldProposal(fixed,world,env,manifest);}
+						if (typeof pt !== "string") worldRecoveryErrors.push(`提案请求失败：${pt.error}`);
+						let proposal = typeof pt === "string" ? normalizeModularWorldProposal(pt, world, env, manifest, id) : undefined;
+						if(typeof pt==="string"&&!proposal?.proposal){const fixed=await this.#repairStructured("literaryWorld",pp,pt,proposal?.errors??["世界提案无效"],8192,recoveryObservation);if(typeof fixed==="string")proposal=normalizeModularWorldProposal(fixed,world,env,manifest,id);else worldRecoveryErrors.push(`提案修复请求失败：${fixed.error}`);}
+						if (!proposal?.proposal && proposal?.errors.length) worldRecoveryErrors.push(`JSON/schema: ${proposal.errors.join("；")}`);
 						if (proposal?.proposal) {
 							const ap = buildWorldAuditPrompt(audit.body, { envelope: env, proposal: proposal.proposal, world, rpState: postState, manifest, preflightWarnings: proposal.warnings, ...stateBasis });
 							const a = await side("literaryWorldAudit", ap.systemPrompt, ap.userText);
+							if (typeof a !== "string") worldRecoveryErrors.push(`审计请求失败：${a.error}`);
 							let normalized = typeof a === "string" ? normalizeWorldTransitionAudit(a, env) : undefined;
-							if(typeof a==="string"&&!normalized?.audit){const fixed=await this.#repairStructured("literaryWorldAudit",ap,a,normalized?.errors??["审计报告无效"],8192,recoveryObservation);if(typeof fixed==="string")normalized=normalizeWorldTransitionAudit(fixed,env);}
-							if(normalized?.audit?.verdict!=="approve") {
+							if(typeof a==="string"&&!normalized?.audit){const fixed=await this.#repairStructured("literaryWorldAudit",ap,a,normalized?.errors??["审计报告无效"],8192,recoveryObservation);if(typeof fixed==="string")normalized=normalizeWorldTransitionAudit(fixed,env);else worldRecoveryErrors.push(`审计修复请求失败：${fixed.error}`);}
+							if (!normalized?.audit && normalized?.errors.length) worldRecoveryErrors.push(`JSON/schema: ${normalized.errors.join("；")}`);
+							if(normalized?.audit && normalized.audit.verdict!=="approve") {
 								const errors=normalized?.audit?.issues.filter(x=>x.severity==="error").map(x=>x.message)??normalized?.errors??["世界审计未返回有效报告"];
 								ev.onActivity?.(`世界恢复审计拒绝：${errors.join("；")}；修复原提案后再次独立审计。`);
 								const fixed=await this.#repairStructured("literaryWorld",pp,JSON.stringify(proposal.proposal),errors,8192,recoveryObservation);
 								if(typeof fixed==="string"){
-									const revised=normalizeModularWorldProposal(fixed,world,env,manifest);
-									if(revised.proposal){const retryAudit=buildWorldAuditPrompt(audit.body,{envelope:env,proposal:revised.proposal,world,rpState:postState,manifest,preflightWarnings:revised.warnings,...stateBasis});const value=await side("literaryWorldAudit",retryAudit.systemPrompt,retryAudit.userText);const check=typeof value==="string"?normalizeWorldTransitionAudit(value,env):undefined;if(check?.audit?.verdict==="approve"){approvedRecoveryAudit=check.audit;nextWorld=commitModularWorldTransition(world,revised.proposal,worldTransitionHash(check.audit),manifest);}else ev.onActivity?.(`修复后审计仍拒绝：${check?.audit?.summary??check?.errors.join("；")??"请求失败"}`);}
-								}
+									const revised=normalizeModularWorldProposal(fixed,world,env,manifest,id);
+									if(revised.proposal){const retryAudit=buildWorldAuditPrompt(audit.body,{envelope:env,proposal:revised.proposal,world,rpState:postState,manifest,preflightWarnings:revised.warnings,...stateBasis});const value=await side("literaryWorldAudit",retryAudit.systemPrompt,retryAudit.userText);const check=typeof value==="string"?normalizeWorldTransitionAudit(value,env):undefined;if(check?.audit?.verdict==="approve"){approvedRecoveryAudit=check.audit;nextWorld=commitModularWorldTransition(world,revised.proposal,worldTransitionHash(check.audit),manifest);}else {const reason=typeof value!=="string"?`修复后审计请求失败：${value.error}`:check?.audit?.summary??check?.errors.join("；")??"审计报告不可解析";worldRecoveryErrors.push(reason);ev.onActivity?.(`修复后审计仍拒绝：${reason}`);}}
+								} else worldRecoveryErrors.push(`审计反馈提案修复请求失败：${fixed.error}`);
 							}
-							else { approvedRecoveryAudit=normalized.audit;nextWorld = commitModularWorldTransition(world, proposal.proposal, worldTransitionHash(normalized.audit), manifest); }
+							else if (normalized?.audit) { approvedRecoveryAudit=normalized.audit;nextWorld = commitModularWorldTransition(world, proposal.proposal, worldTransitionHash(normalized.audit), manifest); }
 						}
 						if (!nextWorld) degraded.push("world");
 					}
-				} else degraded.push("world");
+				}
 			} else degraded.push("world");
-			auditEntry = worldAuditEntry({ status: degraded.includes("world") ? "rejected" : "committed", narrativeEntryId: id, baseRound: world.round, baseStateHash: worldTransitionHash(world), cardKey: manifest.cardKey, manifestRevision: manifest.profileRevision, errors: degraded.includes("world") ? ["恢复结算未通过世界证据/审计，保留旧快照"] : [], ...(approvedRecoveryAudit ? {audit:approvedRecoveryAudit} : {}) });
+			auditEntry = worldAuditEntry({ status: factsFailed ? "fact-failed" : degraded.includes("world") ? "rejected" : "committed", narrativeEntryId: id, baseRound: world.round, baseStateHash: worldTransitionHash(world), cardKey: manifest.cardKey, manifestRevision: manifest.profileRevision, errors: degraded.includes("world") ? ["恢复结算未通过世界证据/审计，保留旧快照", ...worldRecoveryErrors] : [], ...(approvedRecoveryAudit ? {audit:approvedRecoveryAudit} : {}) });
 		}
-		if (config.literaryWorldEnabled && !manifest && !recordedWorld) {
+		if ((!target || target === "world") && config.literaryWorldEnabled && !manifest && !recordedWorld) {
    degraded.push("world"); ev.onActivity?.("世界恢复尚未运行：无匹配画像，保留待恢复，不把跳过记为完成");
   }
   let nextEcology: LiteraryEcologyState | undefined;
+        let ecologyRecoveryError: string | undefined;
         let recoveredNpcReceipt: import("./npc-parallel.ts").NpcParallelReceipt | undefined;
-		if (!checkpoint?.ecologyDone && !recordedEcology && config.literaryEcologyEnabled) {
+		if ((!target || target === "ecology") && !checkpoint?.ecologyDone && !recordedEcology && config.literaryEcologyEnabled) {
 			const skill = workflowSkill(materials.skillFiles, "ecology-runtime"), pools = loadEcologyPools(this.#deps.cwd, config.card, card.name);
 			if (skill) {
-                const result=await computeNpcEcology({provider:this.#deps.npcParallel,
+                const result=await computeNpcEcology({provider:this.#deps.npcParallel,explicitRetry,admissionCandidateHashes:npcAdmission?.candidateHashes,
                     scope:{sessionId:sm.getSessionId(),card:config.card,sourceEntryId:id,visibleEntryIds:postBranch.flatMap(e=>e.id?[e.id]:[])},
                     ecology,committedEcology:ecology,global:pools.global,cardPool:pools.card,lore:materials.entries,state:postState,history,
                     userText,userEntryId:userEntry?.id,userName:config.userName,charName:card.name,narrative,worldSignals:worldSignalsForEcology(world),
                     skillBody:skill.body,npcSkillBody:workflowSkill(materials.skillFiles,"npc-ecology")?.body,preTurn:!!trustedNarrative,previousRound:ecology.round,
                     signal:this.#abort?.signal,guard:()=>{if(!stable(anchor)||this.#abort?.signal.aborted)throw Error("恢复侧写来源已失效");},side,
-                    repair:(step,prompt,raw,errors,max)=>this.#repairStructured(step,prompt,raw,errors,max,recoveryObservation),activity:text=>ev.onActivity?.(text)});
+                    repair:(step,prompt,raw,errors,max)=>this.#repairStructured(step,prompt,raw,errors,max,recoveryObservation),activity:text=>ev.onActivity?.(text),
+                    progress:text=>ev.onActivity?.(`后台整理：恢复中，鲜活世界／NPC · ${text}`)});
                 if(result.npcReceipt)recoveredNpcReceipt=result.npcReceipt;
+                if(result.degraded)ecologyRecoveryError=classifyModelFailure(result.error??"生态恢复计算失败").reason;
                 if(!result.degraded)nextEcology=result.state;
 			}
 			if (!nextEcology) { degraded.push("ecology"); nextEcology = degradedLiteraryEcologyRound(ecology, ecology.round, "aftermath", "恢复结算未通过，保留原有内容"); }
@@ -3325,15 +3868,17 @@ export class StageEngine {
 		if (nextWorld) sm.appendCustomEntry(LITERARY_WORLD_ENTRY_TYPE, { ...nextWorld, _diagnosticSourceEntryId: id });
 		if (nextEcology && (!degraded.includes("ecology") || config.allowDegradedGeneration === true)) sm.appendCustomEntry(LITERARY_ECOLOGY_ENTRY_TYPE, { ...nextEcology, _diagnosticSourceEntryId: id });
 		let presentationRestored = checkpoint?.presentationDone;
-		if (checkpoint?.presentationDone === false || checkpoint?.degradedDomains?.includes("presentation") || (trustedNarrative && !postBranch.some(e => e.customType === "rp-presentation-delivery" && (e.data as Record<string, unknown> | undefined)?.targetEntryId === id))) {
+		if ((!target || target === "presentation") && (checkpoint?.presentationDone === false || checkpoint?.degradedDomains?.includes("presentation") || (trustedNarrative && !postBranch.some(e => e.customType === "rp-presentation-delivery" && (e.data as Record<string, unknown> | undefined)?.targetEntryId === id)))) {
 			const delivered = await this.#deliverAgentPresentation(materials, sm, id, narrative,
 				typeof details?.rpAuthorDraft === "string" ? details.rpAuthorDraft : narrative, stable, recoveryObservation);
 			presentationRestored = delivered.ok;
 			if (!delivered.ok) degraded.push("presentation");
 		}
-		sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: id, presentationDone:presentationRestored, status: degraded.some(x=>x==="world"||x==="ecology"||x==="presentation") && config.allowDegradedGeneration !== true ? "pending" : degraded.length ? "degraded" : "complete", recovered:true,ledgerDone:true,worldDone:!degraded.includes("world"),ecologyDone:!degraded.includes("ecology"),degradedDomains:degraded,...(legacyNpcValidation&&!degraded.includes("ecology")?{npcValidationRecovered:true}:{}) });
+		if ((!target || target === "world") && (checkpoint?.worldDone === false || checkpoint?.degradedDomains?.includes("world")) && !config.literaryWorldEnabled && !recordedWorld) { degraded.push("world"); worldRecoveryErrors.push("world: 原失败领域当前未启用，无法确认完成"); }
+		if ((!target || target === "ecology") && (checkpoint?.ecologyDone === false || checkpoint?.degradedDomains?.includes("ecology")) && !config.literaryEcologyEnabled && !recordedEcology) { degraded.push("ecology"); ecologyRecoveryError = "ecology: 原失败领域当前未启用，无法确认完成"; }
+		sm.appendCustomEntry("rp-turn-settlement", { version: 1, narrativeEntryId: id, presentationDone:presentationRestored, status: !ledgerDone || degraded.length && strictRecovery ? "pending" : degraded.length ? "degraded" : "complete", recovered:true,ledgerDone,worldDone:!degraded.includes("world"),ecologyDone:!degraded.includes("ecology"),degradedDomains:degraded,...(legacyNpcValidation&&!degraded.includes("ecology")&&(!target||target==="ecology")?{npcValidationRecovered:true}:{}) });
 		sm.flush();
-		if (degraded.some(x=>x==="world"||x==="ecology"||x==="presentation") && config.allowDegradedGeneration !== true) throw new Error(`上一拍${degraded.join("/")}仍未恢复；已诊断，不接收新输入，不跳过失败。`);
+		if (target ? degraded.includes(target) : degraded.some(x=>x==="world"||x==="ecology"||x==="presentation") && strictRecovery) throw new Error(`上一拍${target ?? degraded.join("/")}仍未恢复；${worldRecoveryErrors.join("；")}${ecologyRecoveryError?`ecology：${ecologyRecoveryError}；`:""}已诊断，不接收新输入，不跳过失败。`);
 	}
 
 	/** 每剧情库 N 拍提取一次事件账本；失败不推进游标，下一拍自动扩大窗口重试。 */
@@ -3343,7 +3888,7 @@ export class StageEngine {
 		if (!book || !this.#deps.upsertEventDigest) return;
 		const every = Math.max(0, Math.floor(book.everyNTurns()));
 		if (every <= 0) return;
-		const materials = loadStageMaterials(this.#deps.cwd);
+		const materials = this.#loadMaterials();
 		const skill = workflowSkill(materials.skillFiles, "memory");
 		if (!skill) return;
 		const branch = sm.getBranch() as BranchEntryLike[];
@@ -3454,7 +3999,7 @@ export class StageEngine {
 	): Promise<CompactOutcome> {
 		const ev = this.#deps.events ?? {};
 		const sm = this.#deps.getSessionManager();
-		const materials = loadStageMaterials(this.#deps.cwd);
+		const materials = this.#loadMaterials();
 		const { config, card } = materials;
 		try {
 			const branch = sm.getBranch() as BranchEntryLike[];
@@ -3493,7 +4038,7 @@ export class StageEngine {
 						this.#deps.upsertEventDigest
 							? async (text, opts) => {
 								if (!turnLeafIsStable(sm, memoryExpectedLeaf)) return;
-									const materials = loadStageMaterials(this.#deps.cwd);
+									const materials = this.#loadMaterials();
 									const skill = workflowSkill(materials.skillFiles, "memory");
 									if (!skill) return;
 									const sys = `你是梨园的记忆整理旁路。遵守工作流 skill 的规则。
@@ -4128,13 +4673,13 @@ ${skill.body ?? ""}`;
 		/** 台上补充设定集路径（写侧落点；卡未装载时为空＝无 lorebook_write） */
 		const overlayOf = (): string => {
 			try {
-				const m = loadStageMaterials(cwd);
+				const m = this.#loadMaterials();
 				return overlayPathFor(cwd, m.card.name);
 			} catch {
 				return "";
 			}
 		};
-		const privateMaterials = materialSnapshot ?? loadStageMaterials(cwd);
+		const privateMaterials = materialSnapshot ?? this.#loadMaterials();
         const privacyBranch = sm.getBranch() as BranchEntryLike[];
         const taskEntry = [...privacyBranch].reverse().find(entry => entry.message?.role === "user");
         const privacy = { publicTerms: privateMaterials.config.webResearchPublicTerms ?? [], privateTerms: [privateMaterials.config.userName, privateMaterials.card.name,
@@ -4205,7 +4750,7 @@ ${skill.body ?? ""}`;
         const canonBinding = canonEnabled ? JSON.stringify(effectiveNovelPlayBinding(cwd, rawCard, sm.getBranch() as BranchEntryLike[])) : "";
         const corpusResearch: NonNullable<StageToolDeps["corpusResearch"]> = async (query, maxResults, scope, docId) => {
             if (this.#abort?.signal.aborted || !isCurrent()) throw new Error("research scope stopped");
-            const m = loadStageMaterials(cwd), branch = sm.getBranch() as BranchEntryLike[];
+            const m = this.#loadMaterials(), branch = sm.getBranch() as BranchEntryLike[];
             if (JSON.stringify(m.rawCard) !== JSON.stringify(privateMaterials.rawCard) || m.config.card !== privateMaterials.config.card) throw new Error("card source stale");
             if (canonEnabled) {
                 const binding = effectiveNovelPlayBinding(cwd, m.rawCard, branch);
@@ -4229,7 +4774,7 @@ ${skill.body ?? ""}`;
             protectResearchText: text => { if (text && !privacy.privateTexts.includes(text)) privacy.privateTexts.push(text); },
 			...(novelPlayCardBinding(rawCard) ? { canonResearch: async (query: string, maxResults: number, scope: import("../novel-play/research.ts").CanonResearchScope = "visible") => {
 				if (this.#abort?.signal.aborted || !isCurrent()) return [];
-				const m = loadStageMaterials(cwd);
+				const m = this.#loadMaterials();
 				const branch = sm.getBranch() as BranchEntryLike[];
 				const binding = effectiveNovelPlayBinding(cwd, m.rawCard, branch);
                 if (!binding || JSON.stringify(m.rawCard) !== canonIdentity || JSON.stringify(binding) !== canonBinding) throw new Error("本拍原著绑定已换代，未读取旧版本证据");
@@ -4250,7 +4795,7 @@ ${skill.body ?? ""}`;
                 return hits;
 			} } : {}),
 			searchLore: (query, limit) => {
-				const m = loadStageMaterials(cwd);
+				const m = this.#loadMaterials();
 				// 语料 = 世界书 + 补充设定集（materials 已剥离外部插件协议条目）+ 当前分支挂载的知识库。
 				// 知识库此前只有扩展侧搜得到，台上描述却一直承诺「已挂载知识库」——M-D1 补齐（PLAN-RP-TOOLING）。
 				const codex: LorebookEntry[] = [];
@@ -4269,7 +4814,7 @@ ${skill.body ?? ""}`;
 				if (!overlay) return null;
 				return appendOverlayEntry(overlay, input);
 			},
-			listLore: () => loadStageMaterials(cwd).entries,
+			listLore: () => this.#loadMaterials().entries,
 			fingerprint: loreFingerprint,
 			...(this.#deps.setDisabledLore ? { toggleLore: this.#deps.setDisabledLore } : {}),
 			gate: () => ({ lastUserText }),
@@ -4291,7 +4836,7 @@ ${skill.body ?? ""}`;
 			...research,
 			// ---- M-D4 角色库：只读卡面 ----
 			readCard: () => {
-				const m = loadStageMaterials(cwd);
+				const m = this.#loadMaterials();
 				const c = m.card;
 				if (!c) return null;
 				return {
@@ -4318,7 +4863,7 @@ ${skill.body ?? ""}`;
 				: {}),
 			getState: () => stateFromBranch(sm.getBranch() as BranchEntryLike[]),
 			formatState,
-			getSkill: (name: string) => loadStageMaterials(cwd).skillFiles.find((skill) => skill.name === name)?.body,
+			getSkill: (name: string) => this.#loadMaterials().skillFiles.find((skill) => skill.name === name)?.body,
 		};
 	}
 
@@ -4358,114 +4903,142 @@ ${skill.body ?? ""}`;
 	#observedStream(
 		model: StageModelLike,
 		context: { systemPrompt?: string; messages: unknown[]; tools?: unknown[] },
-		options: Record<string, unknown>,
+		options: StageStreamOptions,
 		observation?: StageRequestObservation,
 	): ReturnType<StageStreamFn> {
 		observation?.preflight?.check(model, context, options.maxTokens, observation.notify);
 		const attempt = observation?.collector?.beginCall(observation.phase);
   const sm=this.#deps.getSessionManager(),branch=sm.getBranch() as BranchEntryLike[];
   let journal:ReturnType<RequestJournal["begin"]>|undefined;
-  try{journal=new RequestJournal(this.#deps.cwd).begin({scope:observation?.requestScope??{sessionId:sm.getSessionId(),card:loadStageConfig(this.#deps.cwd).card},sourceEntryId:[...branch].reverse().find(entry=>entry.message?.role==="user"||entry.message?.role==="assistant")?.id??"",groupId:(observation as StageRequestObservation & {requestGroupId?:string}|undefined)?.requestGroupId,phase:observation?.phase??"side",provider:String(model.provider??""),model:model.id},context);}catch{this.#deps.events?.onActivity?.("实际请求记录不可用；未伪造提示词快照");}
+  try{journal=new RequestJournal(this.#deps.cwd).begin({scope:observation?.requestScope??{sessionId:sm.getSessionId(),card:loadStageConfig(this.#deps.cwd).card},sourceEntryId:observation?.sourceEntryId??[...branch].reverse().find(entry=>entry.message?.role==="user"||entry.message?.role==="assistant")?.id??"",groupId:(observation as StageRequestObservation & {requestGroupId?:string}|undefined)?.requestGroupId,phase:observation?.phase??"side",provider:String(model.provider??""),model:model.id},context,model.baseUrl);}catch{this.#deps.events?.onActivity?.("实际请求记录不可用；未伪造提示词快照");}
+  options=withRequestTransport(options,journal);
   const originalPayload=options.onPayload as ((value:unknown,model:StageModelLike)=>unknown)|undefined;
-  options={...options,onPayload:(value:unknown,actualModel:StageModelLike)=>{const projected=originalPayload?.(value,actualModel)??value;try{journal?.payload(projected);}catch{}return projected;}};
+  options={...options,onPayload:(value:unknown,actualModel:StageModelLike)=>{const projected=originalPayload?.(value,actualModel)??value;try{journal?.payload(requestPayloadSnapshot(projected,actualModel));}catch{}return projected;}};
 
+		const signal = options.signal as AbortSignal | undefined;
 		let source: ReturnType<StageStreamFn>;
 		try { source = this.#deps.streamFn(model, context, options); }
 		catch (error) {
-			attempt?.end("failed");try{journal?.end("failed");}catch{}
+			attempt?.end("failed"); try { journal?.end("failed", undefined, undefined, requestFailure(error, signal, options.apiKey)); } catch {}
 			if (isConfirmedContextOverflow(error)) observation?.preflight?.confirmedOverflow(observation.notify);
 			const failed: AssistantMsgLike = { role: "assistant", content: [], stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) };
 			return { async *[Symbol.asyncIterator]() { yield { type: "error", error: failed }; }, result: async () => failed };
 		}
 		if (!observation && !journal) return source;
+		let terminalMessage: AssistantMsgLike | undefined;
+		const finish = (final?: AssistantMsgLike | null, error?: unknown) => {
+			if (final) terminalMessage = final;
+			const responseFailure = final ? options.allowEmptyText===true&&final.stopReason==='stop'&&!textOfAssistant(final)?undefined:modelResponseFailure(final, options.rejectTruncatedText === true) : undefined;
+			const failure = error !== undefined || responseFailure !== undefined
+				? requestFailure(error ?? responseFailure, signal, options.apiKey) : undefined;
+			const status: PerformanceStatus = failure ? failure.origin === "cancelled" ? "aborted" : "failed" : final ? "success" : "degraded";
+			attempt?.usage(final?.usage); attempt?.end(status);
+			try { journal?.end(status === "success" ? "success" : status === "aborted" ? "aborted" : "failed", final?.usage, final?.stopReason, failure); } catch {}
+			if (isConfirmedContextOverflow(error ?? final?.errorMessage)) observation?.preflight?.confirmedOverflow(observation.notify);
+		};
 		return {
 			async *[Symbol.asyncIterator]() {
-				let status: PerformanceStatus = "degraded",usage:unknown,stopReason:string|undefined;
+				let terminal = false;
 				try {
-					for await (const event of source) {
-      if(event.type==="text_delta"||event.type==="thinking_delta")journal?.first();
-						if (event.type === "done" || event.type === "error") {
-							const final = event.type === "done" ? event.message : event.error;
-							attempt?.usage(final?.usage);usage=final?.usage;stopReason=final?.stopReason;
-							status = final?.stopReason === "aborted" ? "aborted" : event.type === "error" || final?.stopReason === "error" ? "failed" : "success";
-							if (isConfirmedContextOverflow(final?.errorMessage)) observation?.preflight?.confirmedOverflow(observation.notify);
-						}
+					for await (const event of abortableEvents(source, signal)) {
+						if (event.type === "text_delta" || event.type === "thinking_delta") journal?.first();
+						if (event.type === "done" || event.type === "error") { terminal = true; finish(event.type === "done" ? event.message : event.error); yield event; return; }
 						yield event;
 					}
-				} catch (error) {
-					status = (options.signal as AbortSignal | undefined)?.aborted ? "aborted" : "failed";
-					if (isConfirmedContextOverflow(error)) observation?.preflight?.confirmedOverflow(observation.notify);
-					throw error;
-				} finally { attempt?.end(status);try{journal?.end(status==="aborted"?"aborted":status==="success"?"success":"failed",usage,stopReason);}catch{} }
+				} catch (error) { terminal = true; finish(undefined, error); throw error; }
+				finally { if (!terminal) finish(undefined, signal?.aborted ? requestAbortError(signal) : new Error("流未返回完成消息")); }
 			},
-			result: () => source.result(),
+			async result() {
+				try { if (terminalMessage) return terminalMessage; const final = await abortable(source.result(), signal); finish(final); return final; }
+				catch (error) { finish(undefined, error); throw error; }
+			},
 		};
 	}
 
 	async #repairStructured(step:SideModelStep,prompt:{systemPrompt:string;userText:string},invalid:string,errors:string[],maxTokens=8192,observation?:StageRequestObservation):Promise<string|{error:string}> {
-		const materials=loadStageMaterials(this.#deps.cwd),protocol=materials.skillFiles.find(x=>x.workflow==="structured-repair")?.body;
+		const materials=this.#loadMaterials(),protocol=materials.skillFiles.find(x=>x.workflow==="structured-repair")?.body;
 		if(!protocol)return {error:"缺少结构化校验修复Skill，未绕过校验"};
 		this.#deps.events?.onActivity?.(`步骤${step}校验失败：${errors.slice(0,4).join("；")}；按回执修复同一工件并重新校验，不改正文。`);
 		const previous=[...(observation?.diagnostics??[])].reverse().find(x=>x.step===step);
 		observation?.diagnostics?.push({phase:observation.phase,step,provider:previous?.provider??"validation",model:previous?.model??"schema",attempt:(previous?.attempt??0)+1,status:"failed",kind:"format",reason:classifyModelFailure("JSON/schema："+errors.join("；")).reason,durationMs:0});
-		return this.#sideText(step,prompt.systemPrompt+"\n\n"+protocol,prompt.userText+"\n\n"+JSON.stringify({invalid_report:invalid.slice(0,24000),validation_errors:errors.slice(0,16)}),maxTokens,"off",this.#abort?.signal,observation,!!materials.config.analysisRecoveryModel);
+		return this.#sideText(step,prompt.systemPrompt+"\n\n"+protocol,prompt.userText+"\n\n"+JSON.stringify({invalid_report:invalid.slice(0,24000),validation_errors:errors.slice(0,16)}),maxTokens,"off",this.#abort?.signal,observation,!observation?.phase.startsWith("settlement.") && !!materials.config.analysisRecoveryModel);
 	}
 
 	async #sideText(
 		step: SideModelStep, systemPrompt: string, userText: string, maxTokens = 8192,
 		reasoning: string | undefined = "off", signal: AbortSignal | undefined = this.#abort?.signal,
-		observation?: StageRequestObservation, forceRecovery = false, temperature?:number,
+		observation?: StageRequestObservation, forceRecovery = false, temperature?:number, forceNonStreaming = false, strictStepModel = false, allowEmptyText=false,
+		useProviderDefaultMaxTokens = false,
 	): Promise<string | { error: string }> {
+		if (useProviderDefaultMaxTokens && (step !== "veridisRewrite" || maxTokens !== 0)) return { error: "Provider-default output budget is restricted to Veridis unset requests" };
 		const config = loadStageConfig(this.#deps.cwd);
 		const resolved = resolveStepModel(step, config.stepModels, this.#deps.getModel(),
 			(provider, id) => this.#deps.findModel?.(provider, id), id => this.#deps.findModelById?.(id));
 		const recoveryRef = config.analysisRecoveryModel;
 		const recovery = recoveryRef ? this.#deps.findModel?.(recoveryRef.provider, recoveryRef.id) : undefined;
 		const primary = forceRecovery ? recovery : resolved.model;
-		if (!primary) return { error: forceRecovery ? "未配置可用恢复模型，结构化报告未修复" : "尚未配置可用剧情模型" };
+  const explicit = config.stepModels?.[step];
+  if (strictStepModel && (!explicit || !primary || primary.provider !== explicit.provider || primary.id !== explicit.id || resolved.fallback))
+   return { error: "请在模型插头配置可用的独立场记岗位；补写账本不会借用主演、导演或恢复模型" };
+		if (!primary) return { error: forceRecovery ? "未配置可用恢复模型，结构化报告未修复" : step === "worldProfile" && resolved.requested ? `世界画像岗位 ${resolved.requested.provider}/${resolved.requested.id} 不在当前启用连接，请在模型插头选择可用画像模型并保存` : "尚未配置可用剧情模型" };
 		if (resolved.fallback && resolved.requested && !forceRecovery) this.#deps.events?.onNotify?.("warning", `步骤 ${step} 的${resolved.requested.provider}/${resolved.requested.id}不在当前可用配置，已转当前剧情模型，未使用旧仓库渠道。`);
-		const models = [primary, ...(!forceRecovery && step !== "npcParallel" && step !== "veridisRewrite" && recovery && (recovery.provider !== primary.provider || recovery.id !== primary.id) ? [recovery] : [])];
+		const models = [primary, ...(!observation?.phase.startsWith("settlement.") && !strictStepModel && !forceRecovery && step !== "npcParallel" && step !== "veridisRewrite" && step !== "worldProfile" && recovery && (recovery.provider !== primary.provider || recovery.id !== primary.id) ? [recovery] : [])];
 		let last = "模型调用失败";
+		let localRetries=0;
 		for (let index = 0; index < models.length; index++) {
-			if (signal?.aborted) return { error: "本拍已取消，未启动恢复请求" };
+			if (signal?.aborted) return { error: requestAbortError(signal, "本拍已取消").message + "；未启动恢复请求" };
 			const model = models[index]!;
 			const started = Date.now();
 			const attempt: ModelAttemptDiagnostic = { phase: observation?.phase ?? "background", step, provider: String(model.provider ?? ""), model: model.id, attempt:index+1, status:"failed", durationMs:0 };
 			let auth: {apiKey?:string;headers?:Record<string,string>} = {};
 			try {
+				observation?.guard?.();
 				auth = await this.#deps.getAuth(model);
+				observation?.guard?.();
 				if (model.baseUrl?.includes("magicv4.ltd")) auth.headers = { ...auth.headers, "user-agent":"undici" };
-				const timeoutMs = step === "writer" ? WRITER_STREAM_TIMEOUT_MS : Math.max(60_000, Math.min(1800_000, (config.analysisTimeoutMinutes ?? 10) * 60_000));
-				const requestController = new AbortController();
-				const requestSignal = signal ? AbortSignal.any([signal,requestController.signal]) : requestController.signal;
-				const timer = setTimeout(() => requestController.abort(), timeoutMs);
+				const timeoutMs = step === "writer" ? WRITER_STREAM_TIMEOUT_MS : analysisRequestTimeoutMs(config);
+				const deadline = createRequestDeadline(signal, timeoutMs, step === "writer" ? "writer" : "analysis", `步骤${step}请求`);
+				const requestSignal = deadline.signal;
 				try {
-					const source = this.#observedStream(model, {systemPrompt,messages:[{role:"user",content:[{type:"text",text:userText}],timestamp:Date.now()}]},
-						{apiKey:auth.apiKey,headers:auth.headers,maxTokens,signal:requestSignal,maxRetries:0,...(typeof temperature==="number"&&Number.isFinite(temperature)&&temperature>=0&&temperature<=2?{temperature}:{}),...(reasoning !== undefined ? {reasoning} : {})},observation);
+					const callModel = forceNonStreaming ? { ...model, compat: { ...((model.compat as Record<string, unknown> | undefined) ?? {}), streaming: false } } : model;
+					const source = this.#observedStream(callModel, {systemPrompt,messages:[{role:"user",content:[{type:"text",text:userText}],timestamp:Date.now()}]},
+						{apiKey:auth.apiKey,headers:auth.headers,...(useProviderDefaultMaxTokens ? {useProviderDefaultMaxTokens:true} : {maxTokens}),signal:requestSignal,timeoutMs,maxRetries:0,allowEmptyText,rejectTruncatedText:true,...(typeof temperature==="number"&&Number.isFinite(temperature)&&temperature>=0&&temperature<=2?{temperature}:{}),...(reasoning !== undefined ? {reasoning} : {})},observation);
 					let final: AssistantMsgLike | null = null;
 					for await (const e of streamWithTimeout(source,timeoutMs,requestSignal)) {
 						if (e.type === "done") final=e.message??null;
 						else if (e.type === "error") throw new Error(e.error?.errorMessage || "供应商请求失败");
 					}
-					if (requestSignal.aborted) throw new Error(signal?.aborted ? "本拍已取消" : `步骤${step}超时(${timeoutMs}ms)`);
+					if (requestSignal.aborted) throw requestAbortError(requestSignal, "本拍已取消");
 					if (!final) throw new Error("流未返回完成消息");
-					if (final.stopReason === "error" || final.stopReason === "aborted") throw new Error(final.errorMessage || `请求${final.stopReason}`);
-                    if((step === "npcParallel" || step === "veridisRewrite") && final.stopReason === "length") throw new Error("辅助模型输出触及上限，截断结果不采用");
+					const responseFailure = allowEmptyText&&final.stopReason==='stop'&&!textOfAssistant(final)?undefined:modelResponseFailure(final, true);
+					if (responseFailure) throw new Error(responseFailure);
 					const text=textOfAssistant(final);
-					if (!text) throw new Error("完成消息无文本，结构化任务未执行成功");
+					if (!text&&!allowEmptyText) throw new Error("完成消息无文本，结构化任务未执行成功");
+					if (isProviderContentRejection(text)) throw new Error(text);
 					attempt.status="success";attempt.durationMs=Date.now()-started;if(index || forceRecovery) attempt.recovered=true;
 					observation?.diagnostics?.push(attempt);
 					if(index || forceRecovery) this.#deps.events?.onActivity?.(`步骤${step}已由${attempt.provider}/${attempt.model}恢复完成，重新执行原任务，未跳过。`);
-					return text;
-				} finally { clearTimeout(timer);requestController.abort(); }
+					return allowEmptyText ? final.content.filter(c => c.type === "text").map(c => c.text ?? "").join("") : text;
+				} finally { deadline.dispose(); }
 			} catch (err) {
 				const raw = err instanceof Error ? err.message : String(err);
 				const clean = auth.apiKey ? raw.split(auth.apiKey).join("[redacted]") : raw;
 				const failure=classifyModelFailure(clean);
-				attempt.status=signal?.aborted ? "cancelled" : "failed";attempt.kind=failure.kind;attempt.reason=failure.reason;attempt.statusCode=failure.statusCode;attempt.durationMs=Date.now()-started;
+				attempt.status=signal?.aborted && !isLocalRequestTimeout(err) ? "cancelled" : "failed";if(isLocalRequestTimeout(err))attempt.origin="local-timeout";if(err instanceof LocalRequestTimeoutError){attempt.origin=err.origin;attempt.timeoutScope=err.scope;attempt.timeoutMs=err.timeoutMs;}attempt.kind=failure.kind;attempt.reason=failure.reason;attempt.statusCode=failure.statusCode;attempt.durationMs=Date.now()-started;
 				observation?.diagnostics?.push(attempt);last=`${attempt.provider}/${attempt.model} [${failure.kind}${failure.statusCode ? ":"+failure.statusCode : ""}] ${failure.reason}`;
-				this.#deps.events?.onActivity?.(`步骤${step}失败：${last}${index+1<models.length&&!signal?.aborted ? "；诊断后使用已配置恢复模型重做同任务。" : "；没有隐藏为成功。"}`);
+				let visibleFailure = true;
+    if(strictStepModel){try{observation?.guard?.();}catch{visibleFailure=false;}}
+    if(visibleFailure) this.#deps.events?.onActivity?.(`步骤${step}失败：${last}${failure.kind === "content-filter" ? "；供应商安全拒绝，不切换恢复模型重试。" : index+1<models.length&&!signal?.aborted ? "；诊断后使用已配置恢复模型重做同任务。" : "；没有隐藏为成功。"}`);
+				if (failure.kind === "content-filter") { last = failure.reason; break; }
 				if(signal?.aborted || isConfirmedContextOverflow(err)) break;
+				// Settlement owns its domain retries; other side stages own a fresh local group.
+				if(!observation?.phase.startsWith('settlement.')&&settlementFailureRetryable(last)&&localRetries<3){
+				 localRetries++;
+				 this.#deps.events?.onActivity?.(`步骤${step}独立重试 ${localRetries}/3`);
+				 if(signal)await settlementRetry.wait(signal);else await settlementRetry.wait(new AbortController().signal);
+				 index--;continue;
+				}
+				localRetries=0;
 				// Authentication fails for the provider, not one model id. Same-provider retry cannot fix an expired key.
 				if(failure.kind==="auth" && models[index+1]?.provider === model.provider) break;
 			}

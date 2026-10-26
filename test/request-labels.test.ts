@@ -15,6 +15,9 @@ test("请求展示覆盖全部现行阶段及历史短名，不丢未知协议�
 	assert.match(phasePurpose("agent.evidence"), /三份报告/);
 	assert.match(phasePurpose("agent.review"), /两份审阅报告/);
 	assert.match(phasePurpose("settlement.worldProposal"), /不等于已发生事实/);
+	assert.match(phasePurpose("database.before"), /合并文学导演/);
+	assert.match(phasePurpose("prep.director"), /不另发独立导演请求/);
+	assert.match(phasePurpose("settlement.memory"), /零框架调用不表示没有请求/);
 });
 
 test("状态、消息角色、结束原因与用量单位只做展示翻译", () => {

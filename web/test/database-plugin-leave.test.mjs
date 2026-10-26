@@ -31,12 +31,15 @@ test('database adapter waits for flush and retains a rejected save', async () =>
 test('database manager save-before-leave and source guards in desktop/mobile browsers', { timeout: 120_000 }, async t => {
  const work = await mkdtemp(join(tmpdir(), 'liyuan-database-leave-'));
  let browser, server;
- const state = { source: 'source-A', metadata: {}, outcome: 'success', hold: null, writes: [], commits: [], loads: [], revision: 0 };
+ const state = { source: 'source-A', metadata: {}, outcome: 'success', hold: null, writes: [], commits: [], loads: [], revision: 0, bindingFails: false };
  const errors = [], forbidden = [];
  const binding = () => ({ scopeKey: 'synthetic-scope', sourceEntryId: state.source, sha256: 'synthetic-host-source', streaming: false });
  const context = () => ({ ...binding(), revision: state.revision, scope: { sessionId: 'synthetic-session' }, chat: [], chatMetadata: state.metadata, extensionSettings: {}, worldbooks: { Fixture: { entries: [] } }, primaryBook: 'Fixture', character: { name: 'Synthetic' }, userName: 'Fixture' });
  const syntheticUpstream = `
 window.syntheticFlushCalls=0;
+// Match the pinned upstream CHAT_CHANGED hydration task that the real host joins.
+const context=window.SillyTavern.getContext();
+context.eventSource.on(context.eventTypes.CHAT_CHANGED,()=>{setTimeout(()=>{},1200);});
 const originalFlush=window.LiyuanDatabasePluginHost.flush;
 window.LiyuanDatabasePluginHost.flush=function(){window.syntheticFlushCalls++;return originalFlush.call(this);};
 window.AutoCardUpdaterAPI={triggerUpdate:async()=>({success:true}),refreshDataAndWorldbook:async()=>{},exportTableAsJson:()=>({})};
@@ -62,7 +65,7 @@ window.__closes=0;createRoot(document.getElementById('root')).render(<Fixture/>)
     if (url.pathname === '/database-plugin-host.html') { state.loads.push(url.searchParams.get('sourceEntryId')); res.writeHead(200, { 'content-type': 'text/html' }); return res.end(hostHtml); }
     if (url.pathname === '/database-plugin-host.js') { res.writeHead(200, { 'content-type': 'text/javascript' }); return res.end(hostScript); }
     if (url.pathname === '/api/database-plugin/status') return json(200, { sourceReady: true, config: { enabled: true } });
-    if (url.pathname === '/api/database-plugin/binding') return json(200, binding());
+    if (url.pathname === '/api/database-plugin/binding') return state.bindingFails ? json(503, { error: 'synthetic binding unavailable' }) : json(200, binding());
     if (url.pathname === '/api/database-plugin/context') return json(200, context());
     if (url.pathname === '/api/database-plugin/vendor/jquery.min.js') { res.writeHead(200, { 'content-type': 'text/javascript' }); return res.end('/* Synthetic empty dependency: the host itself never calls jQuery. */'); }
     if (url.pathname === '/api/database-plugin/source/index.js') { res.writeHead(200, { 'content-type': 'text/javascript' }); return res.end(syntheticUpstream); }
@@ -87,8 +90,8 @@ window.__closes=0;createRoot(document.getElementById('root')).render(<Fixture/>)
   t.signal.addEventListener('abort', () => { state.hold?.release(); void browser?.close(); server.closeAllConnections(); }, { once: true });
   const waitWrite = async () => { for (let i = 0; !state.writes.length && i < 100; i++) await pause(10); assert.equal(state.writes.length, 1); };
   for (const width of [1280, 390]) {
-   for (const scenario of ['close', 'escape', 'reload', 'failure', 'timeout-late', 'timeout-discard', 'source-poll', 'source-context', 'readonly-failure', 'sync-contract']) await t.test(`${width}px ${scenario}`, async () => {
-    state.source = 'source-A'; state.metadata = { retained: { value: 'old' }, removed: { value: 'stale' } }; state.revision = 0;
+    for (const scenario of ['close', 'escape', 'reload', 'failure', 'timeout-late', 'timeout-discard', 'source-poll', 'source-context', 'readonly-failure', 'sync-contract', 'binding-outage', 'busy-idle-draft']) await t.test(`${width}px ${scenario}`, async () => {
+     state.source = 'source-A'; state.metadata = { retained: { value: 'old' }, removed: { value: 'stale' } }; state.revision = 0; state.bindingFails = false;
     state.outcome = ['failure', 'readonly-failure'].includes(scenario) ? 'failure' : 'success';
     state.hold = scenario === 'sync-contract' ? null : gate(); state.writes = []; state.commits = []; state.loads = [];
     const held = state.hold;
@@ -110,8 +113,33 @@ window.__closes=0;createRoot(document.getElementById('root')).render(<Fixture/>)
      const iframe = page.locator('iframe[title="原数据库插件管理台"]');
      await page.waitForFunction(() => { const frame = document.querySelector('iframe'); return frame?.contentWindow?.LiyuanDatabasePluginHost?.ready() && !document.querySelector('.database-manager__state'); });
      await page.evaluate(() => { window.initialDatabaseFrame = document.querySelector('iframe'); });
-     const frame = await (await iframe.elementHandle()).contentFrame();
-     const box = await manager.boundingBox(); assert.ok(box.x >= 0 && box.x + box.width <= width + 1);
+      const frame = await (await iframe.elementHandle()).contentFrame();
+      assert.equal(await frame.evaluate(() => window.syntheticFlushCalls), 1, 'host joins hydration and flushes before readiness');
+      await frame.evaluate(() => { window.syntheticFlushCalls = 0; });
+      const box = await manager.boundingBox(); assert.ok(box.x >= 0 && box.x + box.width <= width + 1);
+      if (scenario === 'binding-outage' || scenario === 'busy-idle-draft') {
+       await frame.locator('#synthetic-edit').fill('draft survives status checks');
+       if (scenario === 'binding-outage') {
+        state.bindingFails = true;
+        await page.evaluate(() => window.__pollBinding());
+        await page.getByRole('alert').filter({ hasText: 'synthetic binding unavailable' }).waitFor();
+        assert.equal(await iframe.evaluate(element => element.inert), true);
+        assert.equal(await page.evaluate(() => document.querySelector('iframe') === window.initialDatabaseFrame), true);
+        assert.equal(await frame.locator('#synthetic-edit').inputValue(), 'draft survives status checks');
+        state.bindingFails = false;
+        await page.getByRole('button', { name: '重新核对分支', exact: true }).click();
+        await page.getByRole('alert').filter({ hasText: 'synthetic binding unavailable' }).waitFor({ state: 'detached' });
+       } else {
+        await page.evaluate(() => window.__busy(true));
+        await page.waitForFunction(() => document.querySelector('iframe')?.inert === true);
+        await page.evaluate(() => window.__busy(false));
+       }
+       await page.waitForFunction(() => document.querySelector('iframe')?.inert === false);
+       assert.equal(await page.evaluate(() => document.querySelector('iframe') === window.initialDatabaseFrame), true, 'same binding must retain the editing realm');
+       assert.equal(await frame.locator('#synthetic-edit').inputValue(), 'draft survives status checks');
+       assert.equal(state.loads.length, 1, 'status-only changes must not reload upstream');
+       return;
+      }
      if (scenario === 'sync-contract') {
       await frame.evaluate(() => { window.savedMetadata = window.SillyTavern.getContext().chatMetadata; });
       state.metadata = { retained: { value: 'current' } };

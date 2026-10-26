@@ -2,12 +2,14 @@ import type { ModelInfo, ModelRef, ModelsResponse } from "../api.ts";
 
 const keyOf = (model: ModelRef): string => `${encodeURIComponent(model.provider)}:${encodeURIComponent(model.id)}`;
 
-export function ModelPlugSelector({ label, value, models, onChange, inheritLabel = "继承总插头", disabled = false }: {
+export function ModelPlugSelector({ label, value, models, onChange, inheritLabel = "继承总插头", showInheritedModel = true, inputId, disabled = false }: {
 	label: string;
 	value: ModelRef | null;
 	models: ModelsResponse | null;
 	onChange: (value: ModelRef | null) => void;
 	inheritLabel?: string;
+	showInheritedModel?: boolean;
+	inputId?: string;
 	disabled?: boolean;
 }) {
 	const current = models?.current;
@@ -20,7 +22,7 @@ export function ModelPlugSelector({ label, value, models, onChange, inheritLabel
 		groups.set(model.providerName, items);
 	}
 	const missing = models !== null && value && !available.some((model) => model.provider === value.provider && model.id === value.id);
-	const id = `model-plug-${label.replace(/\W+/g, "-")}`;
+	const id = inputId ?? `model-plug-${label.replace(/\W+/g, "-")}`;
 	return (
 		<div className="field-group">
 			<label className="field-label" htmlFor={id}>{label}</label>
@@ -29,7 +31,7 @@ export function ModelPlugSelector({ label, value, models, onChange, inheritLabel
 				const model = available.find((item) => keyOf(item) === event.target.value);
 				if (model) onChange({ provider: model.provider, id: model.id });
 			}}>
-				<option value="">{inheritLabel}{current ? `（${current.name || current.id}）` : ""}</option>
+				<option value="">{inheritLabel}{current && showInheritedModel ? `（${current.name || current.id}）` : ""}</option>
 				{missing && <option value={selectedKey}>已失效：{value.provider}/{value.id}</option>}
 				{[...groups].map(([providerName, items]) => (
 					<optgroup key={providerName} label={providerName}>

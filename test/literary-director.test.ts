@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+	buildDatabaseLiteraryDirectorPrompt,
+	parseDatabaseLiteraryDirection,
 	buildLiteraryDirectorPrompt,
 	formatLiteraryDirection,
 	parseLiteraryDirection,
@@ -51,4 +53,22 @@ test("文学导演：解析脏围栏并轻量兼容旧主动性字段", () => {
 	const parsed = parseLiteraryDirection("前言```json\n{\"characterInitiative\":[\"守住门口\"],\"withheldInformation\":[\"真名\"]}\n```尾注");
 	assert.equal(parsed?.characterInitiatives?.[0]?.motive, "守住门口");
 	assert.deepEqual(parsed?.withheldInformation, ["真名"]);
+});
+
+
+test("数据库合并导演：沿用完整资料与Skill，原召回标签之外交付同一导演候选", () => {
+ const input = { state: defaultState(), history: [{role: "user" as const, text: "核对账目"}], activatedLore: [], userText: "核对账目", charName: "云澜", userName: "沈舟", outline: { selectedDailyPlot: { id: "synthetic-choice" } }, ecology: "已有生态" };
+ const merged = buildDatabaseLiteraryDirectorPrompt(input, "PRIVATE_SKILL_SENTINEL");
+ assert.equal(merged.userText, buildLiteraryDirectorPrompt(input).userText);
+ assert.match(merged.systemPrompt, /记忆召回与文学导演合并/);
+ assert.match(merged.systemPrompt, /liyuan_literary_direction/);
+ assert.match(merged.systemPrompt, /AM选择/);
+ assert.match(merged.systemPrompt, /PRIVATE_SKILL_SENTINEL/);
+ assert.doesNotMatch(merged.systemPrompt, /严格只返回 JSON/);
+ assert.deepEqual(parseDatabaseLiteraryDirection('{"scenePressure":"","candidateBeats":[]}'), {version:1});
+ assert.equal(parseDatabaseLiteraryDirection('{}'), undefined);
+ assert.equal(parseDatabaseLiteraryDirection('{"scenePressure":42}'), undefined);
+ assert.equal(parseDatabaseLiteraryDirection('{"unknown":"ignored"}'), undefined);
+ assert.equal(parseDatabaseLiteraryDirection('{"candidateBeats":[42]}'), undefined);
+ assert.equal(parseDatabaseLiteraryDirection('{"characterInitiatives":[{"motive":42}]}'), undefined);
 });

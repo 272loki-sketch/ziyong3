@@ -1,5 +1,25 @@
 import { abortable } from "../src/async-abort.ts";
 import type { AssistantMsgLike, StageStreamEvent } from "../src/stage/engine.ts";
+import { explicitProviderFailure } from "../src/stage/model-failure.ts";
+
+export function readAssistantText(message: AssistantMsgLike | null): string {
+	if (!message) return "";
+	const raw = message as unknown as Record<string, unknown>;
+	if (typeof raw.text === "string") return raw.text.trim();
+	if (typeof raw.content === "string") return raw.content.trim();
+	if (!Array.isArray(raw.content)) return "";
+	return raw.content.map((part: unknown) => {
+		if (typeof part === "string") return part;
+		if (!part || typeof part !== "object") return "";
+		const item = part as Record<string, unknown>;
+		if (item.type !== undefined) return item.type === "text" && typeof item.text === "string" ? item.text : "";
+		// Older untyped responses used text, content or value for plain text.
+		if (typeof item.text === "string") return item.text;
+		if (typeof item.content === "string") return item.content;
+		if (typeof item.value === "string") return item.value;
+		return "";
+	}).join("").trim();
+}
 
 export type SideModelDelta = { kind: "text"; delta: string } | { kind: "error"; text: string };
 /** SDK text_delta is not the browser's wire delta protocol. Never forward thinking or tool text. */
@@ -25,5 +45,7 @@ export async function collectSideModelResult(
 	options?.signal?.throwIfAborted();
 	if (!final) throw new Error("流未产出最终消息");
 	if (final.stopReason === "error" || final.stopReason === "aborted") throw new Error(final.errorMessage || `stopReason=${final.stopReason}`);
+	const failure = explicitProviderFailure(readAssistantText(final));
+	if (failure) throw new Error(failure);
 	return final;
 }

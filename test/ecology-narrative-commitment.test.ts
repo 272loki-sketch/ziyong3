@@ -52,6 +52,16 @@ test("重复引文需明确精确区间，不能从两个角色的相同表述�
 	assert.equal(anchored.occurrences[0].userRole, "committed");
 });
 
+test("正文提取和本轮生成的秘密观察分开校验，来源分类随快照保留", () => {
+ const base=defaultLiteraryEcologyState();
+ const state=normalizeLiteraryEcologyState({actors:[{id:'observer',name:'观察者',knowledgeLedger:[{id:'k',subjectRef:'secret:inventory',summary:'库存短缺',certainty:'confirmed',route:'witnessed',sourceRef:'occurrence:check',evidence:'在仓库清点货架'}]}],secrets:[{id:'inventory',subject:'库存',truth:'库存短缺',knownBy:['observer']}],occurrences:[{id:'check',name:'场外清点',origin:'generated-offscreen',participants:['observer'],status:'resolved',time:'本拍清晨',location:'仓库'},{id:'canonical',name:'收信',origin:'narrative',narrativeEvidence:{sourceEntryId:trust.entryId,quote:'沈舟把信收好'}}]},base)!;
+ assert.deepEqual(validateEcologyTransition(base,state,[],{trustedNarrative:trust}),[]);
+ const restored=normalizeLiteraryEcologyState(JSON.parse(JSON.stringify(state)),base)!;
+ assert.equal(restored.occurrences[0].origin,'generated-offscreen');assert.deepEqual(restored.occurrences[1].narrativeEvidence,state.occurrences[1].narrativeEvidence);
+ const missing=structuredClone(state);missing.actors[0].knowledgeLedger![0].sourceRef='occurrence:missing';
+ assert.match(validateEcologyTransition(base,missing,[],{trustedNarrative:trust}).join(';'),/不存在的获知事件/);
+});
+
 test("生态提示材料只在 aftermath 暴露宿主保存的正文 id，候选 narrativeText 不受信", () => {
 	const input = { ecology: defaultLiteraryEcologyState(), global: emptyEcologyGlobalPool(), cardPool: emptyEcologyCardPool("card", "name"), state: defaultState(), history: [], userText: "继续", narrativeText: "候选稿" };
 	for (const phase of ["arrival", "aftermath"] as const) {

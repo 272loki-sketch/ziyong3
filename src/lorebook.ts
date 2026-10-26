@@ -12,8 +12,8 @@ import type { LorebookEntry } from "./types.ts";
 
 /**
  * 条目内容指纹：用户级启停（config.disabledLore）的持久键。
- * 不用 uid——卡内嵌书与独立世界书合并后 uid 可能冲突，内容才是稳定身份
- * （与 mergeEntries 的去重语义一致）。
+ * 仅用于旧 disabledLore 兼容与管理 CAS；不是合并条目的身份。
+ * 同正文的不同书/原始行必须独立保留。
  */
 export function loreFingerprint(content: string): string {
 	return createHash("md5").update(content.trim()).digest("hex").slice(0, 12);
@@ -533,24 +533,23 @@ export function appendOverlayEntry(path: string, input: OverlayEntryInput): Lore
 	return normalizeEntries([raw])[0];
 }
 
-/** 合并多来源条目，按 content 去重（卡内嵌书与独立世界书常常内容相同） */
+/** 合并只去除重复的来源书/行或同一对象引用，不按正文/启停去重。 */
 export function mergeEntries(...sources: LorebookEntry[][]): LorebookEntry[] {
-	const seen = new Set<string>();
+	const seen = new Set<string>(), objects = new Set<LorebookEntry>();
 	const merged: LorebookEntry[] = [];
-	for (const source of sources) {
-		for (const entry of source) {
-			const fingerprint = entry.content.trim();
-			if (!fingerprint || seen.has(fingerprint)) continue;
-			seen.add(fingerprint);
-			merged.push(entry);
-		}
+	for (const source of sources) for (const entry of source) {
+		const identity = entry.bookId && entry.entryKey !== undefined ? JSON.stringify([entry.bookId, entry.entryKey]) : undefined;
+		if (objects.has(entry) || (identity !== undefined && seen.has(identity))) continue;
+		objects.add(entry);
+		if (identity !== undefined) seen.add(identity);
+		merged.push(entry);
 	}
 	return merged;
 }
 
 /** 常驻条目（constant && enabled），按 order 排序 */
 export function constantEntries(entries: LorebookEntry[]): LorebookEntry[] {
-	return entries.filter((e) => e.enabled && e.constant).sort((a, b) => a.order - b.order);
+	return entries.filter((e) => e.enabled && e.constant && e.content.trim()).sort((a, b) => a.order - b.order);
 }
 
 /** 合并检索别名（scribe 生成的中文别名等）到条目关键词，去重、不修改原数组 */

@@ -312,7 +312,7 @@ export function assemble(entries: AssemblyEntry[], opts: AssembleOptions = {}): 
 				source: "marker",
 				id: e.identifier,
 				name: e.name,
-				role: "system",
+				role: e.role,
 				text,
 			});
 			continue;

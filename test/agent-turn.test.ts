@@ -10,7 +10,7 @@ function stream(responses: any[], contexts: any[]) {
 		contexts.push(context);
 		const response = responses.shift();
 		if (!response) throw new Error("unexpected model request");
-		const message = { role: "assistant", content: response.calls ? response.calls.map((call: any, index: number) => ({ type: "toolCall", id: `call-${index}`, name: call.name, arguments: call.args ?? {} })) : [{ type: "text", text: response.text ?? "" }], stopReason: response.stopReason ?? (response.aborted ? "aborted" : response.error ? "error" : response.calls ? "toolUse" : "stop"), ...(response.error ? { errorMessage: response.error } : {}) };
+		const message = { role: "assistant", content: [...(!response.calls || response.text !== undefined ? [{ type: "text", text: response.terminalText ?? response.text ?? "" }] : []), ...(response.calls ? response.calls.map((call: any, index: number) => ({ type: "toolCall", id: `call-${index}`, name: call.name, arguments: call.args ?? {} })) : [])], stopReason: response.stopReason ?? (response.aborted ? "aborted" : response.error ? "error" : response.calls ? "toolUse" : "stop"), ...(response.error ? { errorMessage: response.error } : {}) };
 		return { async *[Symbol.asyncIterator]() { if (response.text) yield { type: "text_delta", delta: response.text }; response.beforeEnd?.(); if (response.throw) throw new Error(response.throw); yield response.error ? { type: "error", error: message } : { type: "done", message }; }, async result() { return message; } } as never;
 	};
 }
@@ -29,6 +29,43 @@ test("单Agent正文直出不经过稿纸工具，不施加转场/长段词语�
 	const f = fixture([{ text }], "direct");const out = await runAgentTurn(f.options);
 	assert.equal(out.narrative, text);assert.equal(out.aborted, false);assert.equal(f.contexts.length, 1);assert.equal(f.expertCalls.length, 0);assert.equal(f.displayed.join(""), text);
 	assert.equal(f.contexts[0].tools, undefined);
+});
+
+for (const toolsSupported of [true, false]) {
+	for (const terminalText of ["  Complete terminal output.\n\n", "Corrected output.\n", ""]) test(`terminal text replaces streamed deltas, tools=${toolsSupported}, terminal=${JSON.stringify(terminalText)}`, async () => {
+		const f = fixture([{ text: "Streamed prefix.", terminalText }], "direct");
+		f.options.toolsSupported = toolsSupported;
+		const out = await runAgentTurn(f.options);
+		assert.equal(out.authorDraft, terminalText);
+		assert.equal(out.narrative, terminalText);
+		assert.deepEqual(f.revised, [terminalText]);
+		assert.equal(out.aborted, !terminalText);
+		if (terminalText) assert.equal(out.final?.content.find(x => x.type === "text")?.text, terminalText);
+	});
+	for (const stop of ["error", "aborted", "cancel", "scope", "throw"] as const) test(`failed or cancelled terminal preserves streamed partial, tools=${toolsSupported}, stop=${stop}`, async () => {
+		const controller = new AbortController(); let current = true;
+		const raw = "  Streamed partial.\n\n";
+		const f = fixture([{ text: raw, terminalText: "Must not replace partial.",
+			...(stop === "error" ? { error: "Request failed" } : stop === "aborted" ? { aborted: true } : stop === "throw" ? { throw: "Connection lost" } : {}),
+			beforeEnd: () => { if (stop === "cancel") controller.abort(); if (stop === "scope") current = false; } }], "direct");
+		Object.assign(f.options, { toolsSupported, signal: controller.signal, isCurrent: () => current });
+		const out = await runAgentTurn(f.options);
+		assert.equal(out.aborted, true);
+		assert.equal(out.authorDraft, raw);
+		assert.equal(out.final?.content.find(x => x.type === "text")?.text, raw);
+		assert.deepEqual(f.revised, []);
+		assert.equal(f.contexts.length, 1);
+	});
+}
+
+test("terminal reconciliation keeps prior tool-round text and exact concatenation whitespace", async () => {
+	const prefix = "  First paragraph.\n\n", tail = "  Second paragraph.\n\n";
+	const f = fixture([{ text: prefix, calls: [{ name: "read_source" }] }, { text: "Incomplete tail", terminalText: tail }], "direct");
+	f.options.readTools = [{ name: "read_source", description: "read", parameters: { type: "object" } }];
+	const out = await runAgentTurn(f.options);
+	assert.equal(out.aborted, false, out.error);
+	assert.equal(out.authorDraft, prefix + tail);
+	assert.deepEqual(f.revised, [prefix + tail]);
 });
 
 test("导演固定3/2/2专家阶段，只有main普通文本成为正文，不强制修订", async () => {
@@ -157,8 +194,8 @@ test("new recovery diagnostics whitelist scalar budget/validation data and never
 });
 
 for (const mode of ["direct", "director"] as const) for (const toolsSupported of [true, false]) {
-	for (const raw of ["<unlisted-before>合成附属格式</unlisted-before>\n<content>合成正文。</content>\n<unlisted-after>{\"delta\":1}</unlisted-after>", "只有合成正文。"])
-		test(`${mode}/${toolsSupported ? "native" : "fallback"}：统一交付合同保留未知格式，缺格式不门禁或增加调用（${raw.startsWith("<") ? "完整" : "缺格式"}）`, async () => {
+	for (const raw of ["  \n<unlisted-before>合成附属格式</unlisted-before>\n<content>合成正文。</content>\n<unlisted-after>{\"delta\":1}</unlisted-after>\n\n  ", "只有合成正文。"])
+		test(`${mode}/${toolsSupported ? "native" : "fallback"}：统一交付合同保留未知格式，缺格式不门禁或增加调用（${raw.trim().startsWith("<") ? "完整" : "缺格式"}）`, async () => {
 			const responses = mode === "direct" ? [{ text: raw }] : toolsSupported
 				? [consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, { text: raw }, consult("review"), { calls: [{ name: "finalize" }] }]
 				: [{ text: JSON.stringify({ tasks: [{ role: "idea-a", task: "观察对话" }, { role: "idea-b", task: "观察事务" }] }) }, { text: raw }, { text: '{"decision":"keep"}' }];
@@ -185,50 +222,72 @@ for (const mode of ["direct", "director"] as const) for (const toolsSupported of
 			assert.deepEqual(messages, originalMessages);
 			for (const context of f.contexts) {
 				assert.ok(context.systemPrompt.startsWith(systemPrompt + "\n\n【作者交付合同】"));
-				assert.match(context.systemPrompt, /普通文本是输出载体，不是仅交纯正文/);
+				assert.match(context.systemPrompt, /正文及原已返回内容原样先交付/);
 				assert.match(context.systemPrompt, /当前启用的原始角色卡、预设和世界书/);
 				assert.match(context.systemPrompt, /标签、顺序和位置由原材料决定/);
-				assert.match(context.systemPrompt, /不等待拍后检查或补交/);
-				assert.doesNotMatch(context.systemPrompt.slice(systemPrompt.length), /options|MVU|UpdateVariable|JSONPatch/);
+				assert.match(context.systemPrompt, /缺失附属格式由独立后台补充/);
+				assert.doesNotMatch(context.systemPrompt.slice(systemPrompt.length), /options|UpdateVariable|JSONPatch/);
 				assert.deepEqual(context.messages.filter((m: unknown) => messages.includes(m as typeof messages[number])), originalMessages);
 			}
 			if (mode === "director" && toolsSupported) {
-				for (const name of ["begin_narrative", "begin_revision"]) assert.match(f.contexts[0].tools.find((t: any) => t.name === name).description, /完整正文及.*适用附属格式/);
-				assert.match(JSON.stringify(f.contexts[3].messages), /下一轮普通文本一次交付完整正文及/);
-			} else if (!toolsSupported) assert.match(JSON.stringify(f.contexts[mode === "direct" ? 0 : 1].messages), /本轮一次交付完整正文及/);
+				for (const name of ["begin_narrative", "begin_revision"]) assert.match(f.contexts[0].tools.find((t: any) => t.name === name).description, /后台独立补充/);
+				assert.match(JSON.stringify(f.contexts[3].messages), /缺失附属格式由后台独立补充/);
+			} else if (!toolsSupported) assert.match(JSON.stringify(f.contexts[mode === "direct" ? 0 : 1].messages), /缺失附属格式由后台独立补充/);
 		});
 }
 
 test("导演完整修订沿用交付合同及原格式，不新增拍后格式调用", async () => {
-	const raw = "<unknown-card-format>合成格式</unknown-card-format>修订正文。";
+	const raw = "  \n<unknown-card-format>合成格式</unknown-card-format>修订正文。\n\n  ";
 	const f = fixture([consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, { text: "初稿。" }, consult("review"), { calls: [{ name: "begin_revision" }] }, { text: raw }, { calls: [{ name: "finalize" }] }]);
 	const out = await runAgentTurn(f.options);
 	assert.equal(out.aborted, false, out.error);
 	assert.equal(out.authorDraft, raw);
 	assert.equal(f.contexts.length, 8);
 	assert.match(f.contexts[6].systemPrompt, /【作者交付合同】/);
-	assert.match(JSON.stringify(f.contexts[6].messages), /修订通道已开启。下一轮普通文本一次交付完整正文及/);
+	assert.match(JSON.stringify(f.contexts[6].messages), /修订通道已开启。下一轮普通文本交付完整替换稿/);
+});
+
+test("revision tool-round boundaries preserve raw whitespace and replace the old draft", async () => {
+	const prefix = "  Revised first paragraph.\n\n", tail = "  Revised last paragraph.\n\n";
+	const f = fixture([consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, { text: "Old draft." }, consult("review"),
+		{ calls: [{ name: "begin_revision" }] }, { text: prefix, calls: [{ name: "get_draft" }] }, { text: tail }, { calls: [{ name: "finalize" }] }]);
+	const out = await runAgentTurn(f.options);
+	assert.equal(out.aborted, false, out.error);
+	assert.equal(out.authorDraft, prefix + tail);
+	assert.equal(out.final?.content.find(x => x.type === "text")?.text, prefix + tail);
+	assert.deepEqual(f.revised, [prefix + tail]);
+});
+
+test("length terminal reconciles raw text before same-author suffix recovery", async () => {
+	const raw = "  <content>Terminal partial.\n  ", suffix = "Ending.</content>\n\n";
+	const f = fixture([{ text: "Streamed partial.", terminalText: raw, stopReason: "length" }, { text: JSON.stringify({ suffix }) }], "direct");
+	f.options.outputRecoveryPrompt = "Return suffix JSON";
+	const out = await runAgentTurn(f.options);
+	assert.equal(out.aborted, false, out.error);
+	assert.equal(out.authorDraft, raw + suffix);
+	assert.deepEqual(f.revised, [raw, raw + suffix]);
+	assert.equal(out.workflow.recovery?.reason, "provider-length");
 });
 
 test("两份内置作者 Skill 与请求交付合同语义一致", async () => {
 	for (const name of ["主演文本直出", "导演主Agent"]) {
 		const skill = await readFile(new URL(`../skills/${name}/SKILL.md`, import.meta.url), "utf8");
-		assert.match(skill, /普通文本是输出载体，不是仅交纯正文/);
 		assert.match(skill, /当前启用的原始角色卡、预设和世界书/);
-		assert.match(skill, /本轮一次交付完整正文及适用附属格式/);
+		assert.match(skill, /缺失附属格式由独立后台补充/);
 		assert.match(skill, /标签、顺序和位置由原材料决定，不另设格式名单/);
-		assert.match(skill, /不等待拍后检查或补交格式/);
+		assert.match(skill, /不作为正文完成门槛/);
 	}
 });
 
 for (const mode of ["direct", "director"] as const) for (const toolsSupported of [true, false]) {
- for (const includeTail of [true, false]) test(`${mode}/${toolsSupported ? "native" : "fallback"}: stop inside second image recovers original suffix, optional tail=${includeTail}`, async () => {
+  for (const includeTail of [true, false]) test(`${mode}/${toolsSupported ? "native" : "fallback"}: length inside second image recovers original suffix, optional tail=${includeTail}`, async () => {
   const raw = '<content>他们吃完饭。</content>\n<image>first</image>\n<image>second';
   const suffix = ' complete</image>' + (includeTail ? '\n<options>散步</options>\n<UpdateVariable>{"delta":1}</UpdateVariable>' : '');
   const repair = { text: JSON.stringify({ suffix }) };
-  const responses = mode === "direct" ? [{ text: raw }, repair] : toolsSupported
-   ? [consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, { text: raw }, repair, consult("review"), { calls: [{ name: "finalize" }] }]
-   : [{ text: JSON.stringify({ tasks: [{ role: "idea-a", task: "观察对话" }, { role: "idea-b", task: "观察事务" }] }) }, { text: raw }, repair, { text: '{"decision":"keep"}' }];
+   const partial = { text: raw, stopReason: "length" };
+   const responses = mode === "direct" ? [partial, repair] : toolsSupported
+    ? [consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, partial, repair, consult("review"), { calls: [{ name: "finalize" }] }]
+    : [{ text: JSON.stringify({ tasks: [{ role: "idea-a", task: "观察对话" }, { role: "idea-b", task: "观察事务" }] }) }, partial, repair, { text: '{"decision":"keep"}' }];
   const calls = responses.length;
   const f = fixture(responses, mode);
   const { extractPureTextNarrative } = await import("../src/stage/engine.ts");
@@ -241,7 +300,7 @@ for (const mode of ["direct", "director"] as const) for (const toolsSupported of
   assert.doesNotMatch(out.narrative, /options|UpdateVariable|delta/);
   assert.equal(out.final?.content.find(x => x.type === "text")?.text, raw + suffix);
   assert.equal(f.contexts.length, calls);
-  assert.equal(out.workflow.recovery?.reason, "unclosed-container");
+   assert.equal(out.workflow.recovery?.reason, "provider-length");
   assert.equal(out.workflow.recovery?.status, "success");
   const recoveryRound = out.workflow.writerCalls!.find(c => c.phase === "recovery")!.round;
   const recoveryContext = f.contexts[recoveryRound - 1];
@@ -256,7 +315,7 @@ for (const mode of ["direct", "director"] as const) for (const toolsSupported of
 }
 
 for (const mode of ["direct", "director"] as const) for (const toolsSupported of [true, false]) test(`${mode}/${toolsSupported}: suffix still hanging rejects false completion before review`, async () => {
- const raw = '<content>饭已吃完。</content>\n<unknown-author-container>尚未交完';
+  const raw = '<content>饭已吃完。\n<unknown-author-container>尚未交完';
  const repair = { text: JSON.stringify({ suffix: '，仍未闭合' }) };
  const responses = mode === "direct" ? [{ text: raw }, repair] : toolsSupported
   ? [consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, { text: raw }, repair]
@@ -295,19 +354,75 @@ test("container boundary ignores HTML void/optional endings, self-closing and Ma
 });
 
 for (const mode of ["direct", "director"] as const) for (const toolsSupported of [true, false]) {
- for (const parentClosed of [true, false]) test(`${mode}/${toolsSupported}: synthetic 12-op patch missing child close only recovers an EOF-open parent=${!parentClosed}`, async () => {
+ for (const tail of ['<options>\n1. Synthetic choice.\n2. Another choice.', '<unseen-sidecar>Partial delivery with an unmatched “quote']) {
+  test(`${mode}: EOF-open supplementary suffix preserves original without story recovery, tools=${toolsSupported}, tail=${tail.split(">", 1)[0]}`, async () => {
+   const raw = '<content>Completed synthetic paragraph.</content>\n' + tail;
+   assert.equal(authorDraftHasUnclosedContainer(raw), true);
+   const responses = mode === "direct" ? [{ text: raw }] : toolsSupported
+    ? [consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }, { text: raw }, consult("review"), { calls: [{ name: "finalize" }] }]
+    : [{ text: JSON.stringify({ tasks: [{ role: "idea-a", task: "Observe dialogue" }, { role: "idea-b", task: "Observe surroundings" }] }) }, { text: raw }, { text: '{"decision":"keep"}' }];
+   const calls = responses.length;
+   const f = fixture(responses, mode);
+   const { extractPureTextNarrative } = await import("../src/stage/engine.ts");
+   Object.assign(f.options, { toolsSupported, normalizeNarrative: extractPureTextNarrative, outputRecoveryPrompt: "Return suffix JSON" });
+  const out = await runAgentTurn(f.options);
+   assert.equal(out.aborted, false, out.error);
+   assert.equal(out.authorDraft, raw);
+   assert.equal(out.narrative, "Completed synthetic paragraph.");
+   assert.equal(out.workflow.recovery, undefined);
+   assert.equal(f.contexts.length, calls);
+   assert.equal(out.final?.content.find(x => x.type === "text")?.text, raw);
+   if (mode === "director") {
+    assert.deepEqual(f.expertCalls.map(c => [c.phase, c.tasks.length]), [["evidence", 3], ["ideas", 2], ["review", 2]]);
+    assert.equal(f.expertCalls[2].draft, raw);
+   }
+  });
+ }
+}
+for (const toolsSupported of [true, false]) {
+ for (const recovery of [true, false]) for (const refusal of [
+  '[ProxySystem Error] Request blocked due to safety settings. Finish Reason: PROHIBITED_CONTENT',
+  '[ProxySystem Error] PROHIBITED_CONTENT; transport timeout',
+  '{"error":{"message":"Synthetic refusal","code":"SAFETY"}}',
+ ]) test(`explicit stop-text refusal ends author request without receipt retry, tools=${toolsSupported}, recovery=${recovery}, json=${refusal.startsWith("{")}`, async () => {
+  const raw = '<content>Completed synthetic paragraph.</content>\n<options>\n1. Synthetic choice.';
+  const f = fixture([...(recovery ? [{ text: raw }] : []), { text: refusal, stopReason: "stop" }], "direct");
+  Object.assign(f.options, { toolsSupported, outputRecoveryPrompt: "Return suffix JSON" });
+  const out = await runAgentTurn(f.options);
+  assert.equal(out.aborted, true);
+  assert.equal(out.error, refusal);
+  assert.equal(out.authorDraft, recovery ? raw : "");
+  assert.equal(f.contexts.length, recovery ? 2 : 1);
+  assert.equal(out.workflow.stages.some(s => s.stage === "finalize"), false);
+  if (recovery) {
+   assert.equal(out.workflow.recovery?.attempts, 1);
+   assert.equal(out.workflow.recovery?.invalidReceipts, 0);
+   assert.equal(out.workflow.recovery?.status, "failed");
+  }
+ });
+}
+
+test("quoted refusal examples remain ordinary author text", async () => {
+ const raw = 'Synthetic example: `[ProxySystem Error] PROHIBITED_CONTENT`.\n```json\n{"error":{"message":"Example","code":"SAFETY"}}\n```';
+ const f = fixture([{ text: raw }], "direct");
+ const out = await runAgentTurn(f.options);
+ assert.equal(out.aborted, false, out.error);
+ assert.equal(out.authorDraft, raw);
+ assert.equal(f.contexts.length, 1);
+});
+
+for (const mode of ["direct", "director"] as const) for (const toolsSupported of [true, false]) {
+  for (const parentClosed of [true, false]) test(`${mode}/${toolsSupported}: supplementary patch with closed parent=${parentClosed} never gates complete story`, async () => {
   const patch = Array.from({ length: 12 }, (_, i) => ({ op: "replace", path: `/synthetic/${i}`, value: i }));
   const raw = '<content>合成正文已完成。</content>\n<options>合成选项</options>\n<UpdateVariable><Analysis>合成分析已完成。</Analysis><JSONPatch>\n'
    + JSON.stringify(patch) + (parentClosed ? '\n</UpdateVariable>' : '');
   assert.equal(JSON.parse(raw.slice(raw.indexOf('<JSONPatch>') + '<JSONPatch>'.length).split('</UpdateVariable>')[0]).length, 12);
   assert.equal(authorDraftHasUnclosedContainer(raw), !parentClosed);
-  const suffix = '\n</JSONPatch></UpdateVariable>';
   const responses = [
    ...(mode === "direct" ? [] : toolsSupported
     ? [consult("evidence"), consult("ideas"), { calls: [{ name: "begin_narrative" }] }]
     : [{ text: JSON.stringify({ tasks: [{ role: "idea-a", task: "观察对话" }, { role: "idea-b", task: "观察事务" }] }) }]),
    { text: raw },
-   ...(parentClosed ? [] : [{ text: JSON.stringify({ suffix }) }]),
    ...(mode === "direct" ? [] : toolsSupported ? [consult("review"), { calls: [{ name: "finalize" }] }] : [{ text: '{"decision":"keep"}' }]),
   ];
   const calls = responses.length;
@@ -315,7 +430,7 @@ for (const mode of ["direct", "director"] as const) for (const toolsSupported of
   const { extractPureTextNarrative } = await import("../src/stage/engine.ts");
   Object.assign(f.options, { toolsSupported, normalizeNarrative: extractPureTextNarrative, outputRecoveryPrompt: "只返回suffix JSON" });
   const out = await runAgentTurn(f.options);
-  const expected = raw + (parentClosed ? '' : suffix);
+   const expected = raw;
   assert.equal(out.aborted, false, out.error);
   assert.equal(out.error, undefined);
   assert.equal(out.authorDraft, expected);
@@ -323,12 +438,10 @@ for (const mode of ["direct", "director"] as const) for (const toolsSupported of
   assert.equal(out.final?.content.find(x => x.type === "text")?.text, expected);
   assert.equal(out.narrative, extractPureTextNarrative(expected));
   assert.equal(f.contexts.length, calls);
-  assert.equal(out.workflow.writerCalls?.filter(c => c.phase === "recovery").length, parentClosed ? 0 : 1);
-  if (parentClosed) {
+   assert.equal(out.workflow.writerCalls?.filter(c => c.phase === "recovery").length, 0);
    assert.equal(out.workflow.recovery, undefined);
    assert.deepEqual(f.revised, []);
    assert.equal(f.displayed.join(""), raw);
-  } else assert.equal(out.workflow.recovery?.status, "success");
   if (mode === "director") {
    assert.deepEqual(f.expertCalls.map(c => [c.phase, c.tasks.length]), [["evidence", 3], ["ideas", 2], ["review", 2]]);
    assert.equal(f.expertCalls[2].draft, expected);
@@ -376,16 +489,35 @@ for (const mode of ["direct", "director"] as const) for (const toolsSupported of
   assert.equal(out.workflow.stages.some(s => s.stage === "finalize" || s.stage === "review"), false);
   assert.equal(f.contexts.length, setup().length + 3);
  });
- test(`${mode}/${toolsSupported}: zero-text timeout retries fresh stream only once`, async () => {
-  const f = fixture([...setup(), { error: "Queue timeout" }, { text: "完整正文。" }, ...finish()], mode);
+  for (const retries of [1, 2, 3]) test(`${mode}/${toolsSupported}: zero-text timeout stops after success on retry ${retries}`, async () => {
+   const f = fixture([...setup(), ...Array.from({ length: retries }, () => ({ error: "Queue timeout" })), { text: "完整正文。" }, ...finish()], mode);
   Object.assign(f.options, { toolsSupported, outputRecoveryPrompt: "只返回suffix JSON" });
   const out = await runAgentTurn(f.options);
-  assert.equal(out.aborted, false, out.error); assert.equal(out.authorDraft, "完整正文。"); assert.equal(out.workflow.recovery, undefined);
-  const failed = fixture([...setup(), { throw: "transport timeout" }, { error: "Stream timeout" }], mode);
+   assert.equal(out.aborted, false, out.error); assert.equal(out.authorDraft, "完整正文。"); assert.equal(out.workflow.recovery, undefined);
+   assert.equal(f.contexts.length, setup().length + retries + 1 + finish().length);
+  });
+  test(`${mode}/${toolsSupported}: zero-text timeout allows four failing calls and a fresh next run`, async () => {
+   const responses = [...setup(), { throw: "transport timeout" }, { error: "Stream timeout" }, { error: "Queue timeout" }, { error: "transport timed out" }];
+   const failed = fixture(responses, mode);
   Object.assign(failed.options, { toolsSupported, outputRecoveryPrompt: "只返回suffix JSON" });
   const result = await runAgentTurn(failed.options);
-  assert.equal(result.aborted, true); assert.equal(failed.contexts.length, setup().length + 2);
- });
+   assert.equal(result.aborted, true); assert.equal(failed.contexts.length, setup().length + 4);
+   assert.equal(result.error, "transport timed out"); assert.equal(result.authorDraft, "");
+   responses.push(...setup(), ...Array.from({ length: 3 }, () => ({ error: "Queue timeout" })), { text: "Fresh run." }, ...finish());
+   const next = await runAgentTurn(failed.options);
+   assert.equal(next.aborted, false, next.error); assert.equal(next.authorDraft, "Fresh run.");
+   assert.equal(failed.contexts.length, 2 * (setup().length + 4) + finish().length);
+  });
+  test(`${mode}/${toolsSupported}: partial on last transport retry uses suffix recovery, never replay`, async () => {
+   const raw = "<content>Partial.", suffix = " Ending.</content>";
+   const f = fixture([...setup(), ...Array.from({ length: 3 }, () => ({ error: "Queue timeout" })),
+    { text: raw, error: "Stream timeout" }, { text: JSON.stringify({ suffix }) }, ...finish()], mode);
+   Object.assign(f.options, { toolsSupported, outputRecoveryPrompt: "Return suffix JSON" });
+   const out = await runAgentTurn(f.options);
+   assert.equal(out.aborted, false, out.error); assert.equal(out.authorDraft, raw + suffix);
+   assert.equal(out.workflow.recovery?.attempts, 1); assert.equal(f.contexts.length, setup().length + 5 + finish().length);
+   assert.equal(f.displayed.join(""), raw); assert.deepEqual(f.revised, [raw + suffix]);
+  });
  for (const stop of ["cancel", "scope", "auth", "cap", "context", "aborted"]) test(`${mode}/${toolsSupported}: ${stop} never transport-retries`, async () => {
   const controller = new AbortController(); let current = true;
   const errors:Record<string,string> = { auth: "401 auth: Stream timeout", cap: "model capability: Queue timeout", context: "context length limit: Stream timeout" };
@@ -396,6 +528,16 @@ for (const mode of ["direct", "director"] as const) for (const toolsSupported of
   assert.equal(out.workflow.stages.some(s => s.stage === "finalize" || s.stage === "review"), false);
  });
 }
+
+test("separate writing invocations each receive three retries within the same turn", async () => {
+ const failures = () => Array.from({ length: 3 }, () => ({ error: "Queue timeout" }));
+ const f = fixture([...failures(), { calls: [{ name: "read_source" }] }, ...failures(), { text: "Complete draft." }], "direct");
+ f.options.readTools = [{ name: "read_source", description: "read", parameters: { type: "object" } }];
+ const out = await runAgentTurn(f.options);
+ assert.equal(out.aborted, false, out.error); assert.equal(out.authorDraft, "Complete draft.");
+ assert.equal(f.contexts.length, 8); assert.equal(out.workflow.writerRounds, 8);
+ assert.equal(out.workflow.recovery, undefined);
+});
 
 test("unclosed draft without recovery protocol rejects bare continuation", async () => {
  const f = fixture([{ text: '<content>半稿' }], "direct");

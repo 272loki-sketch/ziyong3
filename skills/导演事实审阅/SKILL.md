@@ -4,7 +4,7 @@ description: 默认信任创作补充，只报告可核对的硬矛盾和知情�
 workflow: director-review-facts
 license: AGPL-3.0-only
 upstream-author: Luker Team
-attribution: docs/PROMPT-SOURCES.md
+attribution: docs/materials.md
 resident: false
 每轮: false
 ---

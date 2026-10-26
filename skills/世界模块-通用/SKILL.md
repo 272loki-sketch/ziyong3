@@ -6,4 +6,4 @@ resident: false
 每轮: false
 ---
 
-严格遵守画像中 stateFocus 和 writerProjection，只维护该卡明确需要的持续系统。若无法证明它值得独立运行，保持稳定，不得把未知系统硬映射为势力、经济、敌人或灾难。
+按画像里的 stateFocus 和 writerProjection，维护这张卡需要的持续系统，写出这段时间里它自然产生的变化。实在不适合独立推进就保持稳定，不要硬套成势力、经济或灾难。

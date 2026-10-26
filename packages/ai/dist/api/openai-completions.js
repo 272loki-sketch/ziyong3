@@ -7,6 +7,7 @@ import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { getProviderEnvValue } from "../utils/provider-env.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { observeFetch } from "../utils/observe-fetch.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -103,7 +104,8 @@ export const stream = (model, context, options) => {
             const compat = getCompat(model);
             const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
             const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-            const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, compat);
+            const transport = options?.onTransport ? observeFetch(options.onTransport) : undefined;
+            const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, compat, transport?.fetch);
             let params = buildParams(model, context, options, compat, cacheRetention);
             const nextParams = await options?.onPayload?.(params, model);
             if (nextParams !== undefined) {
@@ -248,9 +250,15 @@ export const stream = (model, context, options) => {
                 applyPendingReasoningDetail(block);
                 return block;
             };
+            let effective = false;
             for await (const chunk of chunkSource) {
                 if (!chunk || typeof chunk !== "object")
                     continue;
+                const delta = chunk.choices?.[0]?.delta;
+                if (!effective && delta && (["content", "reasoning_content", "reasoning", "reasoning_text"].some(key => typeof delta[key] === "string" && delta[key].length > 0) || Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0 || delta.function_call)) {
+                    effective = true;
+                    transport?.effective();
+                }
                 // OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
                 // and each chunk in a streamed completion carries the same id.
                 output.responseId ||= chunk.id;
@@ -431,7 +439,7 @@ export const streamSimple = (model, context, options) => {
         toolChoice,
     });
 };
-function createClient(model, context, apiKey, optionsHeaders, sessionId, compat = getCompat(model)) {
+function createClient(model, context, apiKey, optionsHeaders, sessionId, compat = getCompat(model), customFetch) {
     const headers = { ...model.headers };
     if (model.provider === "github-copilot") {
         const hasImages = hasCopilotVisionInput(context.messages);
@@ -455,6 +463,7 @@ function createClient(model, context, apiKey, optionsHeaders, sessionId, compat 
         baseURL: model.baseUrl,
         dangerouslyAllowBrowser: true,
         defaultHeaders: headers,
+        fetch: customFetch,
     });
 }
 function buildParams(model, context, options, compat = getCompat(model), cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env)) {

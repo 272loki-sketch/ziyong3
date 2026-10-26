@@ -28,6 +28,7 @@ services:
       - liyuan-uploads:/app/.liyuan-uploads
       - liyuan-media:/app/.liyuan-media
       - liyuan-audio:/app/.liyuan-audio
+      - liyuan-fish-tts:/app/.liyuan-fish-tts
       - liyuan-artifacts:/app/.liyuan-artifacts
       - liyuan-codex:/app/.liyuan-codex
       - liyuan-lore:/app/.liyuan-lore
@@ -57,6 +58,7 @@ volumes:
   liyuan-uploads:
   liyuan-media:
   liyuan-audio:
+  liyuan-fish-tts:
   liyuan-artifacts:
   liyuan-codex:
   liyuan-lore:

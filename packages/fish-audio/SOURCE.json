@@ -1,0 +1,22 @@
+{
+  "license": "MIT",
+  "copyright": "2026 severian-dev",
+  "files": [
+    {
+      "path": "upstream/lib.js",
+      "repository": "https://github.com/severian-dev/st-fish-audio",
+      "commit": "ccc2641c9adf651b23f4bfd85b96286427cfbe74",
+      "upstreamPath": "lib.js",
+      "sha256": "27d17f151033525a6fcef5f20a36cb84b419d8a74f178c72c6c18d171b8d573a",
+      "modified": false
+    },
+    {
+      "path": "upstream/validate.js",
+      "repository": "https://github.com/severian-dev/st-fish-audio-plugin",
+      "commit": "2cec82f2c83d201a0f8d872fd9540ade18047877",
+      "upstreamPath": "lib/validate.js",
+      "sha256": "c6b468971a6db1dbe1fdfc55b3901fd331395bf87971d88f790551860b79f432",
+      "modified": false
+    }
+  ]
+}

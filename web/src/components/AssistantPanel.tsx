@@ -1,3 +1,4 @@
+import { workspaceStorageKey } from "../workspace.ts";
 /**
  * 助手面板（右栏）：与剧情会话并行的独立助手对话（2026-07-14 职责拆分）。
  *
@@ -165,7 +166,8 @@ export function AssistantPanel({
 	onDeleteSession,
 	onPickModel,
 }: AssistantPanelProps) {
-	const [input, setInput] = useState("");
+	const [input, setInput] = useState(()=>{try{return sessionStorage.getItem(workspaceStorageKey("assistant-draft"))??"";}catch{return "";}});
+ useEffect(()=>{try{sessionStorage.setItem(workspaceStorageKey("assistant-draft"),input);}catch{}},[input]);
 	const modelData = usePanelData(() => apiGet<ModelsResponse>("/api/models/catalog"), { cacheKey: "/api/models/catalog", watchModels: true });
 	const models = modelData.data;
 	const [histOpen, setHistOpen] = useState(false);

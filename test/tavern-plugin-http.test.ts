@@ -225,13 +225,13 @@ test("internal token without the current turn nonce and signal cannot call the m
  assert.equal((await f.post("/api/tavern-plugins/generate", prompt(), headers)).status, 409); assert.equal(f.calls, 0);
 }));
 
-test("more than 256 sources cannot evict the first source's eight-call allowance", () => fixture(async f => {
+test("more than 256 sources retain the first source's cumulative accounting without a quota", () => fixture(async f => {
  await f.enable(); const first = f.live.sourceEntryId;
  assert.equal((await f.post("/api/tavern-plugins/generate", prompt(), f.bindingHeaders())).status, 200);
  for (let n = 0; n < 256; n++) { f.live.sourceEntryId = "synthetic-budget-" + n; f.live.visibleEntryIds = [f.live.sourceEntryId]; assert.equal((await f.post("/api/tavern-plugins/generate", prompt(), f.bindingHeaders())).status, 200); }
  f.live.sourceEntryId = first; f.live.visibleEntryIds = [first];
  for (let n = 0; n < 7; n++) assert.equal((await f.post("/api/tavern-plugins/generate", prompt(), f.bindingHeaders())).status, 200);
- assert.equal((await f.post("/api/tavern-plugins/generate", prompt(), f.bindingHeaders())).status, 400); assert.equal(f.calls, 264);
+ assert.equal((await f.post("/api/tavern-plugins/generate", prompt(), f.bindingHeaders())).status, 200); assert.equal(f.calls, 265);assert.equal(f.http.store.modelRequestUsage(f.live).used,9);
  assert.equal(f.http.store.read(f.live).revision, 0);
 }));
 
@@ -253,12 +253,12 @@ function mvuFixture(f:Fixture){
  f.http.turnSignal=new AbortController().signal;f.http.internalPhase="after";
  return {payload:{...prompt(),model:"gemini-3.8-flash",reverse_proxy:"https://synthetic-parser.invalid/v1",chat_completion_source:"custom",stream:false,max_tokens:4096},headers:{...f.bindingHeaders(),"x-liyuan-tavern-host":f.http.internalToken,"x-liyuan-tavern-turn":f.http.turnNonce}};
 }
-test("HTTP custom MVU dispatch uses shared generator and exact 3.8 model; persisted allowance caps paid sends",()=>fixture(async f=>{
+test("HTTP custom MVU dispatch uses shared generator and exact 3.8 model; persisted accounting permits further paid sends after eight",()=>fixture(async f=>{
  await f.enable();const {payload,headers}=mvuFixture(f),model={provider:"new",id:"gemini-3.8-flash",baseUrl:payload.reverse_proxy,maxTokens:8192};let authCalls=0;
  const generate=createTavernPluginGenerator({models:()=>[model],mvuRef:()=>({provider:"new",id:model.id}),writer:()=>{throw Error("must not fallback writer");},auth:async selected=>{authCalls++;assert.equal(selected.id,model.id);return {ok:true,apiKey:"synthetic-only"};},stream:(selected,_context,options,binding)=>{assert.equal(selected.id,model.id);assert.equal(binding.purpose,"mvu.parse");assert.equal(binding.sourceEntryId,"story");assert.equal(options.maxTokens,4096);f.calls++;return {async *[Symbol.asyncIterator](){yield {type:"done"};},async result(){return {stopReason:"stop",content:[{type:"text",text:"synthetic patch"}]};}};}});
  f.http.host.generateManagesBudget=true;f.http.host.generate=(messages,signal,options)=>generate(messages,signal,options!);
  for(let n=0;n<8;n++)assert.equal((await f.post("/api/tavern-plugins/generate",payload,headers)).status,200);
- assert.equal((await f.post("/api/tavern-plugins/generate",payload,headers)).status,400);assert.equal(f.calls,8);assert.equal(authCalls,9);
+ assert.equal((await f.post("/api/tavern-plugins/generate",payload,headers)).status,200);assert.equal(f.calls,9);assert.equal(authCalls,9);
 }));
 test("body purpose or custom payload cannot forge trusted after/current MVU settings",()=>fixture(async f=>{
  await f.enable();const {payload,headers}=mvuFixture(f);
@@ -272,4 +272,14 @@ for(const reason of ["scope","cancel","settings"] as const)test(`HTTP auth await
  const generate=createTavernPluginGenerator({models:()=>[model],mvuRef:()=>({provider:"new",id:model.id}),writer:()=>undefined,auth:async()=>{await Promise.resolve();if(reason==="scope")f.live.sourceEntryId="foreign";if(reason==="cancel")f.http.turnSignal=new AbortController().signal;if(reason==="settings"){const saved=f.http.store.read(f.live);(saved.state.extensionSettings.mvu_settings as any).更新方式="随正文输出";f.http.store.save(f.live,saved.revision,saved.state,()=>{});}return {ok:true};},stream:()=>{f.calls++;throw Error("must not bill");}});
  f.http.host.generateManagesBudget=true;f.http.host.generate=(messages,signal,options)=>generate(messages,signal,options!);
  assert.ok((await f.post("/api/tavern-plugins/generate",payload,headers)).status>=400);assert.equal(f.calls,0);
+}));
+
+test("native extension lookup exposes only pinned metadata, not credentials or an unverified latest claim", () => fixture(async f => {
+ await f.enable();
+ const result = await f.post("/api/tavern-plugins/legacy/extensions/version", {extensionName:"JS-Slash-Runner",global:false}, f.bindingHeaders());
+ assert.equal(result.status,200);assert.match(result.data.currentCommitHash,/^[a-f0-9]{40}$/);assert.equal(result.data.remoteUrl,"https://github.com/N0VI028/JS-Slash-Runner.git");assert.equal("isUpToDate" in result.data,false,"installation alone is not an update check");
+ assert.equal(result.text.includes(PRIVATE_KEY),false);assert.equal(f.calls,0);assert.equal(f.http.store.read(f.live).revision,0);
+ for(const name of ["../helper","untrusted-extension","ST-Prompt-Template"]){const denied=await f.post("/api/tavern-plugins/legacy/extensions/version",{extensionName:name},f.bindingHeaders());assert.notEqual(denied.status,200);}
+ assert.equal((await f.post("/api/tavern-plugins/legacy/extensions/version",{extensionName:"JS-Slash-Runner"},{})).status,409);
+ const stale=await f.streamBody("/api/tavern-plugins/legacy/extensions/version",{extensionName:"JS-Slash-Runner"},()=>{f.live.sourceEntryId="other-source";});assert.equal(stale.status,409);assert.equal(f.calls,0);
 }));

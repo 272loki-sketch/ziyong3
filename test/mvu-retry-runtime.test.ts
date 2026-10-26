@@ -24,8 +24,8 @@ test('MVU retry owns a transient signal/nonce and after phase only inside its qu
  }
  internals.ensure=async()=>({evaluate:async()=>{throw Error('synthetic native failure');}});
   await assert.rejects(()=>runtime.recoverMvu(),/synthetic native failure/);assert.equal(signal,undefined);assert.equal(http.internalPhase,undefined);
-  internals.ensure=async()=>({evaluate:async()=>{throw Error('page.evaluate: Error: MVU candidate requests failed: 原脚本本来源的合成/辅助模型请求已达8次预算\n    at privateRuntime:16');}});
-  await assert.rejects(()=>runtime.recoverMvu(),error=>error instanceof Error&&error.message.includes('8/8')&&!error.message.includes('page.evaluate')&&!error.message.includes('privateRuntime'));
+  internals.ensure=async()=>({evaluate:async()=>{throw Error('page.evaluate: Error: MVU candidate requests failed: insufficient_quota: provider credits exhausted\n    at privateRuntime:16');}});
+  await assert.rejects(()=>runtime.recoverMvu(),error=>error instanceof Error&&error.message.includes('insufficient_quota')&&!error.message.includes('page.evaluate')&&!error.message.includes('privateRuntime'));
 });
 test('full-budget completed current MVU reuses before starting a realm; ancestor repair does not invalidate',async()=>{
  const head:any={scopeKey:'scope',sourceEntryId:'reply',chat:[{__liyuanEntryId:'ancestor',variables:{level:1}},{__liyuanEntryId:'reply',is_user:false,__liyuanAuthorDelivery:'Synthetic completed story'}],readonlyBooks:{rules:{entries:[{content:'Synthetic rule'}]}}};

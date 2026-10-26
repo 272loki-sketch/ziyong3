@@ -144,9 +144,9 @@ test('local records are omitted before any source read while approved public gui
     rmSync(join(source, path));
     mkdirSync(join(source, path));
   }
-  const guides = ['docs/PROJECT-STRUCTURE.md', 'docs/PRIVACY-AND-PUBLISHING.md',
-    'docs/DOCUMENTATION-INDEX.md', 'docs/ARCHITECTURE-OVERVIEW.md',
-    'docs/GENERATION-MODES.md', 'docs/PLAN-ROUND-FLOW.md'];
+  const guides = ['docs/shipping.md', 'docs/decisions.md',
+    'docs/diagnostics.md', 'docs/architecture.md',
+    'docs/models.md', 'docs/planning.md'];
   for (const path of guides) put(path);
   const lines: string[] = [];
   const result = prepare({ report: (line: string) => lines.push(line) });

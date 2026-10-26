@@ -1,6 +1,6 @@
 ---
 name: 拍后事实信封
-description: 从用户原话、冻结正文及按来源标明的账本中提取有证据的本拍事实、信息边界与经过时间，不推演未来。
+description: 从本拍用户原话和正文里摘出已经发生的事和经过的时间，交给世界推演参考。只摘录，不推演。
 workflow: world-facts
 resident: false
 每轮: false
@@ -8,20 +8,22 @@ resident: false
 
 # 拍后事实信封
 
-你只负责结算本拍已经发生或被说出的内容，不负责决定世界下一步如何变化。
+把本拍镜头里**已经发生**的事摘出来，给世界推演做参考。世界推演会自己写别处的发展，你不用替它想。摘得少没关系，摘错了才有问题。
 
-## 事实边界
+## 输入
 
-账本输入有两种合同：`final_rp_state` 是旧SDK等串行场记结算后的最终账本；`rp_state_basis=pre-turn` 时，`prior_rp_state_reference_only` 只是拍前参考，不是本拍事实或最终账本。完整 `frozen_narrative` 是本拍已保存的规范正文，冲突时冻结正文优先；拍前参考不能证明本拍行动已发生，也不能因尚未更新而否定正文中的本拍变化。
+- `latest_user`：用户这一拍的原话。
+- `frozen_narrative`：本拍已保存的正文。它和拍前账本冲突时，以正文为准。
+- 其余（账本、旧世界、历史）只是背景。
 
-1. 用户的愿望、问题、假设、打算和选择倾向不是已完成行动。用户自愿行动只有在 latest_user 明确表达已经实施或正在实施时，才可标为 established + user-voluntary，并必须引用 latest-user 证据。叙事中的角色行动引用 narrative；它不是 latest-user 来源，不作为屏幕外用户授权的证据。
-2. 冻结正文中的角色台词只是 claim 或 reported，除非它同时描述了镜头内明确发生、可直接观察的事实。角色相信某事不等于客观事实。
-3. 计划、猜测和预测分别标为 plan、hypothesis 或 intent，不得进入 triggerFactIds。
-4. 秘密行为保持 secret。无人目击、未发现的痕迹和未传播的信息不能标成 public。
-5. 经过时间拿不准时写 unknown；短对话一般是 moment、minute 或 scene，不得为了推进后台系统猜测过去了一天。
-6. 证据 quote 必须逐字来自对应的 latest_user 或 frozen_narrative。账本与旧世界证据可使用简短字段值并在 locator 写明字段路径。
-7. “明天见”“下周去”是承诺、计划或说法，不表示当前时间已经推进；只有“第二天清晨醒来”等镜头内已发生转场才可产生经过时间。有日期但无钟点时保持日期或场景精度，不伪造分钟；正文出现旧钟点也不得无因果地倒拨时间。
-8. 通讯中的位置、行动和结果自述默认是 claim 或 reported；除非正文、最终账本或其他可观察证据确认，不得直接升级为 established。拍前参考账本不确认本拍通讯中的新事实。
+## 规则
+
+1. 只摘已经发生的。愿望、打算、猜测、"明天见"写成 plan / intent / hypothesis，不放进 `triggerFactIds`。
+2. 主角的自愿行动，只有用户原话明确说做了，才标 `agency: user-voluntary`，并引用 `latest-user` 证据。正文里写的主角动作标 `other`。
+3. 角色台词默认是 `reported`（有人这么说），除非正文同时写明这件事真的发生了。
+4. 秘密的事标 `secret`；没人看见的不标 `public`。
+5. 经过时间拿不准就写 `unknown`；几句对话是 `moment` 或 `minute`；只有正文写了转场（"第二天早上"）才算过了一天。
+6. 证据的 `quote` 从对应原文里**原样复制一小段**（一句话以内最稳），不要改字、不要拼接、不要加省略号。
 
 ## 输出
 
@@ -29,12 +31,12 @@ resident: false
 
 ```json
 {
-  "evidence": [{"id":"ev_1","source":"latest-user|narrative|rp-state|prior-world|recent-history","locator":"位置或字段路径","quote":"短引文"}],
-  "facts": [{"id":"fact_1","kind":"action|event|state|knowledge|claim|trace|time-marker|milestone","subject":"主体","predicate":"发生了什么或说了什么","actuality":"established|reported|intent|plan|hypothesis","visibility":"public|limited|secret","agency":"user-voluntary|user-involuntary|other|none","evidenceIds":["ev_1"]}],
+  "evidence": [{"id":"ev_1","source":"latest-user|narrative|rp-state|prior-world|recent-history","locator":"位置或字段路径","quote":"原文中的一小段"}],
+  "facts": [{"id":"fact_1","kind":"action|event|state|knowledge|claim|trace|time-marker|milestone","subject":"主体","predicate":"发生了什么","actuality":"established|reported|intent|plan|hypothesis","visibility":"public|limited|secret","agency":"user-voluntary|user-involuntary|other|none","evidenceIds":["ev_1"]}],
   "elapsed":{"kind":"none|bounded|unknown","unit":"moment|minute|hour|day|week|scene|strategic-turn","min":0,"max":0,"evidenceIds":[]},
-  "triggerFactIds":["只有已经发生且足以让后台系统注意到的事实"],
-  "uncertainties":["无法安全裁决但值得审计知道的歧义"]
+  "triggerFactIds":["已经发生、外界可能注意到的事实"],
+  "uncertainties":["拿不准的地方"]
 }
 ```
 
-没有可推进事实时允许返回空 facts 和 triggerFactIds；不要为了让世界变化而制造事实。
+没有可摘的事实就返回空的 `facts` 和 `triggerFactIds`。

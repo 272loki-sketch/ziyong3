@@ -1,62 +1,85 @@
-# 部署与运维指南
+# 运维
 
-本文是长期操作合同，不保存实际地址、账号、凭据、私人配置、部署日记或验收数字。版本以 manifest 为准，运行服务、公开分支与 Release 分别核验；应用和独立代理组件的版本也分别核验。本地验收记录不随公开仓库发布。部署、提交、推送与 Release 分别需要授权，隐私整理不等于部署授权。
+服务器上的部署、回退与日常运维。隐私与推送见 [shipping](../docs/shipping.md)。
 
-## 部署前
+部署是可撤回的：旧 release 目录原样保留，回退只是把服务指回去再重启。所以事前检查从简，靠快速回退兜底；唯一要人确认的是"服务空闲"，因为重启会打断正在进行的生成。
 
-- 阅读[架构](../docs/ARCHITECTURE-OVERVIEW.md)、[两模式](../docs/GENERATION-MODES.md)与[执行合同](../docs/PLAN-ROUND-FLOW.md)，不恢复旧 ask、自动画像或稿纸门禁。
-- 核对服务账户、工作目录、启动命令、实际版本、剧情/助手 WS hello，以及正文、助手、消化队列和插件任务；短暂 active 不证明可切换或已空闲。
-- 按用户授权，维护/部署默认不新建手工本地备份或归档。核验 GitHub 恢复仓库 URL、分支/标签解析后的精确 commit，以及匹配的源码、manifest/锁文件、SDK 与前端产物来源和校验和；确认可获取且覆盖本次授权产品目标，不只检查版本号或分支名。需重建的产物先在隔离候选中完成构建与恢复验证，不假定有源码就能恢复旧 dist。
-- GitHub 仅覆盖已推送、核验且获准公开的内容，不覆盖未推送提交、继承 dirty 或连接、卡、预设、身份、私人 Skill、会话、插件状态和记忆。保留这些资料原路径及权限；操作会危及未覆盖内容或恢复源不足时停止，请求专项保留/恢复方案，不自动备份/提交/推送，不 reset 或覆盖他人改动，不把私有资料上传 GitHub。
-- 不删除已有备份，不禁用原子写入 `.bak` 或更新器内部回退。旧更新脚本仍有归档副作用，不代表已符合新流程；使用前须审阅当前脚本行为并另行授权。
-- 明确模型变更范围，以完整启用配置为基底保留渠道、默认模型、其它岗位和未知兼容字段；不因升级统一替换 Flash 岗位，不启用过期渠道，不改私人连接来凑验收。
+## 停机前
 
-## 候选验证
+1. 主窗口接管的卡位先"放回多卡，返回原主窗口"。
+2. 打开"多卡并行"，等各卡位的生成、后台整理、待受理输入结束，**逐个暂停全部卡位**，包括空闲的（应用内更新在仍有运行卡位时会拒绝）。
+3. 确认主窗口没有生成、后台整理、助手、消化队列或插件任务。
 
-在隔离临时目录构建候选，隔离 HOME、Agent 与素材，使用合成会话完成离线和必要浏览器验证。记忆测试写临时库，真实模型测试另行授权且有界；生产核对只读，不重生成故事凑成功。完整后端 typecheck、SDK fork 重编与发行包验收各有门禁，见 [TESTING](../TESTING.md)。
+在界面上看过即可。重启后普通卡位不自动续跑，由用户手动"恢复"；接管归属保留。
 
-涉及 inline system 或深度世界书投送时，同步应用源码、SDK fork 编译产物与候选 dist，不能只更新前端或引擎。不能表达相关消息语义的 provider 应明确失败，不假称投送成功；接口能力按实际连接验证，指南不声明私人 provider 配置。
+## 部署
 
-## 配套切换
+推荐方式：源码工作树（含私人数据）保持原位作为服务 cwd，产品代码从独立的 release 目录运行。systemd drop-in 指定入口和 `LIYUAN_WEB_DIST_DIR`，并用 `BindReadOnlyPaths` 把 release 的 `server/`、`src/`、`web/public/`、`skills/`、`node_modules/@liyuan`、`.liyuan/extensions/roleplay.ts` 只读挂到 cwd 对应路径。私有目录不在 release 里，切换碰不到它们。
 
-再次确认空闲、已核验恢复源与匹配产物有效、未覆盖的 dirty/私有资料不会被覆盖后，才停止服务、切换授权目标并启动。源码、Skill 与静态资源须可由服务账户读取，但私有目录和文件保持 0700/0600，不放宽真实素材或配置权限。模型配置可用现有热刷新时，不为更换一个可选模型重置会话或全部岗位。
+```bash
+# SOURCE=源码仓库  REV=要部署的 commit  OLD=当前 release  NEW=新 release 目录
+# DROPIN=/etc/systemd/system/liyuan.service.d/50-current-release.conf
+cd "$SOURCE" && npm run verify                     # 对 REV 跑一次（加本次相关的浏览器测试）
+mkdir "$NEW" && git -C "$SOURCE" archive "$REV" | tar -x -C "$NEW"
+# 依赖：$NEW/node_modules 与 $NEW/web/node_modules 逐项链接到源码已安装的依赖；
+#       但 $NEW/node_modules/@liyuan/* 要指向 $NEW/packages/ 下本版本的 SDK，不能指回源码
+npm --prefix "$NEW/web" run build -- --outDir "$NEW/web/dist"
+sudo -u liyuan test -r "$NEW/server/main.ts" && sudo -u liyuan test -r "$NEW/web/dist/index.html"
+# —— 确认空闲（见上一节）——
+cp -p "$DROPIN" "$DROPIN.prev"
+sed -i "s#$OLD#$NEW#g" "$DROPIN"
+systemctl daemon-reload && systemctl restart liyuan
+```
 
-`web/public/` 部分 bridge、host、语言和样式由服务动态读取，编辑源码可能影响尚未重启的服务；HTML 由构建 dist 投送，资源白名单和后台路由另有接线。必须配套切换源码、候选 dist 与路由，不手工修 bundle。路由变更须经空闲门禁后重启生效。
+- `git archive` 只取已提交的那个 commit，不在 dirty 工作树上直接部署。推送 GitHub 不是部署的前提。
+- `web/public/` 由服务运行时读取，HTML 来自 dist，SDK 读 `packages/*/dist`；三者在同一个 release 里天然配套，不手改 bundle。
+- release 内源码、Skill、静态资源对服务账户可读；私有目录/文件保持 0700/0600。
 
-酒馆设置页适配还须验证原插件组合、合成面板、白名单、MIME、缓存策略、手机和桌面布局及主题。原 manifest、JS/CSS、模板、语言包与版本不因宿主中文或布局适配而改写；浏览器加载事件不等于插件就绪。不拿生产卡脚本或收费模型试设置页。
+不需要：手工整库备份、私有配置哈希快照、候选文件逐个清单、工具链指纹、写死 PID 的前置断言。`scripts/update-local.sh` 是原地合并上游并重启的旧式更新器，用 release 目录部署时不需要它。
 
-## 部署后
+## 部署后核对
 
-独立核对 health、剧情/助手 hello、HTML、bundle、SW 与动态宿主资源是否对应候选；检查磁盘会话、输入绑定模式、私人素材/Skill、记忆及模型岗位未被无授权修改。当前选中会话的重启体验按产品合同验证，不把个别用户偏好写成维护规则。
+几分钟内做完：
 
-启动可能重序列化设置或追加模型元数据，应分别核验 JSON 语义、原会话前缀字节与追加条目类型；这不允许故事、记忆、Skill 或模型岗位被改写。严格保护项和有界元数据例外在独立本地记录中说明，不以文件数量替代数据保护证据。
+1. `systemctl is-active liyuan`，进程命令行指向新 release。
+2. `curl -fsS http://127.0.0.1:<端口>/healthz` 返回 200；首页引用的 bundle 来自新 dist。
+3. 浏览器打开一次：WS 连上，设置页能打开。
 
-卡内世界书只读核对来源、启用/常驻与停用项，不在生产 PNG 上试写。记忆按当前 scope 和已保存规范正文来源核对，不借其它会话数据冒充入库。线上入口检查保持只读，阻止生产卡脚本执行和写请求；设置交互在隔离合成会话实测，入口可见不证明所有卡兼容。
+任一失败立即回退，再查原因。启动时服务会合法地重写部分设置格式或模型元数据（如 Agent 目录的 `settings.json`、`models.json`），这不是异常。线上核对保持只读，不在生产卡上试写。
+
+## 回退
+
+```bash
+cp -p "$DROPIN.prev" "$DROPIN" && systemctl daemon-reload && systemctl restart liyuan
+```
+
+只回代码/dist。用户新数据保留，不回滚故事、数据库或记忆，私有配置不从 GitHub 恢复。新版稳定一段时间后可删更早的 release，至少保留上一个。
+
+## 访问保护
+
+- 敏感 HTTP/WS 拒绝异源 Origin 和不合规的 Fetch Metadata（同站点不等于同源）；路径先规范化再鉴权；无 Origin 的 CLI 请求仍要过访问密码。
+- **未设访问密码时**只接受 localhost、回环或本机网卡 IP 作为 `Host`（防 DNS 重绑定）。用自定义域名：先从本机/IP 入口设好密码，或设置 `LIYUAN_TRUSTED_HOSTS=a.example,b.example`（不带 URL、凭据、通配符）。
+- 反向代理保留原始 `Host`（含非默认端口）：Nginx 用 `proxy_set_header Host $http_host;`，不要用 `$host`。服务不信任 `X-Forwarded-Host`。非默认 HTTPS 端口上线后实际试一次带 Origin 的 POST 和 WebSocket。
+- 密码凭据文件损坏、不是普通文件或是符号链接时服务拒绝开放，不会退化成无密码。排障时保留文件，查权限和磁盘。
+- 接管后的 API/WS 需要工作区与租约：浏览器自动附加；外部工具从 `/api/play-slots/main` 取值后带 `x-liyuan-workspace` 与 `x-liyuan-workspace-lease`，过期返回 `409 workspace_changed`。
+- 遇到来源或 Host 拒绝，先查浏览器地址、代理转发和信任配置，不要关掉校验或鉴权。
 
 ## 网络与代理
 
-Compose 网络设置是模板，不内置机器网关。`LIYUAN_WEB_RESEARCH_PROXY` 可由部署环境显式提供；空值在当前研究代理解析器中表示不使用代理，不回退 HTTP(S) 环境代理。实际请求还须核验研究网络设置与路由，不能仅凭 Compose 声明保证整台服务的网络行为。数据库和 NPC/Veridis Git 路由各有独立配置，不能混用变量或改共享配置。
+- Compose 里的网络设置只是模板。研究网络用 `LIYUAN_WEB_RESEARCH_PROXY`（空值 = 不用代理）；数据库与助手/模板按各自来源下载，Veridis 的 Git 路由见 `server/plugin-git-network.ts`。外部 CLI 代理镜像固定版本，不用 `latest`。
+- Fish 连接问题先做无 Key 的只读网络检查。`LIYUAN_FISH_AUDIO_NETWORK_MODE=compatible` 只为 Fish 切换固定 DNS 与兼容握手，仍严格校验证书；不要用 `NODE_TLS_REJECT_UNAUTHORIZED=0`。上线后确认 `GET /api/fish-tts/status` 不返回 Key。
 
-外部 CLI 代理镜像须固定版本，不用 latest 覆盖后宣称仍有特定补丁。首增量等待、流中/非流式保活、取消和错误需独立验证；认证与日志卷保持私有。外部现实工具权限与故事选择分开，代理存在不扩展操作授权。
+### 模型代理超时
 
-## 容量与原子保存
+部分供应商在隐藏推理期间不发流式字节，部分前置代理会因首包/空闲超时断开（如 524），见 [models 预算与超时](../docs/models.md#预算与超时)。若实测同一端点同一模型支持 `openai-responses` 且事件能及时穿过代理，可以只为受影响的岗位改用这个协议：在 `liyuan.agent.json` 添加渠道（启动时同步到 Agent 目录 `models.json`），只改对应 `stepModels` 键；先备份私有配置、保持 0600 与属主，空闲时重启生效，回退就恢复备份后重启。Responses 目前没有传输时间线（见 [diagnostics 请求查看器](../docs/diagnostics.md#请求查看器)）。
 
-遇到 `ENOSPC` 分别检查部署文件系统的容量与 inode，并以服务账户的可用空间为准。保留块可能让管理员仍可写而服务账户 `statfs.bavail` 已为零，不能据此认定服务可保存，也不直接降低保留块比例掩盖根因。
+## 磁盘与原子保存
 
-清理前按用途、大小和进程占用清点，只精确处理获准清理的可重建缓存或已结束的隔离测试副本。真实会话、素材、生产记忆与正式回退备份不作为垃圾；临时路径中的运行依赖也可能仍被服务使用，不通配删除、不全局清空备份。避免反复复制整项目及依赖来备份少量配置，保留足够服务可写余量。
+- `ENOSPC`：分别看容量与 inode，以服务账户的可用空间为准。只清确认可重建的缓存或已结束的测试副本；会话、素材、记忆、备份不是垃圾。
+- 配置写入走 `src/atomic-json.ts`：同目录临时文件 → 同步 → 替换，保留一个 `.bak`。中断留下的临时文件可能含私人配置，不要公开或随手删。空间不足返回 507。
 
-配置写入通过 `src/atomic-json.ts`：同目录临时文件避免跨挂载 rename，新文件和备份完整同步后才替换，失败保留有效原文件。自动备份保留一个 `.bak`；中断恢复临时文件可能含私人配置，不能因被忽略就公开或删除。提交与备份回滚都失败时保留唯一恢复快照，不后台盲删。
+## 私有持久数据与锁
 
-原子保存不保证跨文件事务或全部断电场景。空间不足返回 507，不当作普通 400；前端本地模式即使已经用于后续输入，也不能冒称服务器持久化成功，重连以盘上配置为准。
-
-## 持久额度与锁
-
-插件 `model-request-budget.json` 按 session/card/source 保留独立持久辅助额度，每来源最多 8 次；预约后取消或失败不退款，重启不清零，旧内存尝试不可凭空重建。这不等于作者轮次预算。
-
-进程锁按 PID、starttime、boot 与 nonce 核验身份，只在确认 owner 死亡后恢复。活进程、未知身份、损坏锁或 symlink 不盲删；旧空锁的宽限不证明任意暂停 writer 已死亡。
-
-## 发布与回退
-
-回退只恢复本次授权目标源码、dist 或明确授权的配置，保留用户新数据，不删除会话/记忆卷，不回滚故事或数据库，不以旧 HEAD 覆盖继承 dirty。产品回退使用切换前已核验的 GitHub 精确 commit 与匹配产物；私有配置不从 GitHub 恢复。已有受限快照仅在另行确认范围和授权后使用，不借历史部署备份回退无关功能；旧对照实例不擅自启动。安装、启用与 autoUpdate 各自管理，部署不隐式开启。
-
-公开候选、提交与归档按[隐私流程](../docs/PRIVACY-AND-PUBLISHING.md)和[发布流程](../docs/BRANCH-RELEASE-WORKFLOW.md)独立审阅。后续指南修订不等于再次部署、模型端点复验或发布 Release。
+- `.liyuan/play-slots/`（含 `main-window.json`）、`.liyuan-fish-tts/`、插件私有目录都是持久数据，更新不覆盖，损坏时不删文件来"修复"。Docker/Compose 用独立持久卷。
+- 插件请求次数持久记在私有 `model-request-budget.json`，重启不清零。
+- 进程锁按 PID/starttime/boot/nonce 核对身份，只在确认持有者已死亡时回收；活进程、身份未知、损坏或 symlink 的锁不要手动删。

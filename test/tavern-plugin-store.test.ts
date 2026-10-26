@@ -183,3 +183,14 @@ test("terminal backup symlink prevents commit without modifying outside bytes or
 	save(store, binding(), state("first")); save(store, binding(), state("current")); const paths = scopePaths(store), current = readFileSync(paths.index), backup = readFileSync(paths.backup), outside = join(cwd, "outside-backup.json");
 	writeFileSync(outside, backup); unlinkSync(paths.backup); symlinkSync(outside, paths.backup); assert.throws(() => save(store, binding(), state("not committed")), /文件类型或大小/); assert.deepEqual(readFileSync(paths.index), current); assert.deepEqual(readFileSync(outside), backup); assert.equal(store.read(binding()).revision, 2); assert.equal(existsSync(paths.lock), false);
 }));
+
+test('legacy source counts above eight remain usable and are not reset on reopen',()=>{
+ const cwd=mkdtempSync(join(tmpdir(),'liyuan-unlimited-count-'));
+ try{
+  const store=new TavernPluginStore(cwd),scope={sessionId:'synthetic',card:'synthetic',sourceEntryId:'story',visibleEntryIds:['story']};
+  for(let i=0;i<19;i++)assert.equal(store.recordModelRequest(scope,()=>{}).calls,i+1);
+  const reopened=new TavernPluginStore(cwd);assert.deepEqual(reopened.modelRequestUsage(scope),{used:19,unlimited:true});
+  assert.equal(reopened.claimModelRequest(scope,8,()=>{}).calls,20);assert.deepEqual(reopened.modelRequestBudget(scope,8),{limit:null,used:20,remaining:null,unlimited:true});
+  assert.throws(()=>reopened.recordModelRequest(scope,()=>{throw Error('stale source')}),/stale source/);assert.equal(reopened.modelRequestUsage(scope).used,20);
+ }finally{rmSync(cwd,{recursive:true,force:true})}
+});

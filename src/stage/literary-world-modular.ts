@@ -31,6 +31,14 @@ export interface GenericWorldModuleState {
 	revision: number;
 	summary: string;
 	records: WorldModuleRecord[];
+	provenance?: WorldGeneratedProvenance;
+}
+
+export interface WorldGeneratedProvenance {
+	kind: "generated-offscreen";
+	sourceEntryId: string;
+	worldRefs: Array<{ moduleId: string; recordId: string }>;
+	timeEvidenceIds: string[];
 }
 
 export interface WorldKernelLink {
@@ -130,7 +138,11 @@ export function normalizeGenericWorldModule(value: unknown, previous: GenericWor
 		const visibility = ["public", "discoverable", "secret"].includes(String(item.visibility)) ? item.visibility as WorldVisibility : "discoverable";
 		return [{ id, facet, label: clean(item.label, 140) || id, status: clean(item.status, 120), summary: clean(item.summary, 800), visibility, attributes: attributeOf(item.attributes), originRefs: records(item.originRefs).map(refOf).filter((ref): ref is WorldDomainRef => !!ref).slice(0, 16), updatedRound: Math.max(0, Math.round(Number(item.updatedRound) || round)) }];
 	}).slice(0, 80);
-	return { id: expected.id, kind: expected.kind, revision: previous?.revision ?? Math.max(0, Math.round(Number(source.revision) || 0)), summary: clean(source.summary, 1000) || previous?.summary || "", records: rows };
+	const raw = source.provenance as Partial<WorldGeneratedProvenance> | undefined;
+	const provenance: WorldGeneratedProvenance | undefined = raw?.kind === "generated-offscreen" && clean(raw.sourceEntryId, 100)
+		? { kind: "generated-offscreen", sourceEntryId: clean(raw.sourceEntryId, 100), worldRefs: records(raw.worldRefs).map(ref => ({ moduleId: clean(ref.moduleId, 80), recordId: clean(ref.recordId, 100) })).filter(ref => ref.moduleId && ref.recordId).slice(0, 16), timeEvidenceIds: strings(raw.timeEvidenceIds, 12, 80) }
+		: undefined;
+	return { id: expected.id, kind: expected.kind, revision: previous?.revision ?? Math.max(0, Math.round(Number(source.revision) || 0)), summary: clean(source.summary, 1000) || previous?.summary || "", records: rows, ...(provenance ? { provenance } : {}) };
 }
 
 export function defaultModularWorldState(manifest?: WorldSimulationManifest | null): ModularWorldState {

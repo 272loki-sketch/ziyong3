@@ -8,7 +8,7 @@ export function DatabasePluginPanel({toast,onOpenManager}:{onOpenManager:()=>voi
  useEffect(()=>{void refresh();},[]);
  const run=async(fn:()=>Promise<unknown>,message:string)=>{setBusy(true);try{await fn();await refresh();toast("info",message);}catch(e){const text=e instanceof Error?e.message:"操作失败";setError(text);toast("error",text);}finally{setBusy(false);}};
  return <section className="sp-section"><h4>上游数据库插件</h4>
-  <div className="field-hint">原样运行 AlbusKen/shujuku；原记忆库保留，启用后停止旧自动剧情入库与旧摘要压缩。数据库整理沿用记忆岗位，嵌入沿用独立配置；不会统一替换模型。</div>
+  <div className="field-hint">原样运行 AlbusKen/shujuku；原记忆库保留，启用后停止旧自动剧情入库与旧摘要压缩。召回与剧情推进跟随设置中“记忆召回 / 剧情推进 / 文学导演”的模型；拍后填表与嵌入保持独立。</div>
   {error&&<div className="panel-error">{error}</div>}
   {!status?<button className="drawer-btn" onClick={()=>void refresh()}>重新读取</button>:<>
    <div className="toggle-row"><span>使用原数据库插件作为记忆后端</span><Toggle checked={status.config.enabled} onChange={enabled=>{if(!busy)void run(()=>api("/api/database-plugin/config",{method:"POST",body:JSON.stringify({enabled})}),enabled?"原数据库记忆后端已启用":"已回退旧记忆后端，插件数据保留");}}/></div>

@@ -81,6 +81,12 @@ function discussionLines(chats: OutlineChatHistory[] | undefined): ChatLine[] {
 		{ role: "assistant" as const, text: chat.answer, requestId: chat.requestId, createdAt: chat.createdAt, focus: chat.focus, options: textOptions(chat.options), warnings: list(chat.warnings), sceneAdvice: chat.sceneAdvice, dailyPlan: chat.dailyPlan, dailyPlans: chat.dailyPlans },
 	]);
 }
+function draftKey(outline: OutlineViewResponse): string | null {
+	return outline.contextKey ? `liyuan:director-draft:${location.pathname}:${outline.contextKey}:${outline.discussionId ?? "default"}` : null;
+}
+function readDraft(key: string | null): string {
+	try { return key ? sessionStorage.getItem(key) ?? "" : ""; } catch { return ""; }
+}
 function pendingProposals(outline: OutlineViewResponse): OutlineProposalView[] {
 	if (outline.pending?.length) return outline.pending.map(({ entry }) => ({
 		...entry.proposal,
@@ -132,7 +138,7 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 	const [diagnostics, setDiagnostics] = useState<TurnDiagnosticsResponse | null>(null);
 	const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
 	const [diagnosticsError, setDiagnosticsError] = useState("");
-		const [loading, setLoading] = useState(true);
+	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState("");
 	const [action, setAction] = useState("");
 	const [liveText, setLiveText] = useState("");
@@ -140,10 +146,32 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 	const [chatStatus, setChatStatus] = useState("");
 	const [messages, setMessages] = useState<ChatLine[]>([]);
  const [discussionTitle,setDiscussionTitle]=useState("");
- const inputDrafts=useRef<Record<string,string>>({});
- const holdScroll=useRef(false);
- const [threadForm,setThreadForm]=useState<"new"|"rename"|null>(null);
-	const [input, setInput] = useState("");
+  const activeDraft = useRef<string | null>(null);
+  const holdScroll=useRef(false);
+  const [awayFromLatest, setAwayFromLatest] = useState(false);
+  const [hasEarlier, setHasEarlier] = useState(false);
+  const [threadForm,setThreadForm]=useState<"new"|"rename"|null>(null);
+	const [input, setInputState] = useState("");
+	const inputRef = useRef("");
+	const composerRef = useRef<HTMLTextAreaElement>(null);
+	const dialogRef = useRef<HTMLElement>(null);
+	const setInput = (value: string) => {
+		inputRef.current = value;
+		setInputState(value);
+		try {
+			if (activeDraft.current) {
+				if (value) sessionStorage.setItem(activeDraft.current, value);
+				else sessionStorage.removeItem(activeDraft.current);
+			}
+		} catch { /* The current draft remains editable when browser storage is unavailable. */ }
+	};
+	const restoreDraft = (outline: OutlineViewResponse) => {
+		const key = draftKey(outline);
+		if (key !== activeDraft.current) {
+			activeDraft.current = key;
+			setInput(readDraft(key));
+		}
+	};
 	const [wish, setWish] = useState("");
 	const [researchQuestion] = useState("");
 	const [researchFilter, setResearchFilter] = useState("");
@@ -164,6 +192,7 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 	const chatTicket = useRef(0);
 	const loadTicket = useRef(0);
 	const contextKey = useRef<string | undefined>(undefined);
+	const activeDiscussion = useRef<string | undefined>(undefined);
 	const mounted = useRef(true);
 	const diagnosticsRequest = useRef(0);
 	const [corpus, setCorpus] = useState<CorpusWorkbenchResponse | null>(null);
@@ -187,13 +216,19 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 		try {
 			const outline = await getOutline();
 			if (!mounted.current || ticket !== loadTicket.current) return;
-			if (contextKey.current && outline.contextKey && contextKey.current !== outline.contextKey) {
+			const branchChanged = contextKey.current && outline.contextKey && contextKey.current !== outline.contextKey;
+			const discussionChanged = activeDiscussion.current !== undefined && activeDiscussion.current !== (outline.discussionId ?? "default");
+			if (branchChanged || discussionChanged) {
 				chatController.current?.abort(); chatController.current = null; chatTicket.current++;
-				setInput(""); setAction(""); setLiveText("");
-				setChatError("故事分支已切换，讨论记录已重新加载；旧请求不会写入新分支。");
+				setAction(""); setLiveText(""); setThreadForm(null);
+				holdScroll.current = false; setAwayFromLatest(false);
+				setChatError(branchChanged ? "故事分支已切换，讨论记录已重新加载；旧请求不会写入新分支。" : "当前对谈已切换，已停止旧请求并重新加载记录。");
 			}
 			contextKey.current = outline.contextKey;
+			activeDiscussion.current = outline.discussionId ?? "default";
+			restoreDraft(outline);
 			setData(outline);
+			setHasEarlier((outline.discussionTotalRounds ?? 0) > (outline.chats?.length ?? 0));
 			setMode(outline.settings?.mode ?? "manual");
 			setResearchMode(outline.settings?.researchMode ?? "off");
 			if (!chatController.current) setMessages(discussionLines(outline.chats));
@@ -329,14 +364,30 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 		return () => window.clearInterval(timer);
 	}, [tab]);
 	useEffect(() => {
-		const key = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+		const key = (event: KeyboardEvent) => {
+			if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing) { event.preventDefault(); onClose(); }
+			if (event.key !== "Tab") return;
+			const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), select:not(:disabled), textarea:not(:disabled), input:not(:disabled), summary, a[href], [tabindex="0"]') ?? []).filter(node => {
+				const closedDetails = node.closest("details:not([open])");
+				return node.getClientRects().length > 0 && (!closedDetails || node.closest("summary")?.parentElement === closedDetails);
+			});
+			const first = controls[0], last = controls.at(-1);
+			if (event.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) { event.preventDefault(); last?.focus(); }
+			else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+		};
 		window.addEventListener("keydown", key);
 		document.body.classList.add("planning-open");
 		return () => { window.removeEventListener("keydown", key); document.body.classList.remove("planning-open"); };
 	}, [onClose]);
-	useEffect(() => { if(holdScroll.current)return;transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight, behavior: "smooth" }); }, [messages, action, liveText, chatError]);
+	useEffect(() => {
+		const previous = document.activeElement;
+		dialogRef.current?.focus();
+		return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
+	}, []);
+	useEffect(() => { if(holdScroll.current)return;transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight, behavior: "instant" }); }, [messages, action, liveText, chatError]);
 
 	const state = data?.state ?? data?.publicView ?? null;
+	const hasOutline = !!state?.revision;
 	const proposals = data ? pendingProposals(data) : [];
 	const busy = !!action;
 	const activeTab = DIRECTOR_MODULE_BY_ID.get(tab)!;
@@ -345,6 +396,7 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 		const userText = message?.trim();
 		if (kind === "chat" && !userText) return;
 		const controller = new AbortController(), ticket = ++chatTicket.current;
+		holdScroll.current = false; setAwayFromLatest(false);
 		chatController.current = controller;
 		setChatError(""); setChatStatus("导演正在读取当前分支与最近讨论…");
 		if (userText) setMessages((current) => [...current, { role: "user", text: userText }]);
@@ -366,11 +418,13 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 				setMessages((current) => [...current.map((line, index) => index === current.length - 1 && line.role === "user" && !line.requestId ? { ...line, requestId: result.requestId } : line), { role: "assistant", text: answer, requestId: result.requestId, focus: result.focus ?? discussionFocus, options: textOptions(result.options), warnings: list(result.warnings), sceneAdvice: result.sceneAdvice, dailyPlan: result.dailyPlan, dailyPlans: result.dailyPlans } as ChatLine]);
 			} else if (kind === "bootstrap") {
 				await bootstrapOutline(wish.trim() || undefined);
+				if (!mounted.current || ticket !== chatTicket.current) return;
 				answer = "首次规划提案已生成，请在提案审阅中确认。";
 				proposalCreated = true;
 				setMessages((current) => [...current, { role: "assistant", text: answer }]);
 			} else {
 				const result = await reconcileOutline();
+				if (!mounted.current || ticket !== chatTicket.current) return;
 				proposalCreated = !!result.proposal && !result.committed;
 				answer = result.stable ? "校准完成：当前大纲无需调整。"
 					: result.committed ? "校准提案已通过审计并自动提交。"
@@ -379,7 +433,7 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 			}
 			if (!mounted.current || ticket !== chatTicket.current) return;
 			chatController.current = null;
-			if (kind === "chat") setInput(current => current.trim() === userText ? "" : current);
+			if (kind === "chat" && inputRef.current.trim() === userText) setInput("");
 			void load();
 			if (proposalCreated) { if (kind !== "chat") setTab("proposals"); toast("info", "新提案已进入提案审阅，讨论回复保留在创作对谈"); }
 			else if (kind === "reconcile") toast("info", answer);
@@ -396,33 +450,38 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 		setAction("clear-discussion");
 		const ticket = chatTicket.current, key = contextKey.current;
 		try {
-			const result = await clearChats(key);
+			const result = await clearChats(key, data?.discussionId);
 			if (!mounted.current || ticket !== chatTicket.current || key !== contextKey.current) return;
-			setMessages(discussionLines(result.chats)); setChatError("");
+			setMessages(discussionLines(result.chats)); setChatError(""); setHasEarlier(false);
+			void load();
 			toast("info", "讨论记录已清空");
 		}
 		catch (cause) { if (mounted.current && ticket === chatTicket.current) toast("error", cause instanceof Error ? cause.message : String(cause)); }
 		finally { if (mounted.current && ticket === chatTicket.current) setAction(""); }
 	};
- const manageThread=async(kind:"new"|"rename"|"select",id?:string)=>{
-  if(busy||loading||!data)return;setAction("discussion-manage");setChatError("");
-  inputDrafts.current[data.discussionId??"default"]=input;
-  try{const result=kind==="new"?await createDiscussion(discussionTitle,contextKey.current):kind==="rename"?await renameDiscussion(data.discussionId??"default",discussionTitle,contextKey.current):await selectDiscussion(id!,contextKey.current);
-   setData(result);setMessages(discussionLines(result.chats));setInput(inputDrafts.current[result.discussionId??"default"]??"");setLiveText("");setThreadForm(null);setDiscussionTitle("");}
-  catch(e){setChatError(e instanceof Error?e.message:String(e));}finally{setAction("");}
+  const manageThread=async(kind:"new"|"rename"|"select",id?:string)=>{
+   if(busy||loading||!data)return;setAction("discussion-manage");setChatError("");
+   loadTicket.current++;
+   const ticket = chatTicket.current, key = contextKey.current;
+   try{const result=kind==="new"?await createDiscussion(discussionTitle,contextKey.current):kind==="rename"?await renameDiscussion(data.discussionId??"default",discussionTitle,contextKey.current):await selectDiscussion(id!,contextKey.current);
+    if (!mounted.current || ticket !== chatTicket.current || key !== contextKey.current) return;
+    activeDiscussion.current=result.discussionId??"default";restoreDraft(result); holdScroll.current=false;setAwayFromLatest(false);
+    setData(result);setMessages(discussionLines(result.chats));setHasEarlier((result.discussionTotalRounds??0)>(result.chats?.length??0));setLiveText("");setThreadForm(null);setDiscussionTitle("");}
+   catch(e){if(mounted.current&&ticket===chatTicket.current)setChatError(e instanceof Error?e.message:String(e));}finally{if(mounted.current&&ticket===chatTicket.current)setAction("");}
  };
  const loadEarlier=async()=>{
   const first=messages.find(line=>line.requestId);if(!first||!data||busy)return;setAction("discussion-history");
-  holdScroll.current=true;const top=transcriptRef.current?.scrollTop??0,height=transcriptRef.current?.scrollHeight??0;
-  try{const result=await getEarlierDiscussion(data.discussionId??"default",first.requestId!,contextKey.current);setMessages(current=>[...discussionLines(result.chats),...current]);requestAnimationFrame(()=>{if(transcriptRef.current)transcriptRef.current.scrollTop=top+transcriptRef.current.scrollHeight-height;});}
-  catch(e){setChatError(e instanceof Error?e.message:String(e));}finally{setAction("");}
+   holdScroll.current=true;setAwayFromLatest(true);const top=transcriptRef.current?.scrollTop??0,height=transcriptRef.current?.scrollHeight??0;
+   const ticket=chatTicket.current,key=contextKey.current;
+   try{const result=await getEarlierDiscussion(data.discussionId??"default",first.requestId!,key);if(!mounted.current||ticket!==chatTicket.current||key!==contextKey.current)return;setHasEarlier(result.hasMore);setMessages(current=>[...discussionLines(result.chats),...current]);requestAnimationFrame(()=>{if(mounted.current&&ticket===chatTicket.current&&transcriptRef.current)transcriptRef.current.scrollTop=top+transcriptRef.current.scrollHeight-height;});}
+   catch(e){if(mounted.current&&ticket===chatTicket.current)setChatError(e instanceof Error?e.message:String(e));}finally{if(mounted.current&&ticket===chatTicket.current)setAction("");}
  };
 
 	const removeDiscussion = async (id: string) => {
 		if (busy || chatController.current || !window.confirm("删除这一轮提问和回复？后续续聊不再使用它，正文、提案和大纲不会被删除。")) return;
 		setAction("delete-discussion");
 		const ticket = chatTicket.current, key = contextKey.current;
-		try { const result = await deleteChat(id, key); if (!mounted.current || ticket !== chatTicket.current || key !== contextKey.current) return; setMessages(discussionLines(result.chats)); toast("info", "这轮讨论已删除"); }
+		try { const result = await deleteChat(id, key, data?.discussionId); if (!mounted.current || ticket !== chatTicket.current || key !== contextKey.current) return; setMessages(discussionLines(result.chats)); void load(); toast("info", "这轮讨论已删除"); }
 		catch (cause) { if (!mounted.current || ticket !== chatTicket.current) return; const message = cause instanceof Error ? cause.message : String(cause); setChatError(message); toast("error", message); }
 		finally { if (mounted.current && ticket === chatTicket.current) setAction(""); }
 	};
@@ -502,42 +561,46 @@ export function StoryPlanningWorkbench({ onClose, toast, contextTick = 0 }: { on
 	const eventsById = useMemo(() => new Map(memoryEvents.map((event) => [event.id, event] as const)), [memoryEvents]);
 
 	return <div className="planning-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-		<section className={`planning-workbench ${full ? "is-full" : ""}`} role="dialog" aria-modal="true" aria-label="故事规划导演室">
+		<section ref={dialogRef} tabIndex={-1} className={`planning-workbench ${full ? "is-full" : ""}`} role="dialog" aria-modal="true" aria-label="故事规划导演室">
 			<header className="planning-head">
 				<div className="planning-brand"><span className="planning-brand-mark">导</span><div><span className="planning-kicker">LIYUAN STORY STUDIO</span><h2>梨园导演室</h2></div></div>
 				<div className="planning-head-actions"><span className="planning-revision">大纲版本 {state?.revision ?? "—"}</span><button className="icon-btn planning-full-btn" onClick={() => setFull((value) => !value)}>{full ? "退出全屏" : "全屏工作"}</button><button className="icon-btn" title="关闭 (Esc)" aria-label="关闭导演室" onClick={onClose}><IconClose size={18} /></button></div>
 			</header>
 			<div className="planning-shell">
+				<label className="planning-mobile-nav">工作区<select aria-label="导演室工作区" value={tab} onChange={event => setTab(event.target.value as Tab)}>{DIRECTOR_MODULE_GROUPS.map(group => <optgroup key={group.label} label={group.label}>{group.tabs.map(item => <option key={item.id} value={item.id}>{item.label}{item.id === "proposals" && proposals.length ? ` · ${proposals.length} 项待审` : ""}</option>)}</optgroup>)}</select></label>
 				<nav className="planning-tabs" aria-label="导演室功能">
 					{DIRECTOR_MODULE_GROUPS.map((group) => <div className="planning-tab-group" key={group.label}><span className="planning-tab-group-label">{group.label}</span>{group.tabs.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} aria-current={tab === item.id ? "page" : undefined} onClick={() => setTab(item.id)}><span><b>{item.label}</b><small>{item.note}</small></span>{item.id === "proposals" && proposals.length > 0 && <em>{proposals.length}</em>}</button>)}</div>)}
 				</nav>
 				<main className="planning-main">
-					<div className="planning-page-head"><div><span>DIRECTOR'S DESK</span><h3>{activeTab.label}</h3><p>{activeTab.note}</p></div>{tab === "proposals" && proposals.length > 0 && <strong>{proposals.length} 项待处理</strong>}</div>
+					<div className="planning-page-head"><div><span>DIRECTOR'S DESK</span><h3>{activeTab.label}</h3><p>{activeTab.note}</p></div>{["room", "proposals", "map"].includes(tab) && <div className="planning-workflow" aria-label="创作流程"><button aria-current={tab === "room" ? "page" : undefined} onClick={() => setTab("room")}>对谈</button><button aria-current={tab === "proposals" ? "page" : undefined} onClick={() => setTab("proposals")}>待审提案 <b>{proposals.length}</b></button><button aria-current={tab === "map" ? "page" : undefined} onClick={() => setTab("map")}>当前大纲</button></div>}</div>
 					<div className="planning-body">
 				{tab === "diagnostics" && <DiagnosticsModule diagnostics={diagnostics} loading={diagnosticsLoading} error={diagnosticsError} onReload={() => void loadDiagnostics()} />}
 				{tab === "memory" && <MemoryModule memoryError={memoryError} loadMemory={() => void loadMemory()} memoryLoading={memoryLoading} memoryEvents={memoryEvents} memoryDiff={memoryDiff} eventsById={eventsById} />}
-				{tab !== "diagnostics" && tab !== "memory" && loading && !data && <div className="planning-empty">正在摊开剧本和索引卡…</div>}
-				{tab !== "diagnostics" && tab !== "memory" && error && <div className="panel-error planning-error">{error}<button className="drawer-btn" onClick={() => { setLoading(true); void load(); }}>重试</button></div>}
-				{tab !== "diagnostics" && tab !== "memory" && !loading && !error && !state && <div className="planning-empty"><strong>导演室还没有故事方案</strong><span>填写体验愿望后点击“首次规划”，建立第一版故事脉络。</span></div>}
+				{tab !== "room" && tab !== "diagnostics" && tab !== "memory" && loading && !data && <div className="planning-empty" role="status">正在摊开剧本和索引卡…</div>}
+				{tab !== "room" && tab !== "diagnostics" && tab !== "memory" && error && <div className="panel-error planning-error" role="alert">{error}<button className="drawer-btn" onClick={() => { setLoading(true); void load(); }}>重试</button></div>}
+				{["map", "characters", "foreshadowing"].includes(tab) && !loading && !error && !hasOutline && <div className="planning-empty"><strong>还没有已确认的大纲</strong><span>先与导演讨论方向，再审阅提案。</span><button className="drawer-btn" onClick={() => setTab(proposals.length ? "proposals" : "room")}>{proposals.length ? "查看待审提案" : "开始创作对谈"}</button></div>}
 
 				{tab === "room" && <div className="planning-room">
 					<div className="planning-discussion-threads"><label>独立对谈<select aria-label="切换导演对谈" value={data?.discussionId??"default"} disabled={busy||loading} onChange={e=>void manageThread("select",e.target.value)}>{(data?.discussions??[{id:"default",title:"原有对谈",rounds:data?.chats?.length??0}]).map(thread=><option key={thread.id} value={thread.id}>{thread.title} · {thread.rounds}轮</option>)}</select></label><button type="button" className="drawer-btn" disabled={busy||loading} onClick={()=>{setDiscussionTitle("");setThreadForm("new");}}>新建对谈</button><button type="button" className="drawer-btn" disabled={busy||loading} onClick={()=>{setDiscussionTitle(data?.discussions?.find(t=>t.id===data.discussionId)?.title??"原有对谈");setThreadForm("rename");}}>对谈改名</button></div>
-     {threadForm&&<form className="planning-discussion-thread-form" onSubmit={e=>{e.preventDefault();void manageThread(threadForm);}}><label>{threadForm==="new"?"新对谈标题":"对谈标题"}<input aria-label="导演对谈标题" maxLength={80} value={discussionTitle} onChange={e=>setDiscussionTitle(e.target.value)} placeholder="例如：人物线 / 下一卷情节" autoFocus/></label><button type="submit" className="drawer-btn" disabled={busy||!discussionTitle.trim()}>保存对谈</button><button type="button" className="drawer-btn" onClick={()=>setThreadForm(null)}>取消</button><small>新建不会清空旧对谈；可以随时切回旧导演继续聊。</small></form>}
-     <div className="planning-discussion-history"><span>当前对谈显示 {messages.filter(line => line.role === "assistant" && line.requestId).length} 轮 · 共 {data?.discussionTotalRounds??data?.chats?.length??0} 轮 · 续聊仅携带本对谈最近8轮</span>{(data?.discussionTotalRounds??0)>messages.filter(line=>line.role==="assistant"&&line.requestId).length&&<button type="button" className="drawer-btn" disabled={busy||loading} onClick={()=>void loadEarlier()}>加载更早记录</button>}<button type="button" className="drawer-btn" disabled={busy || loading} onClick={() => void load()}>刷新记录</button></div>
-					<div className="planning-transcript" ref={transcriptRef}>
-						{messages.length === 0 && <div className="planning-room-intro"><span>从你的体验出发</span><h3>直接讨论你想经历什么，不必写成命令。</h3><p>导演室会读取当前剧情、人物状态、世界与生态工件。可以讨论关系路线、下一阶段节奏、伏笔或你不想出现的走向；方案只有在提案审阅中接受后才写入权威大纲。</p></div>}
+     {threadForm&&<form className="planning-discussion-thread-form" onKeyDown={event => { if(event.key === "Escape") { event.preventDefault();event.stopPropagation();setThreadForm(null); } }} onSubmit={e=>{e.preventDefault();void manageThread(threadForm);}}><label>{threadForm==="new"?"新对谈标题":"对谈标题"}<input aria-label="导演对谈标题" maxLength={80} value={discussionTitle} onChange={e=>setDiscussionTitle(e.target.value)} placeholder="例如：人物线 / 下一卷情节" autoFocus/></label><button type="submit" className="drawer-btn" disabled={busy||!discussionTitle.trim()}>保存对谈</button><button type="button" className="drawer-btn" onClick={()=>setThreadForm(null)}>取消</button><small>新建不会清空旧对谈；可以随时切回旧导演继续聊。</small></form>}
+     <div className="planning-discussion-history"><span title="续聊仅携带本对谈最近 8 轮">已显示 {messages.filter(line => line.role === "assistant" && line.requestId).length} / {data?.discussionTotalRounds??data?.chats?.length??0} 轮</span>{hasEarlier&&<button type="button" className="drawer-btn" disabled={busy||loading} onClick={()=>void loadEarlier()}>{action === "discussion-history" ? "加载中…" : "加载更早记录"}</button>}<button type="button" className="drawer-btn" disabled={busy || loading} onClick={() => void load()}>刷新记录</button></div>
+					<div className="planning-transcript" ref={transcriptRef} role="region" aria-label="当前对谈记录" tabIndex={0} onScroll={event => { const node=event.currentTarget; const away=node.scrollHeight-node.scrollTop-node.clientHeight>80; holdScroll.current=away;setAwayFromLatest(away); }}>
+						{loading && !data && <div className="planning-empty" role="status">正在加载当前分支的对谈…</div>}
+						{error && <div className="panel-error planning-discussion-error" role="alert"><p>{error}</p><button className="drawer-btn" disabled={loading} onClick={() => { setLoading(true); void load(); }}>重试加载</button></div>}
+						{!loading && !error && messages.length === 0 && <div className="planning-room-intro"><span>讨论方向 → 审阅提案 → 确认大纲</span><h3>从你想经历的故事开始。</h3><p>聊下一拍、人物关系或长期路线。下方选择一个切入点，修改草稿后再发送。讨论和候选建议不会成为已发生的正文。</p><small>{hasOutline ? `当前大纲 · 版本 ${state?.revision}` : "尚无已确认大纲，也可以直接开始讨论。"}</small></div>}
 						{messages.map((message, index) => <article key={`${message.requestId ?? index}-${message.role}`} className={`planning-chat ${message.role}`}><div className="planning-chat-head"><small>{message.role === "user" ? "你" : "导演"}{message.focus && ` · ${FOCUS_LABEL[message.focus]}`}{message.createdAt && <time dateTime={message.createdAt}> · {new Date(message.createdAt).toLocaleString()}</time>}</small>{message.role === "assistant" && message.requestId && <button type="button" className="drawer-btn" disabled={busy} aria-label="删除这轮讨论" onClick={() => void removeDiscussion(message.requestId!)}>删除这轮</button>}</div><p>{message.text}</p>{list(message.dailyPlans).length > 0 ? <div className="planning-daily-candidates">{message.dailyPlans!.map((plan, planIndex) => <div key={`${plan.title}-${planIndex}`}><span className="planning-candidate-label">{planIndex === 0 ? "推荐方案" : `备选方案 ${planIndex + 1}`}</span><DailyPlanCard plan={plan} /></div>)}</div> : message.dailyPlan && <DailyPlanCard plan={message.dailyPlan} />}{message.sceneAdvice && <SceneAdviceCard advice={message.sceneAdvice} />}{list(message.warnings).map((warning) => <div className="planning-warning" key={warning}>{warning}</div>)}{list(message.options).length > 0 && <div className="planning-options">{message.options!.map((option) => <button key={option} onClick={() => setInput(option)}>{option}</button>)}</div>}</article>)}
-						{["chat", "bootstrap", "reconcile"].includes(action) && (liveText ? <article className="planning-chat assistant planning-live"><small>导演 · {FOCUS_LABEL[discussionFocus]}</small><p>{liveText}</p></article> : <div className="planning-typing" role="status">{chatStatus || "导演正在翻阅剧情、人物和故事卡…"}<span>连接会自动保活；回复最多等待 5 分钟。</span></div>)}
+						{["chat", "bootstrap", "reconcile"].includes(action) && (liveText ? <article className="planning-chat assistant planning-live"><small>导演 · {FOCUS_LABEL[discussionFocus]} · 回复中，尚未确认保存</small><p>{liveText}</p></article> : <div className="planning-typing" role="status">{chatStatus || "导演正在翻阅剧情、人物和故事卡…"}<span>连接会自动保活；回复最多等待 5 分钟。</span></div>)}
 						{chatError && <div className="planning-discussion-error panel-error" role="alert"><p>{chatError}</p><div><button type="button" className="drawer-btn" disabled={busy || loading || !input.trim()} onClick={() => void runChat("chat", input)}>重试发送</button><button type="button" className="drawer-btn" disabled={busy || loading} onClick={() => void load()}>刷新记录核对</button></div></div>}
 					</div>
-					<div className="planning-mode-strip">{DISCUSSION_MODES.map((modeItem) => <button type="button" key={modeItem.id} className={discussionFocus === modeItem.id ? "active" : ""} title={modeItem.note} onClick={() => { setDiscussionFocus(modeItem.id); if (!input.trim()) setInput(modeItem.prompt); }}><b>{modeItem.label}</b><span>{modeItem.note}</span></button>)}</div>
-					<div className="planning-compose"><textarea aria-label="创作对谈消息" maxLength={4000} value={input} onChange={(event) => setInput(event.target.value)} placeholder={`${FOCUS_LABEL[discussionFocus]}：${DISCUSSION_MODES.find((item) => item.id === discussionFocus)?.note ?? "讨论当前剧情"}…`} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void runChat("chat", input); } }} /><button className="drawer-btn primary" disabled={busy || loading || !data || !input.trim()} onClick={() => void runChat("chat", input)}>问导演</button>{action === "chat" && <button type="button" className="drawer-btn" onClick={() => chatController.current?.abort()}>停止对谈</button>}</div>
-					<div className="planning-tools"><input value={wish} onChange={(event) => setWish(event.target.value)} placeholder="首次规划的用户体验愿望（可选）" /><button disabled={busy} onClick={() => void runChat("bootstrap")}>首次规划</button><button disabled={busy || !state} onClick={() => void runChat("reconcile")}>校准</button><button disabled={busy} onClick={() => void refreshResearch()}><IconRefresh size={13} />研究灵感</button><button className="drawer-btn" disabled={busy} onClick={() => void clearDiscussion()}>清空讨论</button></div>
+					{awayFromLatest && <button className="planning-jump drawer-btn" onClick={() => { holdScroll.current=false;setAwayFromLatest(false);transcriptRef.current?.scrollTo({top:transcriptRef.current.scrollHeight,behavior:"instant"}); }}>回到最新回复 ↓</button>}
+					<div className="planning-mode-strip" aria-label="讨论切入点">{DISCUSSION_MODES.map((modeItem) => <button type="button" key={modeItem.id} disabled={busy || loading || !data} aria-pressed={discussionFocus === modeItem.id} className={discussionFocus === modeItem.id ? "active" : ""} title={modeItem.note} onClick={() => { setDiscussionFocus(modeItem.id); if (!input.trim()) setInput(modeItem.prompt); composerRef.current?.focus(); }}><b>{modeItem.label}</b><span>{modeItem.note}</span></button>)}</div>
+					<div className="planning-compose"><textarea ref={composerRef} aria-label="创作对谈消息" aria-describedby="planning-compose-help" disabled={loading || !data} maxLength={4000} value={input} onChange={(event) => setInput(event.target.value)} placeholder={`${FOCUS_LABEL[discussionFocus]}：${DISCUSSION_MODES.find((item) => item.id === discussionFocus)?.note ?? "讨论当前剧情"}…`} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void runChat("chat", input); } }} /><div className="planning-send-actions"><button className="drawer-btn primary" disabled={busy || loading || !data || !input.trim()} onClick={() => void runChat("chat", input)}>问导演</button>{action === "chat" && <button type="button" className="drawer-btn" onClick={() => chatController.current?.abort()}>停止对谈</button>}</div><div className="planning-compose-help" id="planning-compose-help"><span>{action === "chat" ? "关闭会停止对谈，保留未发送草稿" : "Enter 发送 · Shift+Enter 换行 · 草稿保留在此浏览器标签页"}</span><span>{input.length} / 4000</span></div></div>
+					<details className="planning-room-tools"><summary>规划工具与讨论管理</summary><div className="planning-tools"><input aria-label="首次规划的用户体验愿望" value={wish} onChange={(event) => setWish(event.target.value)} placeholder="首次规划的用户体验愿望（可选）" /><button disabled={busy || loading || !data} onClick={() => void runChat("bootstrap")}>首次规划</button><button disabled={busy || loading || !state} onClick={() => void runChat("reconcile")}>校准</button><button disabled={busy || loading || !data} onClick={() => void refreshResearch()}><IconRefresh size={13} />研究灵感</button><button className="drawer-btn" disabled={busy || loading || !messages.length} onClick={() => void clearDiscussion()}>清空讨论</button></div></details>
 				</div>}
 
-				{tab === "map" && <StoryMapModule state={state!} />}
-				{tab === "characters" && <CharactersModule state={state!} />}
-				{tab === "foreshadowing" && <ForeshadowingModule state={state!} groups={foreshadowGroups} revealed={revealed} setRevealed={setRevealed} />}
+				{tab === "map" && hasOutline && <StoryMapModule state={state!} />}
+				{tab === "characters" && hasOutline && <CharactersModule state={state!} />}
+				{tab === "foreshadowing" && hasOutline && <ForeshadowingModule state={state!} groups={foreshadowGroups} revealed={revealed} setRevealed={setRevealed} />}
 				{tab === "world" && <WorldModule />}
 				{tab === "proposals" && <ProposalsModule proposals={proposals} busy={busy} proposalAction={(proposal, accept) => void proposalAction(proposal, accept)} />}
 				{tab === "corpus" && <CorpusModule corpusUploading={corpusUploading} busy={busy} discoverCorpusWorks={() => void discoverCorpusWorks()} corpusFileRef={corpusFileRef} uploadCorpusFile={(file) => void uploadCorpusFile(file)} uploadCorpusVersion={(doc, file) => void uploadCorpusVersion(doc, file)} corpusUrl={corpusUrl} setCorpusUrl={setCorpusUrl} importCorpusUrl={() => void importCorpusUrl()} corpusLoading={corpusLoading} corpusError={corpusError} corpus={corpus} novelJobs={novelJobs} corpusDetail={corpusDetail} toggleCorpusDetail={(doc) => void toggleCorpusDetail(doc)} corpusAction={(doc, kind) => void corpusAction(doc, kind)} />}

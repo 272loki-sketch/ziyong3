@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { CorpusEngine, cleanTextLayer, chunkText, corpusDocumentsFile, corpusRoot, corpusTextsDir, decodeText, estimateCallsForChunks, splitChapters, CHUNK_CHARS, MAX_CHUNKS } from "../src/outline/corpus.ts";
+import { CorpusEngine, cleanTextLayer, chunkText, corpusDigestsDir, corpusDocumentsFile, corpusRoot, corpusTextsDir, decodeText, estimateCallsForChunks, splitChapters, CHUNK_CHARS, MAX_CHUNKS } from "../src/outline/corpus.ts";
 import { OutlineResearchStore } from "../src/outline/research.ts";
 import { projectCorpusWorkspace } from "../src/outline/projection.ts";
 
@@ -385,3 +386,233 @@ test("恢复：documents.json 旧元数据在 restore 后按落盘正文自愈",
 		assert.equal(JSON.parse(readFileSync(corpusDocumentsFile(cwd), "utf8"))[0].chars, text.length);
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
+
+for (const task of ["digest-map", "digest-reduce-arc", "digest-reduce-final"]) {
+	for (const invalid of [{}, { chapters: [] }, { summary: " \n\t", synopsis: " \n\t" }, { summary: 42, synopsis: [] }]) {
+		test(`${task}: empty summary response ${JSON.stringify(invalid)} fails within existing bounds`, async () => {
+			const cwd = tmp(), calls: string[] = [];
+			try {
+				mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+				writeFileSync(join(cwd, ".liyuan-uploads", "empty.txt"), sampleText());
+				let ready = 0;
+				const engine = new CorpusEngine({ ...corpusDeps(cwd, step => {
+					calls.push(step);
+					return step === task ? JSON.stringify(invalid) : successModel(step);
+				}), onReady: async () => { ready++; } });
+				const { doc } = await engine.create("empty.txt");
+				await engine.waitIdle();
+				assert.equal(doc.status, "failed");
+				assert.equal(ready, 0);
+				assert.equal(calls.filter(step => step === task).length, task === "digest-reduce-arc" ? 4 : 8);
+				assert.equal(doc.modelUsage?.attempts, calls.length);
+				assert.equal(calls.some(step => step.startsWith("digest-extract")), false);
+				if (task !== "digest-map") assert.equal(calls.filter(step => step === "digest-map").length, doc.chunkCount);
+				const saved = JSON.parse(readFileSync(join(corpusDigestsDir(cwd), `${doc.id}.json`), "utf8"));
+				assert.notEqual(saved.pipeline?.finalComplete, true);
+			} finally { rmSync(cwd, { recursive: true, force: true }); }
+		});
+	}
+}
+
+for (const task of ["digest-map", "digest-reduce-final"]) {
+	test(`${task}: empty object gets one parse retry and accepts recovered text`, async () => {
+		const cwd = tmp();
+		try {
+			mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+			writeFileSync(join(cwd, ".liyuan-uploads", "recover.txt"), sampleText());
+			let attempts = 0;
+			const engine = new CorpusEngine(corpusDeps(cwd, step => step === task && ++attempts === 1 ? "{}" : successModel(step)));
+			const { doc } = await engine.create("recover.txt");
+			await engine.waitIdle();
+			assert.equal(doc.status, "ready");
+			assert.equal(attempts, 2);
+			assert.equal(doc.modelUsage?.attempts, 7);
+		} finally { rmSync(cwd, { recursive: true, force: true }); }
+	});
+}
+
+for (const oldSummary of [undefined, null, 42, "", " \n\t", "(本块无摘要)", "（本块无摘要）", "A real summary mentions （本块无摘要） literally."]) {
+	test(`resume only regenerates the exact empty map checkpoint: ${JSON.stringify(oldSummary)}`, async () => {
+		const cwd = tmp();
+		try {
+			mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+			writeFileSync(join(cwd, ".liyuan-uploads", "checkpoint.txt"), sampleText().repeat(4));
+			const initial = new CorpusEngine(corpusDeps(cwd, successModel));
+			const { doc } = await initial.create("checkpoint.txt");
+			await initial.waitIdle();
+			const path = join(corpusDigestsDir(cwd), `${doc.id}.json`);
+			const saved = JSON.parse(readFileSync(path, "utf8"));
+			assert.ok(saved.chunks.length > 1);
+			saved.chunks[0].summary = oldSummary;
+			saved.pipeline.inputHash = createHash("sha256").update(JSON.stringify(saved.chunks)).digest("hex");
+			writeFileSync(path, JSON.stringify(saved));
+			writeFileSync(corpusDocumentsFile(cwd), JSON.stringify([{ ...doc, status: "paused" }]));
+			const calls: Array<{ task: string; chunk?: { index: number } }> = [];
+			const resumed = new CorpusEngine(corpusDeps(cwd, (task, user) => { calls.push(JSON.parse(user)); return successModel(task); }));
+			resumed.resume(doc.id); await resumed.waitIdle();
+			assert.equal(resumed.getDoc(doc.id)?.status, "ready");
+			const valid = typeof oldSummary === "string" && oldSummary.startsWith("A real summary");
+			assert.deepEqual(calls.filter(call => call.task === "digest-map").map(call => call.chunk?.index), valid ? [] : [0]);
+			assert.equal(resumed.getDoc(doc.id)?.modelUsage?.attempts, doc.modelUsage!.attempts + calls.length);
+			if (valid) assert.deepEqual(calls, []);
+		} finally { rmSync(cwd, { recursive: true, force: true }); }
+	});
+}
+
+for (const summary of ["(本块无摘要)", "（本块无摘要）"]) {
+	test(`map rejects the legacy placeholder from a live response: ${summary}`, async () => {
+		const cwd = tmp();
+		try {
+			mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+			writeFileSync(join(cwd, ".liyuan-uploads", "placeholder.txt"), sampleText());
+			let attempts = 0;
+			const engine = new CorpusEngine(corpusDeps(cwd, task => {
+				if (task === "digest-map" && ++attempts === 1) return JSON.stringify({ summary, chapters: ["Chapter 1"] });
+				return successModel(task);
+			}));
+			const { doc } = await engine.create("placeholder.txt");
+			await engine.waitIdle();
+			assert.equal(doc.status, "ready");
+			assert.equal(attempts, 2);
+			assert.equal(engine.getDetail(doc.id).digest?.chunks[0]?.summary, "块摘要");
+			assert.equal(doc.modelUsage?.attempts, 7);
+		} finally { rmSync(cwd, { recursive: true, force: true }); }
+	});
+}
+
+for (const synopsis of ["", " \n\t", "A valid synopsis"]) {
+	test(`resume finalComplete validates synopsis without repeating valid empty extractions: ${JSON.stringify(synopsis)}`, async () => {
+		const cwd = tmp();
+		try {
+			mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+			writeFileSync(join(cwd, ".liyuan-uploads", "final-checkpoint.txt"), sampleText());
+			const initial = new CorpusEngine(corpusDeps(cwd, successModel));
+			const { doc } = await initial.create("final-checkpoint.txt");
+			await initial.waitIdle();
+			const path = join(corpusDigestsDir(cwd), `${doc.id}.json`);
+			const saved = JSON.parse(readFileSync(path, "utf8"));
+			saved.synopsis = synopsis;
+			writeFileSync(path, JSON.stringify(saved));
+			writeFileSync(corpusDocumentsFile(cwd), JSON.stringify([{ ...doc, status: "paused" }]));
+			const calls: string[] = []; let ready = 0;
+			const resumed = new CorpusEngine({ ...corpusDeps(cwd, task => { calls.push(task); return successModel(task); }), onReady: async () => { ready++; } });
+			resumed.resume(doc.id); await resumed.waitIdle();
+			assert.equal(resumed.getDoc(doc.id)?.status, "ready");
+			assert.deepEqual(calls, synopsis.trim() ? [] : ["digest-reduce-final"]);
+			assert.equal(ready, synopsis.trim() ? 0 : 1);
+			assert.equal(resumed.getDoc(doc.id)?.modelUsage?.attempts, doc.modelUsage!.attempts + calls.length);
+			assert.deepEqual(resumed.getDetail(doc.id).digest?.pipeline?.extractions, saved.pipeline.extractions);
+		} finally { rmSync(cwd, { recursive: true, force: true }); }
+	});
+}
+
+for (const failure of ["returned", "thrown", "429 rate limit", "503 unavailable", '{"error":{"message":"Rate limited","status":429}}', '{"error":{"message":"Unavailable","status":503}}']) {
+	test(`provider retry uses fixed 5000ms and retains attempt/budget bounds: ${failure}`, async t => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const cwd = tmp();
+		try {
+			mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+			writeFileSync(join(cwd, ".liyuan-uploads", "retry-clock.txt"), sampleText());
+			let calls = 0;
+			const engine = new CorpusEngine(corpusDeps(cwd, () => {
+				calls++;
+				if (failure === "thrown") throw new Error("synthetic network failure");
+				if (failure.startsWith("{")) return failure;
+				return { error: failure };
+			}), 7);
+			const { doc } = await engine.create("retry-clock.txt");
+			const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+			await flush();
+			assert.equal(calls, 1);
+			// Four attempts per #call; document retries share the same hard quota.
+			while (calls < 7) {
+				const before = calls;
+				t.mock.timers.tick(4999); await flush();
+				assert.equal(calls, before);
+				t.mock.timers.tick(1); await flush();
+				assert.ok(calls > before);
+			}
+			await engine.waitIdle();
+			assert.equal(calls, 7);
+			assert.equal(doc.status, "failed");
+			assert.equal(doc.modelUsage?.attempts, 7);
+			assert.equal(doc.modelUsage?.exhausted, true);
+			assert.throws(() => engine.retry(doc.id), /预算已耗尽/);
+		} finally { rmSync(cwd, { recursive: true, force: true }); }
+	});
+}
+
+test("summary prose mentioning refusal codes is not a provider failure", async () => {
+	const cwd = tmp();
+	try {
+		mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+		writeFileSync(join(cwd, ".liyuan-uploads", "prose.txt"), sampleText());
+		const summary = "The characters discuss content_filter, SAFETY and a 401 error in their story.";
+		const engine = new CorpusEngine(corpusDeps(cwd, task => task === "digest-map" ? JSON.stringify({ summary }) : successModel(task)));
+		const { doc } = await engine.create("prose.txt");
+		await engine.waitIdle();
+		assert.equal(doc.status, "ready");
+		assert.equal(doc.modelUsage?.attempts, 6);
+		assert.equal(engine.getDetail(doc.id).digest?.chunks[0]?.summary, summary);
+	} finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+for (const failure of [
+	"401 unauthorized", "content_filter", "model not found", "insufficient_quota", "尚未配置可用剧情模型", "missing model configuration",
+	"Provider finish_reason: content_filter", "Request blocked due to safety settings", "[ProxySystem Error] PROHIBITED_CONTENT",
+	JSON.stringify({ error: { message: "Request refused", code: "content_filter" } }),
+	JSON.stringify({ error: { message: "Invalid credentials", status: 401 } }),
+]) {
+	for (const channel of ["error", "throw", ...(failure.startsWith("{") || failure.startsWith("Provider") || failure.startsWith("Request") || failure.startsWith("[Proxy") ? ["text"] : [])]) {
+		test(`permanent provider failure stops automatic retries but allows explicit retry: ${channel} ${failure}`, async t => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			const cwd = tmp();
+			try {
+				mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+				writeFileSync(join(cwd, ".liyuan-uploads", "permanent.txt"), sampleText());
+				let calls = 0, failing = true;
+				const engine = new CorpusEngine(corpusDeps(cwd, task => {
+					calls++;
+					if (!failing) return successModel(task);
+					if (channel === "throw") throw new Error(failure);
+					return channel === "text" ? failure : { error: failure };
+				}));
+				const { doc } = await engine.create("permanent.txt");
+				await engine.waitIdle();
+				assert.equal(doc.status, "failed");
+				assert.ok(doc.error);
+				assert.equal(calls, 1);
+				assert.equal(doc.modelUsage?.attempts, 1);
+				assert.notEqual(doc.modelUsage?.exhausted, true);
+				t.mock.timers.tick(20_000); await engine.waitIdle();
+				assert.equal(calls, 1);
+				failing = false; engine.retry(doc.id); await engine.waitIdle();
+				assert.equal(doc.status, "ready");
+				assert.equal(calls, 7);
+				assert.equal(doc.modelUsage?.attempts, 7);
+			} finally { rmSync(cwd, { recursive: true, force: true }); }
+		});
+	}
+}
+
+for (const action of ["pause", "remove"] as const) {
+	test(`${action} wakes the 5000ms provider retry wait without dispatch`, async t => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const cwd = tmp();
+		try {
+			mkdirSync(join(cwd, ".liyuan-uploads"), { recursive: true });
+			writeFileSync(join(cwd, ".liyuan-uploads", "stop-clock.txt"), sampleText());
+			let calls = 0;
+			const engine = new CorpusEngine(corpusDeps(cwd, () => { calls++; return { error: "synthetic network failure" }; }));
+			const { doc } = await engine.create("stop-clock.txt");
+			for (let i = 0; i < 40; i++) await Promise.resolve();
+			assert.equal(calls, 1);
+			await engine[action](doc.id);
+			await engine.waitIdle();
+			t.mock.timers.tick(5000);
+			assert.equal(calls, 1);
+			assert.equal(doc.modelUsage?.attempts, 1);
+			assert.equal(engine.getDoc(doc.id)?.status, action === "pause" ? "paused" : undefined);
+		} finally { rmSync(cwd, { recursive: true, force: true }); }
+	});
+}

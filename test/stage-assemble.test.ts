@@ -433,7 +433,7 @@ test("stateFromBranch：新会话从开场白提取明确时间地点，rp-state
 	assert.equal(stateFromBranch(withSnapshot).location, "体育馆");
 });
 
-test("loadStageMaterials：统一知识集合去重，并一致应用 disabledLore 与协议过滤", () => {
+test("loadStageMaterials：统一知识保留来源行身份，并一致应用 disabledLore 与协议过滤", () => {
 	const cwd = mkdtempSync(join(tmpdir(), "liyuan-unified-lore-"));
 	const duplicate = "外书与卡内完全相同的设定。";
 	const disabled = "这条卡内秘密已由用户停用。";
@@ -463,7 +463,7 @@ test("loadStageMaterials：统一知识集合去重，并一致应用 disabledLo
 		);
 
 		const m = loadStageMaterials(cwd);
-		assert.equal(m.entries.filter((e) => e.content === duplicate).length, 1, "外部书与卡内重复内容只保留一份");
+		assert.equal(m.entries.filter((e) => e.content === duplicate).length, 2, "不同书的独立条目不能按正文去重");
 		const disabledEntry = m.entries.find((e) => e.content === disabled);
 		assert.equal(disabledEntry?.enabled, false, "disabledLore 对卡内条目生效");
 		assert.equal(constantLoreOf(m).some((e) => e.content === disabled), false);

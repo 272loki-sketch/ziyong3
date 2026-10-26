@@ -40,7 +40,7 @@ test("原插件面板：安装/开关/检查/更新/回退、失败不假成功�
 				else return json(404, { error: "synthetic unknown action" });
 				return json(200, plugin);
 			}
-			if (url.pathname === "/tavern-plugin-host.html") { managerRequests.push(url.searchParams.get("plugin")); if (failManager) { res.writeHead(503, { "content-type": "text/html" }); return res.end('<div role="alert">合成宿主加载失败；原数据保留</div>'); } res.writeHead(200, { "content-type": "text/html" }); return res.end(`<h2>合成 ${url.searchParams.get("plugin")} 原设置fixture</h2><button>上游合成设置按钮</button>`); }
+			if (url.pathname === "/tavern-plugin-host.html") { managerRequests.push(url.searchParams.get("plugin")); if (failManager) { res.writeHead(503, { "content-type": "text/html" }); return res.end('<div id="status">原插件加载失败：合成宿主加载失败；原数据保留</div>'); } res.writeHead(200, { "content-type": "text/html" }); return res.end(`<div id="status">原插件已就绪 · 合成宿主</div><h2>合成 ${url.searchParams.get("plugin")} 原设置fixture</h2><button>上游合成设置按钮</button><script>window.LiyuanTavernPlugins={ready:()=>true,host:{flush:async()=>{}}};</script>`); }
 			const paths = { "/": "index.html", "/fixture.js": "fixture.js", "/fixture.css": "fixture.css" };
 			if (paths[url.pathname]) { res.writeHead(200, { "content-type": url.pathname.endsWith(".js") ? "text/javascript" : url.pathname.endsWith(".css") ? "text/css" : "text/html" }); return res.end(await readFile(join(cwd, paths[url.pathname]))); }
 			if (url.pathname !== "/favicon.ico") forbidden.push(url.pathname);
@@ -77,9 +77,10 @@ test("原插件面板：安装/开关/检查/更新/回退、失败不假成功�
 		assert.equal(await page.evaluate(() => window.__toasts.filter(item => item.level === "info").length), successBefore); assert.equal(await page.evaluate(() => window.__changes.length), changesBefore); failConfig = false;
 		await helper.getByRole("button", { name: "打开上游管理台", exact: true }).click();
 		const manager = page.getByRole("dialog", { name: "酒馆助手原上游管理台" }); await manager.waitFor(); await page.frameLocator('.tavern-plugins-manager iframe').getByText("合成 helper 原设置fixture", { exact: true }).waitFor();
-		assert.equal(await manager.locator("iframe").getAttribute("src"), "/tavern-plugin-host.html?view=manager&plugin=helper"); assert.deepEqual(managerRequests, ["helper"]);
+		const hostURL = new URL(await manager.locator("iframe").getAttribute("src"), base);
+		assert.equal(hostURL.pathname, "/tavern-plugin-host.html"); assert.equal(hostURL.searchParams.get("view"), "manager"); assert.equal(hostURL.searchParams.get("plugin"), "helper"); assert.equal(hostURL.searchParams.get("attempt"), "0"); assert.equal(hostURL.searchParams.get("contextTick"), "0"); assert.deepEqual(managerRequests, ["helper"]);
 		await page.setViewportSize({ width: 390, height: 844 }); const box = await manager.boundingBox(); assert.ok(box.x >= 9 && box.width <= 371 && box.height <= 825); assert.equal(await manager.evaluate(element => element.scrollWidth <= element.clientWidth + 1), true);
-		failManager = true; await manager.getByRole("button", { name: "重新载入上游管理台", exact: true }).click(); await page.frameLocator('.tavern-plugins-manager iframe').getByRole("alert").filter({ hasText: /合成宿主加载失败/ }).waitFor();
+		failManager = true; await manager.getByRole("button", { name: "重新载入上游管理台", exact: true }).click(); await manager.getByRole("alert").filter({ hasText: /合成宿主加载失败/ }).waitFor();
 		await manager.getByRole("button", { name: "关闭上游管理台", exact: true }).click(); assert.equal(await page.locator(".tavern-plugins-backdrop").count(), 0);
 		await template.getByRole("button", { name: "安装原版", exact: true }).click(); await template.getByText("已校验 1.0.0", { exact: true }).waitFor();
 		failManager = false; await template.getByRole("button", { name: "打开上游管理台", exact: true }).click(); await page.frameLocator('.tavern-plugins-manager iframe').getByText("合成 template 原设置fixture", { exact: true }).waitFor(); assert.equal(managerRequests.at(-1), "template"); await page.keyboard.press("Escape");

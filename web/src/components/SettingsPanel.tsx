@@ -1,5 +1,5 @@
 /**
- * 设置面板：外观（昼夜）+ 世界书扫描 + agent 行为 + 内置向量记忆。
+ * 设置面板：外观（三套背景）+ 世界书扫描 + agent 行为 + 内置向量记忆。
  * 主题立刻生效、只存本机 localStorage，不写 rp.config。
  * 记忆配置写 `.liyuan-memory/config.json`，不必重载 agent。
  */
@@ -7,13 +7,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiGet, apiPut, type ModelRef, type ModelsResponse, type RpConfigView, type SideModelStep, type StepModelOverrides } from "../api.ts";
 import type { GenerationMode } from "../generation-mode.ts";
-import { getTheme, setTheme, type ThemeMode } from "../theme.ts";
+import { ThemeSelector } from "./ThemeSelector.tsx";
 import { setReadingPosition, useReadingPosition, type ReadingPosition } from "../reading-preference.ts";
 import { PanelStatus, SliderField, Toggle, useAction, usePanelData } from "./kit.tsx";
 import { GenerationModeControl } from "./GenerationModeControl.tsx";
 import { ModelPlugSelector } from "./ModelPlugSelector.tsx";
 import { WorldProfileSection } from "./WorldProfileSection.tsx";
 import { DatabasePluginPanel } from "./DatabasePluginPanel.tsx";
+import { NovelAiSection } from "./NovelAiSection.tsx";
 
 type MemoryStoreStats = {
 	id: string;
@@ -164,7 +165,7 @@ function MemoryChunkManager({
 }
 
 /** 内置向量记忆：剧情库（agent 合并）+ 额外库（导入/手动 + 条目管理） */
-function MemorySection({ toast }: { toast: (level: "info" | "warning" | "error", text: string) => void }) {
+export function MemorySection({ toast }: { toast: (level: "info" | "warning" | "error", text: string) => void }) {
 	const { data, error, loading, reload } = usePanelData(() => apiGet<MemoryStatus>("/api/memory"), {
 		cacheKey: "/api/memory",
 	});
@@ -226,6 +227,14 @@ function MemorySection({ toast }: { toast: (level: "info" | "warning" | "error",
 			});
 			reload();
 		}, "记忆设置已保存");
+
+	const saveEmbeddingConnection = () => run(async () => {
+		await apiPut("/api/memory", {
+			embedMode,
+			cloudEmbed: { baseUrl: cloudBase, apiKey: cloudKey.trim() || (keyConfigured ? "••••••••" : ""), model: cloudModel },
+		});
+		reload();
+	}, "嵌入连接已保存；未改变旧记忆开关");
 
 	const probeEmbed = () =>
 		run(async () => {
@@ -347,6 +356,10 @@ function MemorySection({ toast }: { toast: (level: "info" | "warning" | "error",
 			) : null}
 			{loading && !data ? <div className="field-hint">加载中…</div> : null}
 			{error ? <div className="field-hint" style={{ color: "var(--danger, #c44)" }}>{error}</div> : null}
+			<div className="access-actions">
+				<button type="button" className="drawer-btn" onClick={() => setOpen(v => !v)}>{open ? "收起嵌入连接" : "配置嵌入连接"}</button>
+				<span className="field-hint">日常卡语义检索可单独使用云端连接，无需开启旧记忆库。</span>
+			</div>
 			<div className="toggle-row">
 				<span>启用向量记忆</span>
 				<Toggle
@@ -409,6 +422,7 @@ function MemorySection({ toast }: { toast: (level: "info" | "warning" | "error",
 						</div>
 					)}
 					<div className="access-actions" style={{ marginTop: 8 }}>
+						<button type="button" className="drawer-btn save-btn" disabled={busy} onClick={() => void saveEmbeddingConnection()}>保存嵌入连接（不启用旧记忆）</button>
 						<button
 							type="button"
 							className="drawer-btn save-btn"
@@ -692,7 +706,6 @@ export function SettingsPanel({
 	const revisionRef = useRef(0);
 	const failedRevisionRef = useRef<number | null>(null);
 	const stepModelsDirtyRef = useRef(false);
-	const [dark, setDark] = useState(() => getTheme() === "dark");
 	const readingPosition = useReadingPosition();
 	const formDisabled = saving;
 
@@ -722,15 +735,8 @@ export function SettingsPanel({
 		setDirty(true);
 	};
 
-	const onTheme = (on: boolean) => {
-		const mode: ThemeMode = on ? "dark" : "light";
-		setDark(on);
-		setTheme(mode);
-		toast("info", on ? "已切换到黑夜模式" : "已切换到白昼模式");
-	};
-
-	const save = useCallback(async () => {
-		if (!data || !dirty || savingRef.current) return;
+	const save = useCallback(async (modelSelection?: StepModelOverrides) => {
+		if (!data || (!dirty && modelSelection === undefined) || savingRef.current) return;
 		const revision = revisionRef.current;
 		if (failedRevisionRef.current === revision) return;
 		savingRef.current = true;
@@ -748,7 +754,7 @@ export function SettingsPanel({
 				literaryEcologyEnabled,
 				webResearchMode,
                 webResearchPublicTerms: webResearchPublicTerms.split("\n").map(term => term.trim()).filter(Boolean),
-				...(stepModelsDirtyRef.current ? { stepModels } : {}),
+				...(modelSelection !== undefined ? { stepModels: modelSelection } : stepModelsDirtyRef.current ? { stepModels } : {}),
 			});
 			if (revisionRef.current === revision) {
 				failedRevisionRef.current = null;
@@ -774,15 +780,11 @@ export function SettingsPanel({
 	return (
 		<div className="panel-body panel-body-sticky" aria-busy={saving} style={saving ? { pointerEvents: "none", opacity: 0.72 } : undefined}>
 			<PanelStatus loading={loading} error={error} hasData={!!data} />
-			{data && <div className="field-hint">{saving ? "设置自动保存中…" : failedRevisionRef.current === revisionRef.current ? "自动保存失败，请再次修改后重试" : dirty ? "修改将在短暂停止操作后自动保存" : "设置会自动保存"}</div>}
+			{data && <div className="field-hint">{saving ? "设置自动保存中…" : failedRevisionRef.current === revisionRef.current ? "自动保存失败，请再次修改后重试" : dirty ? "修改将在短暂停止操作后自动保存" : "模型岗位选择立即保存，其他设置会自动保存"}</div>}
 			{modelData.error && <div className="sp-empty">模型清单读取失败：{modelData.error}</div>}
 			<section className="sp-section">
 				<h4>外观</h4>
-				<div className="toggle-row">
-					<span>黑夜模式</span>
-					<Toggle checked={dark} onChange={onTheme} />
-				</div>
-				<div className="field-hint">白昼 / 黑夜立刻切换，偏好记在本机浏览器，与会话配置无关。</div>
+				<ThemeSelector toast={toast} />
 			</section>
 			<AccessSection toast={toast} />
 			<section className="sp-section">
@@ -801,6 +803,7 @@ export function SettingsPanel({
 			</section>
 			<DatabasePluginPanel toast={toast} onOpenManager={onOpenDatabase} />
 			<MemorySection toast={toast} />
+			<NovelAiSection toast={toast} />
 			{data && (
 				<>
 					<section className="sp-section">
@@ -866,12 +869,12 @@ export function SettingsPanel({
 					<section className="sp-section">
 						<h4>模型插头</h4>
 						<div className="field-hint">
-							总插头是连接面板当前选择的剧情模型。保存“主演正文 / 小说开演”也会立即切换当前会话模型；Novel Play 内部卡始终跟随这个当前模型，不冻结创建角色卡时的旧路由。下列其他步骤可分别选择模型。
+							总插头是连接面板当前选择的剧情模型。保存“主演正文 / 小说开演”也会立即切换当前会话模型；Novel Play 内部卡始终跟随这个当前模型，不冻结创建角色卡时的旧路由。下列其他步骤可分别选择模型。召回／推进／文学导演为同一岗位，保存后同步数据库召回和剧情任务；拍后填表模型不变。
 						</div>
 						{([
 							["writer", "共用主演正文 / 小说开演"],
 							["literaryContinuity", "导演连续性证据"],
-							["literaryDirector", "正常文学导演（直出模式）"],
+							["literaryDirector", "记忆召回 / 剧情推进 / 文学导演"],
 							["literaryWorld", "后台世界推演"],
 							["worldProfile", "角色卡世界画像"],
 							["literaryWorldFacts", "拍后事实信封"],
@@ -880,7 +883,7 @@ export function SettingsPanel({
 							["ecologyGlobal", "全局叙事原型池"],
 							["ecologyCard", "角色卡生态池"],
 							["ecologyRuntime", "人物与场所生态"],
-                            ["npcParallel", "众生侧写 · 原插件生成与生态审阅"],
+                            ["npcParallel", "众生侧写 · 场外经历生成与生态审阅"],
                             ["veridisRewrite", "Veridis Rewrite · 拍后净化"],
 							["directorSetting", "导演设定核对"],
 							["directorIdeas", "导演角度构思"],
@@ -891,22 +894,24 @@ export function SettingsPanel({
 							["outlineReconcile", "大纲剧情校准"],
 							["outlineResearch", "大纲研究灵感"],
 							["outlineCorpusResearch", "导演小说研究检索"],
+							["dailyPlot", "日常剧情筹备（独立后台，须显式配置）"],
 							["novelDigest", "小说消化"],
 							["outlineAudit", "大纲提案审计"],
 							["scribe", "场记与状态兜底"],
 							["compaction", "前情压缩"],
 							["presetSort", "预设 AI 分拣"],
 						] as Array<[SideModelStep, string]>).map(([step, label]) => (
-							<ModelPlugSelector key={step} label={label} value={stepModels[step] ?? null} models={modelData.data} disabled={formDisabled || modelData.loading || !!modelData.error}
+							<ModelPlugSelector key={step} label={label} inputId={step === "dailyPlot" ? "model-plug-dailyPlot" : step === "literaryDirector" ? "model-plug-literaryDirector" : undefined} inheritLabel={step === "dailyPlot" ? "未配置（不借用其他岗位）" : undefined} showInheritedModel={step !== "dailyPlot"} value={stepModels[step] ?? null} models={modelData.data} disabled={formDisabled || modelData.loading || !!modelData.error}
 									onChange={(value: ModelRef | null) => {
+									const next = { ...stepModels };
+									if (value) next[step] = value;
+									else delete next[step];
 									stepModelsDirtyRef.current = true;
-									setStepModels((current) => {
-										const next = { ...current };
-										if (value) next[step] = value;
-										else delete next[step];
-										return next;
-									});
+									setStepModels(next);
 									touch();
+									// Start while this editor still owns the current workspace/lease.
+									// A delayed effect is cancelled on close and would lose the selection.
+									void save(next);
 								}} />
 						))}
 					</section>

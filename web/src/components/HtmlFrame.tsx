@@ -1,3 +1,4 @@
+import { workspaceFrameBootstrap } from "../workspace.ts";
 /**
  * 对话流 HTML 沙箱帧（底层展示通道）。
  *
@@ -53,7 +54,7 @@ export function HtmlFrame({
 	);
 	const [showSource, setShowSource] = useState(false);
 	const [open, setOpen] = useState(defaultOpen);
-	const srcDoc = buildSrcDoc(
+	const rawSrcDoc = buildSrcDoc(
 		html,
 		scripts,
 		seamless,
@@ -62,6 +63,9 @@ export function HtmlFrame({
 		dossierSnapshot,
 		dossierStatus,
 	);
+ const transport=scripts&&seamless?workspaceFrameBootstrap():"";
+ const srcDoc=transport?rawSrcDoc.replace(/<head(?:\s[^>]*)?>/i,head=>head+transport):rawSrcDoc;
+
 	/**
 	 * 沙箱矩阵：
 	 * - 静态 seamless：only same-origin（量高，无脚本）

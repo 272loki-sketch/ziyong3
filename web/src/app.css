@@ -9,6 +9,7 @@
    ============================================================ */
 
 :root {
+	color-scheme: light;
 	/* 底与面 */
 	--bg: #f7f4f0;
 	--bg-glow: #faf6f2;
@@ -52,8 +53,44 @@
 	--font-serif: "Noto Serif SC", "Source Han Serif SC", "STZhongsong", "SimSun", "宋体", serif;
 }
 
+/* ── 护眼：浅鼠尾草底；只影响宿主显示，不改原卡或正文 ── */
+html[data-theme="eye-care"] {
+	--bg: #e8eee2;
+	--bg-glow: #f0f3e9;
+	--surface: #f3f6ed;
+	--surface-dim: #e2e9d9;
+	--surface-deep: #d3ddc8;
+	--text: #35402e;
+	--text-strong: #202b1b;
+	--text-soft: #56634c;
+	--text-faint: #69765e;
+	--text-em: #637059;
+	--text-quote: #202b1b;
+	--hairline: #d2ddc7;
+	--hairline-strong: #b9c8ab;
+	--accent-wash: #e9e7d8;
+	--accent-wash-strong: #ded8c4;
+}
+html[data-theme="eye-care"] body {
+	background: radial-gradient(1000px 500px at 50% -8%, var(--bg-glow), transparent 60%), var(--bg);
+}
+.theme-picker { border: 0; margin: 0; padding: 0; min-width: 0; }
+.theme-picker legend { padding: 0 0 10px; color: var(--text-strong); font-size: 13px; }
+.theme-picker-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.theme-picker-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; padding: 10px; border: 1px solid var(--hairline-strong); border-radius: var(--radius); background: var(--surface); cursor: pointer; min-width: 0; position: relative; }
+.theme-picker-choice.is-selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.theme-picker-choice input { accent-color: var(--accent); margin: 0; }
+.theme-picker-choice strong { font-size: 12px; color: var(--text-strong); }
+.theme-picker-choice > span:last-child { font-size: 11px; color: var(--text-soft); line-height: 1.5; }
+.theme-picker-swatch { width: 100%; height: 32px; border-radius: 6px; border: 1px solid #0002; }
+.theme-picker-swatch--light { background: #f7f4f0; }
+.theme-picker-swatch--eye-care { background: #e8eee2; }
+.theme-picker-swatch--dark { background: #141110; }
+@media (max-width: 380px) { .theme-picker-options { grid-template-columns: 1fr; } .theme-picker-swatch { height: 24px; } }
+
 /* ── 黑夜：暖墨底 + 朱砂仍唯一彩色（禁蓝紫） ── */
 html[data-theme="dark"] {
+	color-scheme: dark;
 	--bg: #141110;
 	--bg-glow: #1c1816;
 	--surface: #1e1a18;
@@ -1717,6 +1754,11 @@ html[data-theme="dark"] .msg-md-code {
 .historical-image-slot > img { max-width: 100%; border-radius: 10px; }
 .historical-image-slot summary { cursor: pointer; color: var(--text-soft); }
 .historical-image-slot pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.nai-image-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.nai-image-controls .panel-error { flex-basis: 100%; overflow-wrap: anywhere; }
+.nai-settings fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.nai-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.nai-settings .field-input { min-width: 0; max-width: 100%; box-sizing: border-box; }
 .lightbox {
 	position: fixed;
 	inset: 0;
@@ -3658,7 +3700,10 @@ input.panel-search.num {
 		display: flex;
 		flex-wrap: nowrap;
 		align-items: center;
-		justify-content: center;
+		justify-content: safe center;
+		overflow-x: auto;
+		overscroll-behavior-x: contain;
+		max-width: 100%;
 		gap: 0;
 		padding: 4px 4px;
 		padding-top: calc(4px + env(safe-area-inset-top));
@@ -7798,3 +7843,50 @@ body.planning-open { overflow: hidden; }
 .settlement-note > span { flex: 1; min-width: 0; }
 .settlement-note > button { flex-shrink: 0; font-size: inherit; }
 @media (max-width: 600px) { .settlement-note { align-items: flex-start; flex-wrap: wrap; } }
+
+/* Independent play slots: no CSS reaches the author or card source. */
+.play-slots-backdrop { position: fixed; inset: 0; z-index: 130; display: grid; place-items: center; background: #0007; padding: 16px; }
+.play-slots-panel { width: min(1240px, 100%); height: min(880px, 95dvh); display: flex; flex-direction: column; background: var(--bg); border: 1px solid var(--hairline-strong); border-radius: var(--radius-l); box-shadow: var(--shadow-3); overflow: hidden; }
+.play-slots-header { display: flex; justify-content: space-between; align-items: flex-start; padding: 18px 24px; border-bottom: 1px solid var(--hairline); gap: 12px; }
+.play-slots-header h2 { margin: 0; font-size: 20px; } .play-slots-header p { margin: 6px 0 0; color: var(--text-soft); font-size: 12px; }
+.play-slots-layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); flex: 1; min-height: 0; }
+.play-slots-layout aside { padding: 16px; border-right: 1px solid var(--hairline); overflow: auto; }
+.play-slots-layout aside > button { width: 100%; margin-bottom: 12px; }
+.play-slots-content { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.play-slot-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; } .play-slot-pane[hidden] { display: none; }
+.play-slot-pane > header { display: flex; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--hairline); }
+.play-slot-pane > header span { color: var(--text-soft); font-size: 12px; }
+.play-slot-history { flex: 1; min-height: 0; overflow: auto; padding: 18px; }
+.play-slot-message { background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--radius); padding: 16px; margin: 0 0 14px; }
+.play-slot-message.is-user { background: var(--surface-dim); }
+.play-slot-message > strong { font-size: 12px; color: var(--accent); }
+.play-slot-message pre, .play-slot-outbox pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.85; margin: 8px 0 0; }
+.play-slot-message details { color: var(--text-soft); margin-top: 10px; }
+.play-slot-compose { background: var(--surface); padding: 12px 18px; border-top: 1px solid var(--hairline); }
+.play-slot-compose textarea { width: 100%; min-height: 86px; resize: vertical; background: var(--surface-dim); color: var(--text); border: 1px solid var(--hairline-strong); border-radius: var(--radius); padding: 10px; font: inherit; }
+.play-slot-compose > div { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 8px; }
+.play-slot-compose select { background: var(--surface); color: var(--text); border: 1px solid var(--hairline-strong); border-radius: 6px; padding: 6px; }
+.play-slot-nav { display: flex; gap: 4px; margin-bottom: 8px; }
+.play-slot-nav button { border: 1px solid var(--hairline-strong); border-radius: 8px; padding: 8px; color: var(--text); background: var(--surface); cursor: pointer; }
+.play-slot-nav button:first-child { flex: 1; min-width: 0; text-align: left; overflow-wrap: anywhere; } .play-slot-nav button[aria-current=page] { border-color: var(--accent); background: var(--accent-wash); }
+.play-slot-nav small { display: block; margin-top: 4px; color: var(--text-soft); } .play-slot-nav button:disabled { opacity: .5; cursor: not-allowed; }
+.play-slot-outbox { padding: 8px 18px; background: var(--accent-wash); font-size: 12px; max-height: 120px; overflow: auto; }
+@media (max-width: 700px) { .play-slots-backdrop { padding: 0; } .play-slots-panel { height: 100dvh; width: 100%; border-radius: 0; } .play-slots-header { padding: 12px; } .play-slots-layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0,1fr); } .play-slots-layout aside { border-right: 0; border-bottom: 1px solid var(--hairline); padding: 10px; max-height: 215px; } .play-slots-layout aside > .field-hint { display: none; } .play-slots-layout aside nav { display: flex; gap: 8px; overflow-x: auto; } .play-slot-nav { flex: 0 0 190px; } .play-slot-history { padding: 10px; } .play-slot-compose { padding: 10px; } }
+
+.play-slots-panel button, .play-slots-panel select { font-family: var(--font); }
+
+/* Canonical multi-card save ownership; never overlays or discards the editor. */
+.workspace-bar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:8px 14px; background:var(--panel-bg,var(--bg)); border-bottom:1px solid var(--border); font-size:13px; }
+.workspace-bar span { flex:1; min-width:220px; }
+.play-slot-nav { flex-wrap:wrap; }
+.play-slot-nav .slot-takeover { flex:1 0 100%; }
+.parallel-saves { margin:8px 0 14px; }
+.parallel-saves .drawer-btn { display:block; width:100%; margin:6px 0; }
+
+/* Details/actions stay inside the ledger overlay; the collapsed strip stays one row. */
+.ledger-sync-notice { padding: 6px 10px; color: var(--text); font-size: .8rem; line-height: 1.5; overflow-wrap: anywhere; border-left: 3px solid #d29844; }
+
+.ledger-retry-controls { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:4px 0; }
+.ledger-retry-controls small { color:var(--text-soft); font-size:.75rem; overflow-wrap:anywhere; }
+
+.ledger-summary-status { flex:none; white-space:nowrap; color:var(--text-soft); font-size:11px; line-height:1; }

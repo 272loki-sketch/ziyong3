@@ -1,3 +1,4 @@
+import { scopedUrl } from "../workspace.ts";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { configureTavernPlugin, getTavernPluginsStatus, runTavernPluginAction, type TavernPluginAction, type TavernPluginId, type TavernPluginInfo, type TavernPluginsStatus } from "../api.ts";
 import { IconBack, IconClose, IconRefresh, IconPuzzle, IconCheck } from "./icons.tsx";
@@ -131,7 +132,7 @@ export function OriginalTavernPluginManager({ plugin, contextTick = 0, onClose, 
 			key={`${plugin.id}:${plugin.commit ?? "unverified"}:${contextTick}:${attempt}`}
 			title={`${name}原上游设置`}
 			data-context-tick={contextTick}
-			src={`/tavern-plugin-host.html?view=manager&plugin=${plugin.id}${mvu?"&focus=mvu":""}&attempt=${attempt}&contextTick=${contextTick}`}
+			src={scopedUrl(`/tavern-plugin-host.html?view=manager&plugin=${plugin.id}${mvu?"&focus=mvu":""}&attempt=${attempt}&contextTick=${contextTick}`)}
 			sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups"
 			allow="clipboard-read; clipboard-write"
 			onError={() => { setFrameError("原上游管理台页面未载入；服务端可能不可用。请重试。"); setPhase("error"); }}
@@ -181,11 +182,12 @@ export function TavernPluginsPanel({ toast, contextTick = 0, managerMode = false
 	const request = useRef(0);
 	const generation = useRef(0);
 	const actionRunning = useRef(false);
-	const refresh = useCallback(async (visible = false): Promise<TavernPluginsStatus> => {
+	const statusContext = useRef<string | null>(null);
+	const refresh = useCallback(async (visible = false, fresh = true): Promise<TavernPluginsStatus> => {
 		const token = ++request.current;
 		if (visible && mounted.current) setLoading(true);
 		try {
-			const next = await getTavernPluginsStatus();
+			const next = await getTavernPluginsStatus({ fresh });
 			if (mounted.current && token === request.current) { setStatus(next); setError(""); }
 			return next;
 		} catch (cause) {
@@ -197,7 +199,10 @@ export function TavernPluginsPanel({ toast, contextTick = 0, managerMode = false
 		mounted.current = true;
 		generation.current++;
 		actionRunning.current = false; setBusy(false); setManagerId(null);
-		void refresh(true).catch(() => {});
+		const nextContext = `${contextTick}:${pluginId ?? "all"}`;
+		const changed = statusContext.current !== null && statusContext.current !== nextContext;
+		statusContext.current = nextContext;
+		void refresh(true, changed).catch(() => {});
 		const poll = window.setInterval(() => { if (!actionRunning.current) void refresh().catch(() => {}); }, 10_000);
 		return () => { mounted.current = false; generation.current++; request.current++; window.clearInterval(poll); };
 	}, [contextTick, pluginId, refresh]);

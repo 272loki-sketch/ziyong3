@@ -107,6 +107,28 @@ test("append upgrade is branch-local and projects old progress into the child pa
 	assert.equal(projected?.progress.nodeId, b);
 	assert.equal(projected?.progress.packageRevision, "child-revision");
 });
+test("post-upgrade progress and conflicts supersede inherited state without leaking sibling state", async () => {
+	const child = { ...pkg, revision: "child-revision", lineage: { parentDocId: "book", parentRevision: pkg.revision, relation: "append-only" as const, inheritedNodeIds: pkg.nodes.map(node => node.id), newNodeIds: [] } };
+	const from = { docId: "book", revision: pkg.revision, startNodeId: a, position: "before" as const, anchorKind: "node" as const };
+	const to = { ...from, revision: child.revision };
+	const oldState = { id: "old-state", type: "custom", customType: "rp-novel-play", data: { version: 1, card: from, progress: { packageRevision: pkg.revision, nodeId: b, position: "after" }, conflicts: [], preparedFromLeafId: "u1" } };
+	const upgrade = { id: "upgrade", type: "custom", customType: NOVEL_PLAY_UPGRADE_ENTRY_TYPE, data: { version: 1, from, to, sourceLeafId: "u1" } };
+	const upgradedBranch = [...branch, oldState, upgrade];
+	const conflicts = [{ packageRevision: child.revision, nodeId: e, sourceEntryIds: ["u1"] }];
+	const currentState = { id: "child-state", type: "custom", customType: "rp-novel-play", data: { version: 1, card: to, progress: { packageRevision: child.revision, nodeId: d, position: "after" }, conflicts, preparedFromLeafId: "upgrade" } };
+	const currentBranch = [...upgradedBranch, currentState];
+	assert.deepEqual(novelPlayStateFromBranch(currentBranch, to, child), currentState.data);
+	assert.equal(novelPlayStateFromBranch(upgradedBranch, to, child)?.progress.nodeId, b);
+	const invalid = { ...currentState, data: { ...currentState.data, preparedFromLeafId: "sibling-only" } };
+	assert.equal(novelPlayStateFromBranch([...upgradedBranch, invalid], to, child)?.progress.nodeId, b);
+	let startingAnchor: unknown;
+	const prepared = await prepareNovelPlayTurn({ cwd: "/unused", rawCard, branch: currentBranch, expectedLeafId: "child-state", getLeafId: () => "child-state", skillBody: "strict", loadPackage: () => ({ version: 1, source, package: child }), modelCall: async (_system, user) => {
+		startingAnchor = JSON.parse(user).startingAnchor;
+		return JSON.stringify({ version: 1, progress: currentState.data.progress, conflicts: [] });
+	} });
+	assert.deepEqual(startingAnchor, currentState.data.progress);
+	assert.deepEqual(prepared?.state.conflicts, conflicts);
+});
 test("engine patch applies LF/CRLF legacy input and preserves each newline style", () => {
 	const legacyLf = [
 		'from "../novel-play/runtime.ts"; // novel-play-runtime-integration-v1',

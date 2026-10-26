@@ -15,6 +15,7 @@ import type { ExtensionAPI } from "@liyuan/agent-runtime";
 import { completeSimple } from "@liyuan/ai/compat";
 import { Type } from "typebox";
 
+import { resolveWorldbooks } from "../../src/worldbook-bindings.ts";
 import { loadCardFile } from "../../src/card.ts";
 import { buildImportBlock, cleanChat, DEFAULT_STRIP_TAGS, parseStChat, serializeForImportSummary } from "../../src/chatlog.ts";
 import { findCommand } from "../../src/commands.ts";
@@ -31,8 +32,6 @@ import { memoryArchiveCompacted, memoryRecallForTurn, memorySearch } from "../..
 import {
 	constantEntries,
 	appendOverlayEntry,
-	applyLoreSourceState,
-	loadLorebookFile,
 	mergeEntries,
 	mountedLorebookPaths,
 	overlayPathFor,
@@ -360,13 +359,13 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 	};
 
 	/** 同 syncPanelsFromDisk：世界状态经助手/面板编辑后，剧情侧须从盘对齐 */
-	const syncStateFromDisk = () => {
+	const syncStateFromDisk = (snapshot = true) => {
 		if (!stateFile) return;
 		try {
 			const disk = { ...defaultState(), ...loadState(stateFile) };
 			if (JSON.stringify(disk) !== JSON.stringify(state)) {
 				state = disk;
-				snapshotState();
+				if (snapshot) snapshotState();
 			}
 		} catch {
 			// 保持内存
@@ -1240,17 +1239,9 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				card = loadCardFile(cardAbs);
 			}
 
-			// 旧扩展的独立书/补充设定集合；Web台上引擎由 loadStageMaterials 另含卡内书。
-			// 来源覆盖先应用再合并，不改变旧扩展的提示词装配边界。
-			const fileGroups: LorebookEntry[][] = [];
-			for (const rel of mountedLorebookPaths(config)) {
-				const abs = resolvePath(ctx.cwd, rel);
-				if (existsSync(abs)) fileGroups.push(applyLoreSourceState(loadLorebookFile(abs), config, "file", rel));
-			}
-			const fileEntries = mergeEntries(...fileGroups);
+			const worldbooks = resolveWorldbooks(ctx.cwd, config, { card, sessionId: ctx.sessionManager.getSessionId() });
 			overlayFile = overlayPathFor(ctx.cwd, card.name);
-			const overlayEntries = existsSync(overlayFile) ? applyLoreSourceState(loadLorebookFile(overlayFile), config, "agent", config.card) : [];
-			entries = mergeEntries(fileEntries, overlayEntries);
+			entries = mergeEntries(...worldbooks.books.map(book => book.entries));
 
 			// 转换后的预设（可选）：system 块进 system prompt，postHistory 块进末端注入
 			// 工作草稿（preset-override.json）优先，与 hotReload 一致
@@ -1882,15 +1873,9 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 			const cardAbs = resolvePath(cwd, config.card);
 			card = loadCardFile(cardAbs);
 		}
-		const fileGroups: LorebookEntry[][] = [];
-		for (const rel of mountedLorebookPaths(config)) {
-			const abs = resolvePath(cwd, rel);
-			if (existsSync(abs)) fileGroups.push(applyLoreSourceState(loadLorebookFile(abs), config, "file", rel));
-		}
-		const fileEntries = mergeEntries(...fileGroups);
+		const worldbooks = resolveWorldbooks(cwd, config, { card, sessionId: stateFile?.split(/[\\/]/).at(-1)?.replace(/\.json$/, "") });
 		overlayFile = overlayPathFor(cwd, card.name);
-		const overlayEntries = existsSync(overlayFile) ? applyLoreSourceState(loadLorebookFile(overlayFile), config, "agent", config.card) : [];
-		entries = mergeEntries(fileEntries, overlayEntries);
+		entries = mergeEntries(...worldbooks.books.map(book => book.entries));
 		preset = null;
 		if (config.preset) {
 			// 工作草稿优先（面板改开关/正文立即生效但不写盘）；无草稿才读预设文件

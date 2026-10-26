@@ -1,3 +1,4 @@
+import { scopedUrl } from "./workspace.ts";
 /**
  * 附件随消息：文件已落盘后，路径清单附在消息尾行。
  * 支持两类目录：
@@ -58,9 +59,9 @@ export function toAttachmentView(file: string): AttachmentView {
 /** 附件 HTTP 地址（与 static 托管一致） */
 export function attachmentUrl(a: AttachmentView): string {
 	if (a.kind === "media" || a.file.startsWith(MEDIA_DIR)) {
-		return `/media/${a.name.split("/").map(encodeURIComponent).join("/")}`;
+		return scopedUrl(`/media/${a.name.split("/").map(encodeURIComponent).join("/")}`);
 	}
-	return `/uploads/${encodeURIComponent(a.name)}`;
+	return scopedUrl(`/uploads/${encodeURIComponent(a.name)}`);
 }
 
 /** 组装消息尾行 */

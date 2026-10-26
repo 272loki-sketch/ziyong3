@@ -7,15 +7,16 @@
  */
 
 type SyncFn = () => void;
+type StateSyncFn = (snapshot?: boolean) => void;
 
 let panelSync: SyncFn | null = null;
-let stateSync: SyncFn | null = null;
+let stateSync: StateSyncFn | null = null;
 
 export function registerStoryPanelSync(fn: SyncFn | null): void {
 	panelSync = fn;
 }
 
-export function registerStoryStateSync(fn: SyncFn | null): void {
+export function registerStoryStateSync(fn: StateSyncFn | null): void {
 	stateSync = fn;
 }
 
@@ -29,9 +30,9 @@ export function syncStoryPanelsFromDisk(): void {
 }
 
 /** 从磁盘收编剧情扩展的世界状态内存 + 树快照 */
-export function syncStoryStateFromDisk(): void {
+export function syncStoryStateFromDisk(snapshot = true): void {
 	try {
-		stateSync?.();
+		stateSync?.(snapshot);
 	} catch {
 		// ignore
 	}

@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { VeridisRewriteRuntime, defaultVeridisHostSettings, type VeridisRewriteRunInput, type VeridisRewriteSourceLike } from '../server/veridis-rewrite-runtime.ts';
 import type { VeridisRewriteCandidate } from '../server/veridis-rewrite-source.ts';
+import { classifyModelFailure } from '../src/stage/model-failure.ts';
+import { computeVeridisRewrite } from '../src/stage/veridis-rewrite.ts';
 
 // Explicit synthetic public-module protocol fixture, not a copy of upstream code.
 const DEFAULTS = `export const extensionName = 'synthetic-rewrite';
@@ -33,7 +35,7 @@ export async function runAiRewriteForMessageNow(_payload,{preparedTask:task}){
  const maxBatch=Math.max(1,settings.aiRewrite.maxItemsPerRequest||20),accepted=new Map;
  for(let index=0;index<task.items.length;index+=maxBatch){
    const items=task.items.slice(index,index+maxBatch),prompt=settings.aiRewrite.promptTemplate+'\\n'+items.map(item=>'<rewrite_target id="'+item.id+'">'+item.text+'</rewrite_target>').join('\\n');
-   try {const config={generation_id:'fixture-'+index,ordered_prompts:[{role:'user',content:prompt}],custom_api:{key:settings.aiRewrite.apiKey,max_tokens:settings.aiRewrite.maxTokens,temperature:settings.aiRewrite.temperature}};
+    try {const config={generation_id:'fixture-'+index,ordered_prompts:[{role:'user',content:prompt}],custom_api:{key:settings.aiRewrite.apiKey,max_tokens:settings.aiRewrite.maxTokens > 0 ? settings.aiRewrite.maxTokens : 'unset',temperature:settings.aiRewrite.temperature}};
     const value=await globalThis.TavernHelper.generateRaw(config);
     parseAiResponse(value,new Map(items.map(item=>[item.id,item]))).forEach((text,id)=>accepted.set(id,text));
    }catch{return {status:'fallback-applied'};}
@@ -117,6 +119,18 @@ test('empty/disabled rules and absent exact narrative ranges explicitly skip wit
   }
 }));
 
+test('original unset output budget stays explicit through the Worker bridge, positive budgets stay exact', () => fixture(async ({ runtime }) => {
+  for (const maxTokens of [0, 1, 512, 65536]) {
+    const result = await runtime.run(input({ settings: { aiRewrite: { maxTokens } }, generate: async request => {
+      assert.equal(request.maxTokens, maxTokens);
+      assert.equal(request.useProviderDefaultMaxTokens, maxTokens === 0 ? true : undefined);
+      return '{"hit-1":"他说了细微的变化。"}';
+    } }));
+    assert.equal(result.calls, 1);
+    assert.deepEqual(result.errors, []);
+  }
+}));
+
 test('target filtering preserves full options/MVU/HTML/fences and never submits their protected matches', () => fixture(async ({ runtime }) => {
   const suffix='\n<options>不易察觉。</options>\n<UpdateVariable>不易察觉。</UpdateVariable>\n<StatusPlaceHolderImpl/>\n<div>不易察觉。</div>\n```html\n不易察觉。\n```';
   const author='<content>'+narrative+'</content>'+suffix;
@@ -138,9 +152,48 @@ test('original Markdown/emphasis and quotation structure are protected inside ad
 }));
 
 test('invalid original JSON target protocol is not called successful or admitted as a fallback', () => fixture(async ({ runtime }) => {
-  for(const value of ['```json\n{"hit-1":"change"}\n```','{"other":"change"}','{"hit-1":0}','{}']){
+  for(const [value,reason] of [['```json\n{"hit-1":"change"}\n```',/JSON 解析失败/],['{"other":"change"}',/schema 目标回执校验失败/],['{"hit-1":0}',/schema 目标回执校验失败/],['{}',/schema 目标回执为空/]] as const){
     const result=await runtime.run(input({generate:async()=>value}));
-    assert.equal(result.changed,false);assert.equal(result.text,narrative);assert.equal(result.calls,1);assert.ok(result.errors.length>0);
+    assert.equal(result.changed,false);assert.equal(result.text,narrative);assert.equal(result.calls,1);assert.match(result.errors.join(' '),reason);
+    assert.equal(classifyModelFailure(result.errors.join(' ')).retryable,true);
+  }
+}));
+
+test('managed failures survive Worker fallback and receipt creation with safe retry classification', () => fixture(async ({ runtime }) => {
+  for (const [message, status, kind, retryable] of [
+    ['invalid api key', undefined, 'auth', false],
+    ['synthetic private detail', 401, 'auth', false],
+    ['model not found', undefined, 'model', false],
+    ['insufficient_quota', 429, 'quota', false],
+    ['synthetic private detail', 429, 'rate-limit', true],
+    ['fetch failed', undefined, 'transport', true],
+    ['request timed out', undefined, 'timeout', true],
+    ['Provider finish_reason: content_filter', undefined, 'content-filter', false],
+  ] as const) {
+    const runInput = input({ generate: async () => { throw Object.assign(new Error(`${message}`), { status }); } });
+    const receipt = await computeVeridisRewrite({ enabled: () => true, claimRequest: () => {}, run: value => runtime.run({ ...value, sourceEntryId: value.scope.sourceEntryId }) }, {
+      ...runInput, scope: { sessionId: 'synthetic-session', card: 'synthetic-card', sourceEntryId: runInput.sourceEntryId, visibleEntryIds: [runInput.sourceEntryId] }, guard: () => {},
+    });
+    assert.equal(receipt.status, 'failed');
+    assert.equal(receipt.calls, 1);
+    assert.equal(receipt.text, undefined);
+    assert.doesNotMatch(receipt.error!, /synthetic private detail/);
+    const failure = classifyModelFailure(receipt.error);
+    assert.equal(failure.kind, kind);
+    assert.equal(failure.retryable, retryable);
+  }
+}));
+
+test('partial target maps retain a safe schema failure through the source-bound receipt', () => fixture(async ({ runtime }) => {
+  const runInput = input({authorDraft:narrative.repeat(2),narrative:narrative.repeat(2),generate:async()=>'PB_PRIVATE_RESPONSE'});
+  for (const response of ['{"hit-1":"synthetic private replacement"}', '{}', 'PB_PRIVATE_RESPONSE']) {
+    const receipt = await computeVeridisRewrite({enabled:()=>true,claimRequest:()=>{},run:value=>runtime.run({...value,sourceEntryId:value.scope.sourceEntryId})}, {
+      ...runInput,generate:async()=>response,scope:{sessionId:'synthetic-session',card:'synthetic-card',sourceEntryId:runInput.sourceEntryId,visibleEntryIds:[runInput.sourceEntryId]},guard:()=>{},
+    });
+    assert.equal(receipt.status,'failed');assert.equal(receipt.calls,1);assert.equal(receipt.text,undefined);
+    assert.match(receipt.error!,/JSON|schema/);assert.doesNotMatch(receipt.error!,/synthetic private replacement|PB_PRIVATE_RESPONSE/);
+    assert.equal(classifyModelFailure(receipt.error).kind,'format');assert.equal(classifyModelFailure(receipt.error).retryable,true);
+    if(response.includes('hit-1'))assert.match(receipt.error!,/缺少目标回执/);
   }
 }));
 
@@ -149,10 +202,10 @@ test('custom prompt example IDs do not replace the original actual target map', 
   assert.equal(result.changed,true);assert.equal(result.calls,1);assert.deepEqual(result.errors,[]);
 }));
 
-test('per-run hard limit is eight managed generation calls', () => fixture(async ({ runtime }) => {
+test('more than eight managed generations remain available within the task deadline', () => fixture(async ({ runtime }) => {
   const repeated=Array.from({length:10},(_,index)=>`${index}处不易察觉。`).join('');
   const result=await runtime.run(input({authorDraft:repeated,narrative:repeated,settings:{aiRewrite:{maxItemsPerRequest:1}}}));
-  assert.equal(result.calls,8);assert.equal(result.changed,false);assert.equal(result.text,repeated);assert.ok(result.errors.length>0);
+  assert.equal(result.calls,10);assert.equal(result.changed,true);assert.equal(result.text,repeated.replaceAll('不易察觉','细微'));assert.deepEqual(result.errors,[]);
 }));
 
 test('late provider result is rejected by source guard and does not alter the original', () => fixture(async ({ runtime }) => {

@@ -18,7 +18,7 @@ function isMain() {
   catch { return false; }
 }
 
-const entries = ['README.md', 'TESTING.md', 'AGENTS.md', 'CLAUDE.md', 'docs/DOCUMENTATION-INDEX.md'];
+const entries = ['README.md', 'TESTING.md', 'AGENTS.md', 'CLAUDE.md'];
 
 // Deliberately a small Markdown parser, not a heading or full CommonMark validator.
 function links(text) {

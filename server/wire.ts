@@ -1,3 +1,9 @@
+import { createHash } from "node:crypto";
+import {parseSupplementaryResponse} from '../src/stage/supplementary.ts';
+import {mergedPrepView} from '../src/stage/merged-prep-view.ts';
+import type { LedgerStatus } from "../src/stage/ledger-status.ts";
+export type { LedgerStatus };
+import type { PlotChoiceInput } from "../src/plot-options/types.ts";
 import type {VeridisRewriteReceipt} from "../src/stage/veridis-rewrite.ts";
 import type {NpcParallelReceipt} from "../src/stage/npc-parallel.ts";
 import { presentationDeliveryView, type PresentationDeliveryView } from "../src/stage/agent-presentation.ts";
@@ -125,7 +131,8 @@ export interface WireMsg {
 	generationWorkflow?: GenerationWorkflow;
 	presentationDelivery?: PresentationDeliveryView;
  /** Unchanged main-author output, for read-only regex preview (never regenerated). */
- authorDelivery?: string;
+  authorDelivery?: string;
+  supplementaryDelivery?: {status:string;receiptHash:string;version:number};
 	/** 已 flush 的用户输入 ID，用于 ACK 丢失后的 hello 对账。 */
 	messageId?: string;
 	channel: WireChannel;
@@ -309,6 +316,7 @@ export interface UpdateWire {
 
 /** Server → Client 帧 */
 export type ServerFrame =
+ | { type: "workspace_changed" }
 	| {
 			type: "hello";
 			/** 宿主进程真实应用版本；旧 host 不提供此字段。 */
@@ -325,6 +333,7 @@ export type ServerFrame =
 			userName: string;
 			messages: WireMsg[];
 			state: WorldState | null;
+			ledgerStatus?: LedgerStatus;
 			world: LiteraryWorldState;
 			worldAudit: WorldAuditWireView | null;
 			worldModules: ModularWorldWireView;
@@ -363,7 +372,7 @@ export type ServerFrame =
 	| { type: "stream"; state: "clear" }
 	| { type: "agent"; state: "start" | "settling" | "end" }
 	| { type: "activity"; activity: WireActivity }
-	| { type: "state"; state: WorldState }
+	| { type: "state"; state: WorldState; ledgerStatus?: LedgerStatus }
 	/** agent 自建面板变化（panel_write/close 落盘、rewind 回退）：活跃面板全量推送（同 state 的 fs.watch 机制） */
 	| { type: "panels"; panels: RpPanel[] }
 	| { type: "stats"; stats: WireStats }
@@ -418,7 +427,7 @@ export interface AssistantSessionInfo {
 /** Client → Server 帧 */
 export type ClientFrame =
 	/** 新前端必填目标和 ID；无二者仅留给 legacy。斜杠命令不自动重试。 */
-	| { type: "prompt"; text: string; sessionId?: string; messageId?: string; generationMode?: GenerationMode }
+	| { type: "prompt"; plotChoice?: PlotChoiceInput; text: string; sessionId?: string; messageId?: string; generationMode?: GenerationMode }
 	| { type: "abort" }
 	/**
 	 * 重新生成最后一轮。
@@ -602,10 +611,11 @@ function workflowView(details: Record<string, unknown>): WireBeatWorkflow | unde
 		edits: finiteNumber(wf.edits), lookups: finiteNumber(wf.lookups), rounds: finiteNumber(wf.rounds), outputTokens: finiteNumber(wf.outputTokens),
 		narrativeChars: finiteNumber(wf.narrativeChars), durationMs: finiteNumber(wf.durationMs),
 	};
+	const mergedPrep = mergedPrepView(prep, projectTurnPerformance(details.rpPerformance, typeof details.rpPerformanceOwner === "string" ? details.rpPerformanceOwner : "")?.phases);
 	const stages: WireWorkflowStage[] = [
 		{ id: "continuity", label: "文学连续性", status: stageStatus("continuity", continuity ? "success" : "skipped"), summary: continuity ? "已生成并交给拍前导演" : status.continuity === "degraded" ? "调用或解析失败，本拍无补充工件" : "本拍未触发" },
 		{ id: "plot-adaptation", label: "生态剧情适配", status: stageStatus("plotAdaptation", prep.plotAdaptation ? "success" : "skipped"), summary: prep.plotAdaptation ? "卡级语法已将生态候选改造成当前事件" : status.plotAdaptation === "degraded" ? "调用或解析失败，正文按原流程继续" : "生态关闭或未运行" },
-		{ id: "director", label: "Stitches 导演", status: stageStatus("director", direction ? "success" : typeof prep.literaryDirection === "string" ? "reused" : "skipped"), summary: direction ? "方向已生成并注入主演" : typeof prep.literaryDirection === "string" ? "旧导演工件已注入主演" : status.director === "degraded" ? "调用或解析失败，主演无导演工件继续" : "本拍未运行" },
+		{ id: "director", label: "文学导演", status: stageStatus("director", direction ? "success" : typeof prep.literaryDirection === "string" ? "reused" : "skipped"), summary: direction ? "方向已生成并注入主演" : typeof prep.literaryDirection === "string" ? "旧导演工件已注入主演" : status.director === "degraded" ? "调用或解析失败，主演无导演工件继续" : "本拍未运行", ...(mergedPrep ?? {}) },
 		{ id: "scene-conductor", label: "场面编排", status: stageStatus("sceneConductor", prep.sceneConductor ? "success" : "skipped"), summary: prep.sceneConductor ? "已组织角色动作、信息边界和停点" : status.sceneConductor === "degraded" ? "调用或解析失败，主演按导演方向继续" : "本拍未运行" },
 		{ id: "ecology-arrival", label: "生态抵达", status: stageStatus("ecologyArrival", prep.literaryEcology ? "success" : "skipped"), summary: status.ecologyArrival === "degraded" ? "候选失败或被门禁拒绝，沿用上一快照" : prep.literaryEcology ? "生态切面已提供给导演" : "生态关闭或未运行" },
 		{ id: "writer", label: "主演分段演出", status: "success", summary: `${writer.appends || writer.writes} 个稿段 · ${writer.rounds} 轮` },
@@ -635,7 +645,62 @@ function workflowView(details: Record<string, unknown>): WireBeatWorkflow | unde
  * opts.backstage：该轮用户以 // 开头（幕后轮），助手回复走 backstage 通道
  * （PLAN-PHASE3 §6.1 显示通道——排版区隔，非上下文切割）。
  */
-export type ToWireOpts = { backstage?: boolean; skin?: DisplaySkin | null };
+export type ToWireOpts = {
+ backstage?: boolean;
+ skin?: DisplaySkin | null;
+ /** Source-bound native plugin display additions; never part of authorDelivery or story facts. */
+ displaySuffixes?: ReadonlyMap<string, string>;
+ /** Verified source-bound presentation (e.g. Veridis), selected before all skin/native additions. */
+ displayOverrides?: ReadonlyMap<string, string>;
+};
+
+/** Current-branch receipts bind exact saved bytes, never the selected display rewrite. */
+export function supplementaryDeliveryProjection(branch: ReadonlyArray<Record<string, unknown>>, sourceEntryId: string, author: unknown, narrative: unknown): Record<string, unknown> {
+	if (typeof author !== "string" || typeof narrative !== "string") return {};
+	const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+	const authorHash = hash(author), narrativeHash = hash(narrative);
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type !== "custom" || entry.customType !== "rp-supplementary-delivery" || !entry.data || typeof entry.data !== "object" || Array.isArray(entry.data)) continue;
+		const data = entry.data as Record<string, unknown>;
+		if (![1,2,3,4].includes(Number(data.version)) || data.sourceEntryId !== sourceEntryId || data.authorHash !== authorHash || data.narrativeHash !== narrativeHash
+			|| !["pending", "complete", "failed", "skipped"].includes(String(data.status))) continue;
+  let status=data.status;
+  if(Number(data.version)>=2&&data.status==='complete'){
+   try{
+    const input=typeof data.frozenInput==='string'?JSON.parse(data.frozenInput):null;
+    if(!input||input.authorDraft!==author||input.narrative!==narrative||hash(String(data.frozenInput))!==data.materialHash||parseSupplementaryResponse(JSON.stringify(data.response),String(data.frozenInput)).text!==data.text)status='failed';
+   }catch{status='failed';}
+  }
+		return {
+			rpSupplementaryDelivery: { status },
+   rpSupplementaryReceipt:{status,version:data.version,receiptHash:hash(JSON.stringify(data))},
+			...(status === "complete" && typeof data.text === "string" && data.text.trim() ? { rpSupplementaryText: data.text } : {}),
+		};
+	}
+	return {};
+}
+
+/**
+ * MVU 只额外读取附属补交里带变量更新块的条目（作者漏交的 UpdateVariable）。
+ * 只认通过校验、绑定同一原稿与正文的 complete 收据；显示用附属文本不进入 MVU。
+ */
+export function supplementaryMvuInput(branch: ReadonlyArray<Record<string, unknown>>, sourceEntryId: string, author: unknown, narrative: unknown): { __liyuanSupplementaryVariables?: string } {
+	const projection = supplementaryDeliveryProjection(branch, sourceEntryId, author, narrative);
+	if ((projection.rpSupplementaryDelivery as { status?: string } | undefined)?.status !== "complete") return {};
+	const validated = projection.rpSupplementaryReceipt as { receiptHash?: string; version?: number } | undefined;
+	// Legacy display receipts did not validate a structured response. Never use their items as executable input.
+	if (!validated || Number(validated.version) < 2) return {};
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index], data = entry.data as Record<string, unknown> | undefined;
+		if (entry.type !== "custom" || entry.customType !== "rp-supplementary-delivery" || data?.sourceEntryId !== sourceEntryId || data.status !== "complete"
+			|| createHash("sha256").update(JSON.stringify(data)).digest("hex") !== validated.receiptHash) continue;
+		const items = Array.isArray((data.response as { items?: unknown })?.items) ? (data.response as { items: Array<{ text?: unknown }> }).items : [];
+		const text = items.map(item => typeof item?.text === "string" ? item.text : "").filter(t => /<UpdateVariable(?:\s[^>]*)?>[\s\S]*?<\/UpdateVariable\s*>/i.test(t)).join("\n\n").trim();
+		return text ? { __liyuanSupplementaryVariables: text } : {};
+	}
+	return {};
+}
 
 export function toWireMsg(m: unknown, names: WireNames, opts?: ToWireOpts): WireMsg | null {
 	if (!m || typeof m !== "object") return null;
@@ -654,6 +719,20 @@ export function toWireMsg(m: unknown, names: WireNames, opts?: ToWireOpts): Wire
 	if (msg.role === "assistant") {
 		const aborted = msg.stopReason === "aborted";
 		const channel: WireChannel = opts?.backstage ? "backstage" : "narrative";
+		const entryId = authorDetails?.rpEntryId;
+  const candidateSuffix = !aborted && channel === "narrative" && typeof entryId === "string"
+   ? opts?.displaySuffixes?.get(entryId) ?? "" : "";
+  // An optional plugin marker is useful only when an enabled original renderer at this
+  // message depth can consume it. Do not leak a bare marker on other cards/old floors.
+  const suffix = candidateSuffix && skin?.rules.some(rule => {
+   try { return new RegExp(rule.source, rule.flags).test(candidateSuffix); } catch { return false; }
+  }) ? candidateSuffix : "";
+  const displayOverride = !aborted && channel === "narrative" && typeof entryId === "string"
+   ? opts?.displayOverrides?.get(entryId) : undefined;
+   const supplementary = !aborted && channel === "narrative" && typeof authorDetails?.rpSupplementaryText === "string"
+    && (authorDetails.rpSupplementaryDelivery as {status?:unknown} | undefined)?.status === "complete"
+    ? authorDetails.rpSupplementaryText : "";
+   const displaySource = (displayOverride ?? text) + (supplementary ? "\n\n" + supplementary : "") + suffix;
 		const modelThinking = thinkingOf(msg.content).trim();
 		// 正常中间 tool 轮：跳过（防叠泡）；**用户中断**的半截须上屏，即便夹着 toolCall
 		if (!aborted && hasToolCall(msg.content)) return null;
@@ -665,7 +744,7 @@ export function toWireMsg(m: unknown, names: WireNames, opts?: ToWireOpts): Wire
 		// narrative：先卡显示正则再策略；backstage 仍纯文本策略（不套角色卡皮肤）
 		const display = text
 			? channel === "narrative"
-				? prepareDisplayText(text, skin)
+				? prepareDisplayText(displaySource, skin)
 				: prepareDisplayText(text, null)
 			: "";
 
@@ -692,9 +771,10 @@ export function toWireMsg(m: unknown, names: WireNames, opts?: ToWireOpts): Wire
 			msg.details && typeof msg.details === "object" && !Array.isArray(msg.details)
 				? (msg.details as Record<string, unknown>).rpTimeline
 				: undefined;
-		const rpTimeline = originalAuthor
-   ? [...(Array.isArray(savedTimeline) ? savedTimeline.filter(seg => seg?.kind === "thinking") : []), {kind:"text",text:originalAuthor}]
-   : savedTimeline;
+		const rpTimeline = originalAuthor || displayOverride !== undefined || supplementary
+   ? [...(Array.isArray(savedTimeline) ? savedTimeline.filter(seg => seg?.kind === "thinking") : []), {kind:"text",text:displaySource}]
+   : suffix && Array.isArray(savedTimeline) && savedTimeline.length
+    ? [...savedTimeline, {kind:"text",text:suffix}] : savedTimeline;
   const tlSkin = channel === "narrative" ? skin : null;
 		const timeline =
 			Array.isArray(rpTimeline) && rpTimeline.length > 0
@@ -721,6 +801,7 @@ export function toWireMsg(m: unknown, names: WireNames, opts?: ToWireOpts): Wire
 			channel,
 			name: names.charName,
    ...(originalAuthor ? {authorDelivery:originalAuthor} : {}),
+   ...(authorDetails?.rpSupplementaryReceipt ? {supplementaryDelivery:authorDetails.rpSupplementaryReceipt as WireMsg['supplementaryDelivery']} : {}),
 			...(modelDiagnosticsView((msg.details as Record<string,unknown>|undefined)?.rpModelDiagnostics)?.length ? {modelDiagnostics:modelDiagnosticsView((msg.details as Record<string,unknown>).rpModelDiagnostics)} : {}),
 			...(isGenerationMode((msg.details as Record<string, unknown> | undefined)?.rpGenerationMode) ? { generationMode: (msg.details as Record<string, unknown>).rpGenerationMode as GenerationMode } : {}),
 			...(presentationDeliveryView((msg.details as Record<string, unknown> | undefined)?.rpPresentationDelivery) ? { presentationDelivery: presentationDeliveryView((msg.details as Record<string, unknown>).rpPresentationDelivery) } : {}),
@@ -931,7 +1012,7 @@ function depthPlan(patched: unknown[], names: WireNames): number[] {
 export function toWireHistory(
 	messages: unknown[],
 	names: WireNames,
-	opts?: { skin?: DisplaySkin | null },
+	opts?: Pick<ToWireOpts, "skin" | "displaySuffixes" | "displayOverrides">,
 ): WireMsg[] {
 	const out: WireMsg[] = [];
 	let backstage = false;
@@ -946,7 +1027,7 @@ export function toWireHistory(
 		if (role === "user") {
 			backstage = isBackstageText(textOf((m as MsgLike).content));
 		}
-		const w = toWireMsg(m, names, { backstage, skin: depths ? skinAtDepth(skin, depths[i]) : skin });
+		const w = toWireMsg(m, names, { backstage, skin: depths ? skinAtDepth(skin, depths[i]) : skin, displaySuffixes: opts?.displaySuffixes, displayOverrides: opts?.displayOverrides });
 		if (w) { const entryId = ((m as MsgLike).details as Record<string, unknown> | undefined)?.rpEntryId; if (typeof entryId === "string") w.entryId = entryId; const scope = ((m as MsgLike).details as Record<string,unknown> | undefined)?.rpTavernScope; if(typeof scope === "string") w.entryScope = scope; out.push(w); }
 	}
 	return foldTurnNarratives(out);

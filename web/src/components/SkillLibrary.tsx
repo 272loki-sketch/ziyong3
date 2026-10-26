@@ -3,7 +3,7 @@ import { apiGet, apiPost } from "../api.ts";
 
 type WorkflowStage =
 	| "continuity" | "character" | "persona" | "director" | "writer" | "curtain" | "world" | "world-profile" | "world-facts" | "world-audit"
-	| "ecology-global" | "ecology-card" | "ecology-runtime" | "outline-bootstrap" | "outline-chat" | "outline-reconcile" | "outline-foreshadowing" | "outline-research" | "outline-audit"
+	| "daily-plot" | "ecology-global" | "ecology-card" | "ecology-runtime" | "outline-bootstrap" | "outline-chat" | "outline-reconcile" | "outline-foreshadowing" | "outline-research" | "outline-audit"
 	| "writer-direct" | "director-main"
 	| "director-evidence" | "director-setting" | "director-ecology" | "director-ideas" | "director-review-facts" | "director-review-style"
 	| (string & {});
@@ -62,6 +62,7 @@ const STAGE_LABELS: Record<string, string> = {
 	"ecology-runtime": "人物场所生态",
 	"outline-bootstrap": "大纲首次规划",
 	"outline-chat": "大纲编剧讨论",
+	"daily-plot": "日常剧情筹备（独立后台）",
 	"outline-reconcile": "大纲剧情校准",
 	"outline-foreshadowing": "大纲伏笔编织",
 	"outline-research": "大纲研究灵感",

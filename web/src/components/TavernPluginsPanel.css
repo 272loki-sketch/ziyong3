@@ -97,6 +97,14 @@
 .plugin-overview-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; margin-top: auto; padding-top: 14px; border-top: 1px solid var(--hairline, #ebe6df); color: var(--accent-strong, #9d3319); font-size: 10px; }
 .plugin-overview-footer > span { font-size: 19px; }
 .plugin-center-footnote { margin: 20px 0 0; font-size: 11px; line-height: 1.8; color: var(--text-soft, #73695f); }
+.plugin-overview-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 18px; padding: 16px; border: 1px solid var(--hairline, #ebe6df); border-radius: 10px; background: var(--surface, #fffcfa); }
+.plugin-overview-toolbar strong { font-size: 13px; }
+.plugin-overview-toolbar p { margin: 6px 0 0; font-size: 11px; line-height: 1.7; color: var(--text-soft, #73695f); }
+.plugin-overview-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 16px; font-size: 11px; line-height: 1.7; color: var(--text-soft, #73695f); overflow-wrap: anywhere; }
+.plugin-status-badge { flex: 0 0 auto; padding: 3px 8px; border-radius: 5px; background: var(--surface-dim, #f3efe9); font-weight: 600; }
+.plugin-status-badge.is-ready { color: var(--accent-strong, #9d3319); background: var(--accent-wash, #faeee7); }
+.plugin-status-badge.is-attention, .plugin-status-badge.is-error { color: var(--danger, #a33); border: 1px solid currentColor; }
+.plugin-overview-card { scroll-margin-block: 16px; }
 .plugin-center-detail .tavern-plugins-panel.is-manager { padding: 0; }
 .plugin-center-detail .tavern-plugins-panel.is-manager .tavern-plugin-grid { grid-template-columns: minmax(0, 1fr); }
 .plugin-center-detail .npc-parallel-panel { max-width: none; }

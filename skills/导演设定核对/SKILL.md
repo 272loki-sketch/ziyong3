@@ -4,7 +4,7 @@ description: 核对本拍的设定、明确写作要求与人物知情边界。
 workflow: director-setting
 license: AGPL-3.0-only
 upstream-author: Luker Team
-attribution: docs/PROMPT-SOURCES.md
+attribution: docs/materials.md
 resident: false
 每轮: false
 ---

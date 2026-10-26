@@ -6,14 +6,14 @@ does not replace the AGPL license of the adapted prompts below.
 
 ## Luker Director Prompts
 
-The seven director Skills identified in [PROMPT-SOURCES](../docs/PROMPT-SOURCES.md)
+The seven director Skills identified in [materials](../docs/materials.md#来源与署名)
 are translated and adapted from Luker Team's v2.8.0 prompts and method Skills:
 
 - Upstream: https://github.com/funnycups/Luker
 - Reference commit: `e25115a572b9c3a85af5a3a29b9098f9b46d80c7`.
 - Existing Skill attribution: `upstream-author: Luker Team`.
 - Existing Skill license: `AGPL-3.0-only`.
-- Source mapping and adaptation details: [PROMPT-SOURCES](../docs/PROMPT-SOURCES.md).
+- Source mapping and adaptation details: [materials](../docs/materials.md#来源与署名).
 - Modification notice dated 2026-10-13: the distributed derivative translates
   and adapts the upstream prompts to Liyuan's fixed 3/2/2 director workflow,
   host tool names, source-bound receipts and single-author decision protocol.

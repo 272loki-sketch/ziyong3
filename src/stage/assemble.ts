@@ -21,6 +21,8 @@ import { isBackstageText } from "../stance.ts";
 import type { DisplayRule } from "../cardfront.ts";
 import { hasDepthLimits, rulesAtDepth } from "../cardfront.ts";
 import type { CharacterCard, LorebookEntry, MacroContext, RpConfig, WorldState } from "../types.ts";
+import type { AssembledPiece, DepthPiece } from "../preset-assemble.ts";
+import { insertDatabasePluginDepthEntries, type DatabasePluginWorldbookEntry } from "./database-plugin-prompt.ts";
 
 // ---------------- 分支 → 历史 ----------------
 
@@ -40,6 +42,29 @@ export interface BranchEntryLike {
 export interface BeatMsg {
 	role: "user" | "assistant";
 	text: string;
+}
+
+/** Preserve preset roles and marker order; depths count history, not preset messages. */
+export function buildStagePresetMessages(history: unknown[], before: AssembledPiece[], after: AssembledPiece[], depth: DepthPiece[], worldbook: DatabasePluginWorldbookEntry[] = []): unknown[] {
+	const message = (piece: AssembledPiece) => ({
+		role: piece.role, content: [{ type: "text", text: piece.text }], timestamp: 0,
+		...(piece.role === "assistant" ? {
+			api: "openai-completions", provider: "preset", model: "preset", stopReason: "stop",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		} : {}),
+	});
+	const result: unknown[] = before.map(message);
+	const native = insertDatabasePluginDepthEntries(history, worldbook);
+	let nativeIndex = 0;
+	for (let i = 0; i <= history.length; i++) {
+		for (const piece of depth) {
+			if (Math.max(0, history.length - Math.max(0, Math.trunc(piece.depth))) === i) result.push(message(piece));
+		}
+		while (nativeIndex < native.length && native[nativeIndex] !== history[i]) result.push(native[nativeIndex++]);
+		if (i < history.length) result.push(native[nativeIndex++]);
+	}
+	return [...result, ...after.map(message)];
 }
 
 const textOf = (content: unknown): string => {

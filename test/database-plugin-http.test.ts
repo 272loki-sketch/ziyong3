@@ -78,3 +78,48 @@ test('state HTTP save returns a compact durable receipt, not the entire private 
  const f=fixture(),server=createServer((req,res)=>{void f.api.handle(req,res)});await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
  try{const c=await f.api.context();const response=await fetch('http://127.0.0.1:'+(server.address() as any).port+'/api/database-plugin/state',{method:'POST',body:JSON.stringify({...c,state:{...emptyState,chatMetadata:{synthetic:'x'.repeat(100000)}}})});assert.equal(response.status,200);const receipt=await response.json();assert.equal(receipt.globalRevision,1);assert.equal(receipt.sourceEntryId,'a-1');assert.ok(receipt.savedAt);assert.ok(JSON.stringify(receipt).length<300);assert.equal((await f.api.context()).chatMetadata.synthetic.length,100000);}finally{await new Promise<void>(r=>server.close(()=>r()));f.cleanup()}
 });
+
+test('identity guards avoid material assembly, including the current bound settlement source',async()=>{
+ const f=fixture();let contexts=0,bindings=0;
+ const context=f.api.host.context;
+ f.api.host.context=()=>{contexts++;return context();};
+ f.api.host.binding=()=>{bindings++;const c=f.context();return {scope:c.scope,sourceEntryId:c.sourceEntryId};};
+ try{
+  const c=await f.api.context(),body={scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId};contexts=0;
+  f.api.boundSourceEntryId=c.sourceEntryId;
+  for(let i=0;i<100;i++)f.api.assertBinding(body,true);
+  assert.equal(contexts,0);assert.equal(bindings,100);
+  await f.api.save({...body,revision:c.revision,state:emptyState});
+  assert.equal(contexts,1,'a save assembles ancestors once, not again for every identity guard');
+  f.switch({...f.context(),sourceEntryId:'sibling',visibleEntryIds:['sibling'],chat:[{__liyuanEntryId:'sibling',message_id:'sibling',mes:'Synthetic sibling',is_user:false}]});
+  assert.throws(()=>f.api.assertBinding(body,true),/来源|分支/);
+  f.api.boundSourceEntryId=undefined;
+  assert.throws(()=>f.api.assertBinding(body,true),/分支/);
+ }finally{f.cleanup()}
+});
+
+test('lightweight guards retain full ancestor validation when recovering an older source',async()=>{
+ const f=fixture();f.api.host.binding=()=>{const c=f.context();return {scope:c.scope,sourceEntryId:c.sourceEntryId};};
+ try{
+  const c=await f.api.context(),body={scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId};
+  const old=f.context();f.switch({...old,sourceEntryId:'a-2',visibleEntryIds:['a-1','a-2'],chat:[...old.chat,{__liyuanEntryId:'a-2',message_id:'a-2',mes:'Synthetic next narrative',is_user:false}]});
+  f.api.boundSourceEntryId='a-1';
+  assert.equal(f.api.assertBinding(body,true).sourceEntryId,'a-1');
+  f.switch({...f.context(),visibleEntryIds:['a-2'],chat:f.context().chat.slice(1)});
+  assert.throws(()=>f.api.assertBinding(body,true),/来源/);
+ }finally{f.cleanup()}
+});
+
+test('request polling uses lightweight guards and cancels on a real source change',async()=>{
+ const {EventEmitter}=await import('node:events');const f=fixture();let contexts=0,bindings=0;
+ const context=f.api.host.context;f.api.host.context=()=>{contexts++;return context();};
+ f.api.host.binding=()=>{bindings++;const c=f.context();return {scope:c.scope,sourceEntryId:c.sourceEntryId};};
+ const c=await f.api.context(),req=new EventEmitter(),res=new EventEmitter();contexts=0;
+ const task=f.api.boundRequestController(req as any,res as any,{scopeKey:c.scopeKey,sourceEntryId:c.sourceEntryId});
+ try{
+  await new Promise(r=>setTimeout(r,450));
+  assert.ok(bindings>=2);assert.equal(contexts,0);assert.equal(task.controller.signal.aborted,false);
+  f.switch({...f.context(),sourceEntryId:'changed'});
+  await new Promise(r=>setTimeout(r,250));assert.equal(task.controller.signal.aborted,true);
+ }finally{task.release();assert.equal(req.listenerCount('aborted'),0);assert.equal(res.listenerCount('close'),0);f.cleanup()}
+});

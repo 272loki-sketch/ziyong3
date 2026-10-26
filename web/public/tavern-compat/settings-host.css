@@ -12,6 +12,12 @@
  --grey50: var(--liyuan-muted); --grey5050a: var(--liyuan-border); --grey30: #e3dcd3; --grey5020a: color-mix(in srgb, var(--liyuan-border) 35%, transparent);
  --black50a: #0008; --white50a: #fff8;
 }
+:root[data-theme=eye-care] {
+ color-scheme: light;
+ --liyuan-bg: #e8eee2; --liyuan-surface: #f3f6ed; --liyuan-dim: #e2e9d9;
+ --liyuan-text: #35402e; --liyuan-muted: #56634c; --liyuan-border: #b9c8ab;
+ --liyuan-wash: #e9e7d8;
+}
 :root[data-theme=dark] {
  color-scheme: dark;
  --liyuan-bg: #141110; --liyuan-surface: #1e1a18; --liyuan-dim: #272220;

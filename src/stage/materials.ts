@@ -14,13 +14,10 @@ import { isAbsolute, join } from "node:path";
 import { loadCardFile, applyMacros, readCardRawJson } from "../card.ts";
 import { promptRules, extractRegexScripts, type DisplayRule } from "../cardfront.ts";
 import {
-	applyLoreSourceState,
 	constantEntries,
-	loadLorebookFile,
 	loadLorebookRegexScripts,
 	mergeEntries,
 	mountedLorebookPaths,
-	overlayPathFor,
 	setMountedLorebooks,
 } from "../lorebook.ts";
 import { addFoldTags, addHistoryStripTags, discoverFoldTagsFromTexts, resetDisplayTagExtras } from "../postprocess.ts";
@@ -35,9 +32,11 @@ import {
 import { loadPresetDoc, type PresetDoc } from "../preset-doc.ts";
 import { normalizeRpPreset, type RpPreset } from "../preset.ts";
 import { resolveConfigPath } from "../paths.ts";
+import { resolveWorldbooks, type ResolvedWorldbooks } from "../worldbook-bindings.ts";
 import { DEFAULT_CONFIG, type CharacterCard, type LorebookEntry, type RpConfig } from "../types.ts";
 import { normalizeStepModels } from "../model-routing.ts";
 import { scanSkillFiles, type SkillFile } from "./skill-store.ts";
+import type { DatabasePluginWorldbookEntry } from "./database-plugin-prompt.ts";
 
 /**
  * 预设格式栈的已知标签：**只在送模历史整块剥**（防往拍模仿），显示层照常渲染。
@@ -52,14 +51,18 @@ const FORMAT_STACK_TAGS = ["w2g", "catsay", "UpdateVariable", "JSONPatch", "Anal
 export type { AssembledPiece } from "../preset-assemble.ts";
 
 export interface StageMaterials {
+	/** Native database placement owns worldbook delivery, not the legacy constant channel. */
+	databaseWorldbook?: boolean;
 	/** Enabled original Tavern host consumes macros/protocols; sources remain unchanged. */
 	nativeTavernPlugins?: boolean;
 	config: RpConfig;
 	card: CharacterCard;
 	/** 角色卡原始 JSON。只供独立谢幕轮判断任意卡格式，不参与正文装配。 */
 	rawCard: Record<string, unknown>;
-	/** 卡内嵌书 + 已挂载世界书 + 补充设定集 overlay，禁用项与外部插件协议条目已剔除 */
+	/** 已解析角色主书/附加/全局/聊天/补充；保留条目身份与启停，旧模式仅剔除外部协议 */
 	entries: LorebookEntry[];
+	/** 与管理/原宿主共用的来源清单（包含原始行）。 */
+	worldbooks?: ResolvedWorldbooks;
 	/** 预设文档（原文 + 归一条目）；null＝未配置且无默认预设 */
 	presetDoc: PresetDoc | null;
 	/** 旧文学旁路消费的归一预设视图；装配权威仍是 presetDoc 原始 JSON。 */
@@ -112,7 +115,7 @@ export function loadStageConfig(cwd: string): RpConfig {
 }
 
 /** 装载一拍所需全部素材；卡缺失/损坏时抛错（引擎转告用户，不演） */
-export function loadStageMaterials(cwd: string, options: { nativeTavernPlugins?: boolean } = {}): StageMaterials {
+export function loadStageMaterials(cwd: string, options: { nativeTavernPlugins?: boolean; sessionId?: string } = {}): StageMaterials {
 	const config = loadStageConfig(cwd);
 
 	const cardAbs = resolvePath(cwd, config.card);
@@ -127,29 +130,10 @@ export function loadStageMaterials(cwd: string, options: { nativeTavernPlugins?:
 		}
 	})();
 
-	// 剧情知识：卡内 character_book + 已挂载独立书（0..N）+ 补充设定集 overlay。
-	// 下游常驻、被动扫描、索引与主动检索只消费这一个去重后的权威集合。
-	const fileGroups: LorebookEntry[][] = [];
-	const lorebookRegexScripts: unknown[] = [];
-	for (const rel of mountedLorebookPaths(config)) {
-		const abs = resolvePath(cwd, rel);
-		if (existsSync(abs)) {
-			fileGroups.push(applyLoreSourceState(loadLorebookFile(abs), config, "file", rel).map((entry) => ({ ...entry, source: `lorebook:${rel}` })));
-			lorebookRegexScripts.push(...loadLorebookRegexScripts(abs));
-		}
-	}
-	const fileEntries = mergeEntries(...fileGroups);
-	const overlayFile = overlayPathFor(cwd, card.name);
-	const overlayEntries = existsSync(overlayFile)
-		? applyLoreSourceState(loadLorebookFile(overlayFile), config, "agent", config.card).map((entry) => ({ ...entry, source: "overlay" }))
-		: [];
-	// 用户级停用 → 外部插件协议判死（M-C2）。协议条目是 H 类「脑内 harness」：
-	// 指望酒馆插件解析的输出格式强制令，梨园无解析器且原生 world_state_update 已覆盖其功能，
-	// 留着只会与 draft_write「纯剧情文字」互斥（实测首拍 31% 思考 + 正文污染 + 双份记账）。
-	const originalEntries = mergeEntries(
-		applyLoreSourceState(card.book, config, "card", config.card).map((entry) => ({ ...entry, source: "card" })),
-		fileEntries, overlayEntries,
-	);
+	// 角色显式绑定优先，内嵌仅回退；所有宿主/管理面与生成共用同一来源。
+	const worldbooks = resolveWorldbooks(cwd, config, { card, rawCard, sessionId: options.sessionId });
+	const lorebookRegexScripts: unknown[] = worldbooks.books.flatMap(book => book.source === "file" ? loadLorebookRegexScripts(book.abs) : []);
+	const originalEntries = mergeEntries(...worldbooks.books.map(book => book.entries));
 	const protocolFiltered = options.nativeTavernPlugins ? { entries: originalEntries, dropped: [] } : stripProtocolEntries(originalEntries);
 	const entries = protocolFiltered.entries;
 	const protocolDrops = protocolFiltered.dropped;
@@ -245,6 +229,7 @@ export function loadStageMaterials(cwd: string, options: { nativeTavernPlugins?:
 		}).slice(0, 32),
 		macroWarnings: [...unsupported],
 		protocolDrops,
+		worldbooks,
 		// 送模侧作者正则：预设 + 卡（与 cardfront 显示侧同源；promptOnly/破坏性规则）
 		promptRules: promptRules([...((presetDoc?.raw?.extensions as { regex_scripts?: unknown[] } | undefined)?.regex_scripts ?? []), ...cardRegexScripts, ...lorebookRegexScripts]),
 	};
@@ -260,6 +245,46 @@ export function projectStageWorldbookEntries(materials: StageMaterials, retained
  if(lore.length)markerMaterials.worldInfoBefore=applyMacros(lore.map(e=>`- ${e.comment?`【${e.comment}】`:''}${e.content}`).join('\n'),{charName:materials.card.name,userName:materials.config.userName});
  const assembled=materials.presetDoc?assemble(materials.presetDoc.entries,{materials:markerMaterials,charName:materials.card.name,userName:materials.config.userName,preserveUnknownMacros:materials.nativeTavernPlugins}):null;
  return {...materials,entries,markerMaterials,presetBefore:assembled?.before??[],presetDepth:assembled?.depth??[],presetAssembly:assembled?.report??[]};
+}
+
+/** Read native placement from the resolved source row, never from normalized lore alone. */
+export function stageDatabaseWorldbookEntries(materials: StageMaterials): DatabasePluginWorldbookEntry[] {
+	return materials.entries.map(entry => {
+		const book = materials.worldbooks?.books.find(book => book.id === entry.bookId);
+		if (!book || entry.entryKey === undefined) throw new Error("Native worldbook source row is unavailable");
+		const rows = book.rawBook.entries as Record<string, Record<string, unknown>>;
+		const raw = rows[entry.entryKey];
+		if (!raw) throw new Error("Native worldbook source row is unavailable");
+		const extensions = raw.extensions && typeof raw.extensions === "object" ? raw.extensions as Record<string, unknown> : {};
+		const option = (snake: string, camel: string) => raw[snake] ?? extensions[snake] ?? raw[camel] ?? extensions[camel];
+		return {
+			...extensions, ...raw,
+			uid: entry.uid, enabled: entry.enabled, disable: !entry.enabled,
+			constant: entry.constant, type: entry.constant ? "constant" : "keyword",
+			content: applyMacros(typeof raw.content === "string" ? raw.content : entry.content, { charName: materials.card.name, userName: materials.config.userName }),
+			keys: entry.keys, keys_secondary: entry.secondaryKeys, selective: entry.selective, order: entry.order,
+			position: extensions.position ?? raw.position ?? 0,
+			depth: raw.depth ?? extensions.depth ?? 4, role: raw.role ?? extensions.role,
+			scan_depth: option("scan_depth", "scanDepth"), case_sensitive: option("case_sensitive", "caseSensitive"),
+			match_whole_words: option("match_whole_words", "matchWholeWords"),
+			exclude_recursion: option("exclude_recursion", "excludeRecursion"), prevent_recursion: option("prevent_recursion", "preventRecursion"),
+		} as DatabasePluginWorldbookEntry;
+	});
+}
+
+/** Replace the legacy constant slot before reassembly; keep preset text and order untouched. */
+export function projectStageDatabaseWorldbook(materials: StageMaterials, worldbook: { before: string; after: string }): StageMaterials {
+	const markerMaterials = { ...materials.markerMaterials };
+	delete markerMaterials.worldInfoBefore;
+	delete markerMaterials.worldInfoAfter;
+	if (worldbook.before) markerMaterials.worldInfoBefore = worldbook.before;
+	if (worldbook.after) markerMaterials.worldInfoAfter = worldbook.after;
+	const assembled = materials.presetDoc ? assemble(materials.presetDoc.entries, {
+		materials: markerMaterials, charName: materials.card.name, userName: materials.config.userName,
+		preserveUnknownMacros: materials.nativeTavernPlugins,
+	}) : null;
+	return { ...materials, databaseWorldbook: true, markerMaterials, presetBefore: assembled?.before ?? [],
+		presetDepth: assembled?.depth ?? [], presetAssembly: assembled?.report ?? [] };
 }
 
 /**
@@ -283,5 +308,5 @@ export function assemblePresetAfter(m: StageMaterials, userText: string): Assemb
 
 /** 常驻世界书条目（enabled+constant，按 order 排序）——system prompt 素材 */
 export function constantLoreOf(m: StageMaterials): LorebookEntry[] {
-	return constantEntries(m.entries);
+	return m.databaseWorldbook ? [] : constantEntries(m.entries);
 }

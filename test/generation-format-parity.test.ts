@@ -10,9 +10,10 @@ import { StageEngine, extractPureTextNarrative, type AssistantMsgLike, type Stag
 import { buildAgentPresentationMaterials, parseAgentPresentation } from "../src/stage/agent-presentation.ts";
 import { loadStageMaterials } from "../src/stage/materials.ts";
 import type { GenerationMode } from "../src/stage/generation-mode.ts";
+import { SUPPLEMENTARY_PROTOCOL, supplementaryHash, supplementaryInput } from "../src/stage/supplementary.ts";
 
 // Synthetic card/lore and faux streams only: no private card, credentials or API.
-// New modes keep original author delivery without a format model or format success gate.
+// Supplementary output is independent of original author delivery and its fact projection.
 // Legacy JSON parsers remain compatible; the SDK path is not changed.
 const CARD_SYSTEM = "FORMAT_PARITY_CARD_SYSTEM：依据原始卡格式交付，附属区域名为 <scene_sidecar>，不是正文容器。";
 const CARD_POST = "FORMAT_PARITY_CARD_POST：保留本卡合法的 HTML 与 Markdown；不得只保留内置格式标签。";
@@ -76,7 +77,7 @@ function presentationResponse(payload: PresentationPayload, inline = false): str
 // Adapted from generation-mode-engine.test.ts: actual assembly and settlement,
 // bounded faux responses. Presentation calls are routed by user JSON phase, not
 // prompt wording, and never consume the main-agent workflow script.
-function fixture(mode: GenerationMode, body = BODY, options: { customOnly?: boolean; inline?: boolean; worldFormat?: string } = {}) {
+function fixture(mode: GenerationMode, body = BODY, options: { customOnly?: boolean; inline?: boolean; worldFormat?: string; authorDelta?: string } = {}) {
 	const cwd = mkdtempSync(join(tmpdir(), "liyuan-format-parity-"));
 	const cleanup = () => rmSync(cwd, { recursive: true, force: true });
 	try {
@@ -98,20 +99,31 @@ function fixture(mode: GenerationMode, body = BODY, options: { customOnly?: bool
 			stepModels: Object.fromEntries(steps.map(id => [id, { provider: "faux", id }])),
 		}));
 		const sm = SessionManager.create(cwd, join(cwd, "sessions"));
-		const requests: Array<{ model: string; context: Parameters<StageStreamFn>[1]; presentation?: PresentationPayload }> = [];
+		const requests: Array<{ model: string; context: Parameters<StageStreamFn>[1]; presentation?: PresentationPayload; supplementary: boolean }> = [];
 		const script: Response[] = mode === "direct" ? [{ text: body }] : directorScript(body);
 		let presentationFail = false;
 		const streamFn: StageStreamFn = (model, context) => {
 			assert.ok(requests.length < 64, "faux request budget exhausted");
 			const payload = presentationPayload(context);
-			requests.push({ model: model.id, context: structuredClone(context), presentation: payload });
+			const supplementary = context.systemPrompt === SUPPLEMENTARY_PROTOCOL;
+			requests.push({ model: model.id, context: structuredClone(context), presentation: payload, supplementary });
+			if (supplementary) {
+				assert.equal(model.id, "writer");
+				const input = JSON.parse((context.messages[0] as any).content[0].text);
+				const saved = (sm.getBranch() as any[]).find(entry => entry.message?.role === "assistant");
+				assert.deepEqual(input, JSON.parse(supplementaryInput(loadStageMaterials(cwd), saved.message.details.rpNarrative, body).userText));
+			}
 			let response: Response | undefined;
-			if(model.id==="writer") {
+			if (supplementary) {
+    const input=JSON.parse((context.messages[0] as any).content[0].text);
+    response = { text: JSON.stringify({version:2,narrative:null,items:Object.values(LEGAL_FORMATS).filter(format=>!body.includes(format)).map(text=>({source:'entries.0',requirement:input.entries[0].content,text}))}) };
+   }
+			else if(model.id==="writer") {
 				response=presentationFixtureReply(context);
 				try { const input=JSON.parse((context.messages[0] as any)?.content?.[0]?.text??"{}"); if(input.phase==="author-boundary")response={text:JSON.stringify({fragments:[BODY]})}; } catch {}
 			}
 			if(response){try{const parsed=JSON.parse(response.text??"{}");if(parsed.body!==undefined)response=undefined;}catch{}}
-			if (model.id === "writer" && payload) {
+			if (!supplementary && model.id === "writer" && payload) {
 				const output = JSON.parse(presentationResponse(payload, options.inline));
 				if (presentationFail) output.missing = ["合成未交付格式"];
 				response = { text: JSON.stringify(output) };
@@ -128,10 +140,11 @@ function fixture(mode: GenerationMode, body = BODY, options: { customOnly?: bool
 			};
 			return {
 				async *[Symbol.asyncIterator]() {
-					if (reply.text) {
-						const midpoint = Math.ceil(reply.text.length / 2);
-						yield { type: "text_delta", delta: reply.text.slice(0, midpoint) };
-						yield { type: "text_delta", delta: reply.text.slice(midpoint) };
+					const deltaText = model.id === "writer" && reply.text === body ? options.authorDelta ?? reply.text : reply.text;
+					if (deltaText) {
+						const midpoint = Math.ceil(deltaText.length / 2);
+						yield { type: "text_delta", delta: deltaText.slice(0, midpoint) };
+						yield { type: "text_delta", delta: deltaText.slice(midpoint) };
 					}
 					yield { type: "done", message };
 				},
@@ -167,7 +180,13 @@ function deliveredText(sm: SessionManager): string {
 	for (const requirement of artifact.requirements) assert.ok(output.includes(requirement.quote), "requirements must cite actual delivery");
 	assert.equal(artifact.origin,"author");
  assert.deepEqual(artifact.requirements,[]);
- assert.equal(output,reply.message.details.rpAuthorDraft);
+	assert.equal(output,reply.message.details.rpAuthorDraft);
+	const supplementary = (sm.getBranch() as any[]).filter(entry => entry.customType === "rp-supplementary-delivery" && entry.data.sourceEntryId === reply.id).at(-1)?.data;
+	assert.ok(supplementary, "supplementary output has its own persisted receipt");
+	assert.equal(supplementary.authorHash, supplementaryHash(output));
+	assert.equal(supplementary.narrativeHash, supplementaryHash(reply.message.details.rpNarrative));
+	assert.equal(supplementary.status, supplementary.text ? "complete" : "skipped");
+	assert.deepEqual(missingFormats([output, supplementary.text].join("\n\n"), LEGAL_FORMATS), []);
 	return output;
 }
 
@@ -210,17 +229,31 @@ test("格式收口保留自定义块、HTML、Markdown与行动选项，并校�
 });
 
 for (const mode of ["direct", "director"] as const) {
+	test(`${mode}: authoritative terminal raw output is persisted and delivered without trimming`, { timeout: 15000 }, async () => {
+		const raw = `  \n<content>${BODY}</content>\n\n${SIDECAR}\n\n  `;
+		const f = fixture(mode, raw, { authorDelta: `<content>${PARAGRAPHS[0]}` });
+		try {
+			await f.engine.performTurn("Continue synthetic story.", { generationMode: mode });
+			assert.equal(replyFrom(f.sm).message.details.rpAuthorDraft, raw);
+			assert.equal(deliveredText(f.sm), raw);
+			assert.ok(!f.requests.some(request => request.presentation));
+			assert.equal(f.requests.filter(request => request.model === "writer" && !request.supplementary).length, mode === "direct" ? 1 : 6);
+			assert.equal(f.requests.filter(request => request.supplementary).length, 1);
+		} finally { f.cleanup(); }
+	});
+
 	test(`${mode}：主作者收到原始卡与内嵌/挂载世界书格式要求`, { timeout: 15000 }, async () => {
 		const f = fixture(mode);
 		try {
 			await f.engine.performTurn("继续核对记录。", { generationMode: mode });
 			deliveredText(f.sm);
-			const writer = f.requests.find(request => request.model === "writer" && !request.presentation);
+			const writer = f.requests.find(request => request.model === "writer" && !request.presentation && !request.supplementary);
 			assert.ok(writer);
 			const originalText = [writer.context.systemPrompt, ...writer.context.messages.map((message: any) => message.content?.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n"))].join("\n");
 			assert.deepEqual(missingFormats(originalText, { card_system: CARD_SYSTEM, card_post_history: CARD_POST, card_book: CARD_BOOK_FORMAT, mounted_worldbook: WORLD_FORMAT, options_rule: OPTIONS_FORMAT }), []);
-   assert.ok(!f.requests.some(request=>request.presentation),"no post-author format request");
-   assert.equal(f.requests.filter(request=>request.model==="writer").length,mode==="direct"?1:6);
+   assert.ok(!f.requests.some(request=>request.presentation),"no legacy presentation rewrite request");
+   assert.equal(f.requests.filter(request=>request.model==="writer"&&!request.supplementary).length,mode==="direct"?1:6);
+   assert.equal(f.requests.filter(request=>request.supplementary).length,1);
 		} finally { f.cleanup(); }
 	});
 
@@ -285,7 +318,7 @@ test("历史格式pending仅重挂原稿，零模型调用，不重复账本/生
  }finally{f.cleanup();}
 });
 
-for(const mode of ["direct","director"] as const)test(mode+"：缺失/未知卡格式不触发校验或补交，不截去后段正文",async()=>{
+for(const mode of ["direct","director"] as const)test(mode+": missing formats use independent supplementary delivery without gating or truncating the author",async()=>{
  const raw="<content>云澜读完了记录。</content>\n<未知面板>合成数据</未知面板>\n后来的同伴走进屋子，与他们坐下吃饭。";
  const f=fixture(mode,raw);
  try{await f.engine.performTurn("做完后一起吃。",{generationMode:mode});assert.equal(deliveredText(f.sm),raw);assert.equal(latestSettlement(f.sm,replyFrom(f.sm).id).status,"complete");assert.ok(!f.requests.some(r=>r.presentation));}

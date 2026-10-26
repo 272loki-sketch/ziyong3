@@ -94,6 +94,14 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		const healthBefore = await api("/healthz");
 		browser = await chromium.launch({ headless: true, args: process.getuid?.() === 0 ? ["--no-sandbox"] : [] });
 		page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, locale: "zh-CN" }); page.setDefaultTimeout(12000);
+		if (process.env.LIYUAN_UI_CJK_FONT) {
+			const font = (await readFile(process.env.LIYUAN_UI_CJK_FONT)).toString("base64");
+			await page.addInitScript(data => {
+				const face = new FontFace("Noto Sans SC", `url(data:font/woff2;base64,${data})`, { weight: "400" });
+				document.fonts.add(face); void face.load().then(() => { window.__fixtureFontReady = true; }).catch(() => {});
+			}, font);
+		}
+
 		page.on("pageerror", error => errors.push(error.message));
 		page.on("request", req => { if (req.method() !== "GET") writes.push({ path: new URL(req.url()).pathname, method: req.method() }); });
 		page.on("response", async res => { if (res.request().method() !== "GET") responses.push({ path: new URL(res.url()).pathname, status: res.status(), body: await res.text().catch(() => "") }); });
@@ -111,26 +119,46 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		const inheritedCard = () => page.locator(".conn-card").filter({ has: page.locator(".conn-wh-name", { hasText: "继承关闭配置" }) });
 		await live().waitFor(); assert.equal(await live().isChecked(), true);
 		const normalizedBaseline = await diskConfig();
+		const fixtureBaseline = await profileConfig("fixture");
+		const inheritedBaseline = await profileConfig("inherited");
+		assert.deepEqual(normalizedBaseline, config, "startup retains the complete synthetic configuration");
+		assert.deepEqual(fixtureBaseline, { ...normalizedBaseline, providers: { fixture: normalizedBaseline.providers.fixture } });
+		assert.deepEqual(inheritedBaseline, { version: 1, defaultProvider: "inherited", defaultModel: "inherited-off", providers: { inherited: inheritedProvider } });
 		const initialCatalog = await api("/api/models/catalog");
 		if (artifacts) await writeFile(join(artifacts, "initial-catalog.fixture.json"), JSON.stringify(initialCatalog, null, 2));
 		assert.equal(initialCatalog.current.id, "writer", "isolated runtime must have a real configured model before testing checkbox");
+		assert.equal(initialCatalog.current.provider, "fixture");
+		// Warehouse snapshots remain independently scoped; the live/runtime aggregate
+		// must retain both channels, defaults, sibling models and unknown compat fields.
+		const assertConnections = async (supportsTools, inheritedExpected = inheritedBaseline) => {
+			const expected = structuredClone(normalizedBaseline);
+			expected.providers.fixture.models.find(m => m.id === "writer").compat.supportsTools = supportsTools;
+			assert.deepEqual(await diskConfig(), expected, "complete enabled configuration");
+			assert.deepEqual(await profileConfig("fixture"), { ...fixtureBaseline, providers: { fixture: expected.providers.fixture } }, "fixture owns only its channel");
+			assert.deepEqual(await profileConfig("inherited"), inheritedExpected, "independent inherited profile");
+			const runtime = JSON.parse(await readFile(join(cwd, "agent/models.json"), "utf8"));
+			assert.deepEqual(runtime.providers, expected.providers, "merged runtime preserves all channel parameters");
+			const catalog = await api("/api/models/catalog");
+			assert.deepEqual(catalog.models.map(m => `${m.provider}/${m.id}`).sort(), Object.entries(expected.providers).flatMap(([provider, value]) => value.models.map(m => `${provider}/${m.id}`)).sort(), "only enabled models are runnable");
+			assert.equal(catalog.current.provider, "fixture");
+			assert.equal(catalog.current.id, "writer");
+			assert.equal(catalog.current.thinkingLevel, initialCatalog.current.thinkingLevel);
+		};
 		// Direct live change is persisted and automatically refreshes config/catalog UI.
 		await live().click();
 		await waitFor(async () => (await diskConfig()).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools === false, "live disable persistence");
 		await waitFor(async () => (await profileConfig("fixture")).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools === false, "active profile sync");
 		await waitFor(async () => !(await live().isChecked()) && !(await live().isDisabled()), "live disable UI reload");
 		assert.deepEqual(configWithoutToolFlag(await diskConfig()), normalizedBaseline);
-		assert.deepEqual(configWithoutToolFlag(await profileConfig("fixture")), normalizedBaseline);
+		await assertConnections(false);
 		assert.deepEqual((await api("/api/models/catalog")).current.id, "writer");
 		await page.reload(); await openConnection();
-		await live().waitFor(); assert.equal(await live().isChecked(), false);
+		await live().waitFor(); await waitFor(async () => !(await live().isChecked()) && !(await live().isDisabled()), "reload reflects persisted tool support"); assert.equal(await live().isChecked(), false);
 		await live().click();
 		await waitFor(async () => (await diskConfig()).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools === true && !(await live().isDisabled()), "live reenable");
-		// Reproduce an older active warehouse copy missing an enabled channel.
-		const olderProfile = await profileConfig("fixture");
-		delete olderProfile.providers.inherited;
-		await writeFile(join(cwd, "liyuan-profiles/fixture.json"), JSON.stringify({ id: "fixture", name: "合成配置", updatedAt: Date.now(), config: olderProfile }));
-		// Editing that active profile must retain the actual enabled scope/defaults.
+		await assertConnections(true);
+		// The active snapshot intentionally excludes the independently owned inherited
+		// channel. Editing it must still use the complete enabled scope/defaults.
 		await activeCard().getByRole("button", { name: "修改", exact: true }).click();
 		await rowTools("writer").waitFor();
 		assert.equal(await rowTools("sibling").isChecked(), true);
@@ -139,6 +167,7 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		await page.getByRole("button", { name: "保存修改", exact: true }).click();
 		await waitFor(async () => (await diskConfig()).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools === false && (await profileConfig("fixture")).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools === false, "edited live profile");
 		assert.deepEqual(configWithoutToolFlag(await diskConfig()), normalizedBaseline);
+		await assertConnections(false);
 		assert.equal((await api("/api/models/catalog")).current.id, "writer");
 		assert.equal((await api("/api/models/catalog")).models.some(m => m.provider === "inherited"), true);
 		await waitFor(async () => !(await live().isChecked()) && !(await live().isDisabled()), "editor save refreshes live UI");
@@ -152,6 +181,7 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		assert.equal(await live().isChecked(), false);
 		assert.equal((await diskConfig()).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools, false);
 		assert.equal((await profileConfig("fixture")).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools, false);
+		await assertConnections(false);
 		await page.unroute("**/api/agent-profiles");
 		// Lost response after a real server write: report error, re-read saved state.
 		await page.route("**/api/agent-profiles", async route => {
@@ -165,6 +195,7 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		await waitFor(async () => await live().isChecked() && !(await live().isDisabled()), "actual saved state after lost response");
 		assert.equal((await diskConfig()).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools, true);
 		assert.equal((await profileConfig("fixture")).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools, true);
+		await assertConnections(true);
 		await page.unroute("**/api/agent-profiles");
 		// No active warehouse: the live switch uses agent-config and still handles failure.
 		await writeFile(join(cwd, "liyuan.agent.meta.json"), JSON.stringify({ activeId: null }));
@@ -176,13 +207,15 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		});
 		await live().click(); await page.getByText("合成独立配置失败", { exact: true }).waitFor();
 		assert.equal(await live().isChecked(), true);
+		await assertConnections(true);
 		await page.unroute("**/api/agent-config");
 		await live().click();
 		await waitFor(async () => (await diskConfig()).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools === false && !(await live().isDisabled()), "standalone config save");
-		assert.equal((await profileConfig("fixture")).providers.fixture.models.find(m => m.id === "writer").compat.supportsTools, true);
+		// Changed live channels sync to their owners even without an active profile.
+		await assertConnections(false);
 		await writeFile(join(cwd, "liyuan.agent.meta.json"), JSON.stringify({ activeId: "fixture" }));
 		await page.reload(); await openConnection();
-		await live().waitFor(); assert.equal(await live().isChecked(), false);
+		await live().waitFor(); await waitFor(async () => !(await live().isChecked()) && !(await live().isDisabled()), "reload reflects persisted tool support"); assert.equal(await live().isChecked(), false);
 		// Inactive inherited false remains off, true model override remains on.
 		await inheritedCard().getByRole("button", { name: "修改", exact: true }).click();
 		await rowTools("inherited-off").waitFor();
@@ -194,6 +227,9 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		assert.equal((await profileConfig("inherited")).providers.inherited.compat.supportsTools, false);
 		assert.equal((await diskConfig()).defaultProvider, "fixture");
 		assert.deepEqual((await diskConfig()).providers.inherited, normalizedBaseline.providers.inherited);
+		const editedInherited = structuredClone(inheritedBaseline);
+		editedInherited.providers.inherited.models[0].compat = { supportsTools: true };
+		await assertConnections(false, editedInherited);
 		// Generator defaults checked, stores only in warehouse and never selects a model.
 		await page.getByRole("button", { name: "＋ 生成配置", exact: true }).click();
 		await page.getByLabel("配置名 / 渠道名", { exact: true }).fill("generated");
@@ -208,9 +244,10 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		await waitFor(async () => { try { return (await profileConfig("generated")).providers.generated.models[0].compat.supportsTools === false; } catch { return false; } }, "generated disabled capability");
 		assert.equal((await api("/api/models/catalog")).current.id, "writer");
 		// Mobile controls remain visible/clickable and reopen from persisted state.
+		await assertConnections(false, editedInherited);
 		await page.setViewportSize({ width: 390, height: 844 });
 		await page.reload(); await openConnection();
-		await live().waitFor(); assert.equal(await live().isChecked(), false);
+		await live().waitFor(); await waitFor(async () => !(await live().isChecked()) && !(await live().isDisabled()), "reload reflects persisted tool support"); assert.equal(await live().isChecked(), false);
 		await live().scrollIntoViewIfNeeded();
 		const bounds = await live().boundingBox(); assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 391);
 		await live().click();
@@ -222,11 +259,32 @@ test("连接工具开关：桌面/手机、默认与继承、保存重开、失�
 		assert.equal(await page.locator(".conn-panel").evaluate(el => el.scrollWidth <= el.clientWidth + 1), true);
 		if (artifacts) { await mkdir(artifacts, { recursive: true }); await page.screenshot({ path: join(artifacts, "connect-tools-mobile.png"), fullPage: true }); }
 		assert.deepEqual(configWithoutToolFlag(await diskConfig()), normalizedBaseline);
+		await assertConnections(true, editedInherited);
 		assert.deepEqual(JSON.parse(await readFile(join(cwd, "liyuan.config.json"), "utf8")), stageConfig);
 		assert.equal((await api("/healthz")).sessionId, healthBefore.sessionId);
 		assert.deepEqual(errors, []); assert.deepEqual(forbiddenFrames, []);
 		assert.ok(writes.every(write => ["/api/agent-config", "/api/agent-profiles"].includes(write.path)), JSON.stringify(writes));
 		assert.ok(!logs.includes("[side-model]") && !logs.includes("开演失败"), "UI must not perform model inference");
+		// Smoke the newly built full App entry points against real isolated services.
+		await page.getByRole("button", { name: "设置", exact: true }).click();
+		await page.getByRole("radio", { name: /护眼模式/ }).check();
+		assert.equal(await page.locator("html").getAttribute("data-theme"), "eye-care");
+		await page.getByRole("button", { name: "设置", exact: true }).click();
+		await page.getByRole("button", { name: "多卡并行", exact: true }).click();
+		const parallel = page.getByRole("dialog", { name: "多卡并行", exact: true });
+		await parallel.getByRole("button", { name: "新开独立卡位", exact: true }).click();
+		await parallel.getByRole("status").filter({ hasText: "可以输入" }).waitFor();
+		assert.equal(await parallel.evaluate(el => el.scrollWidth <= el.clientWidth + 1), true);
+		assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, "full mobile App must not overflow horizontally");
+		assert.equal((await api("/healthz")).sessionId, healthBefore.sessionId, "starting a parallel slot must not switch the primary story");
+		if (process.env.LIYUAN_UI_CJK_FONT) await page.waitForFunction(() => window.__fixtureFontReady === true);
+		if (artifacts) await page.screenshot({ path: join(artifacts, "parallel-slot-mobile.png"), fullPage: true });
+		await parallel.getByRole("button", { name: "暂停", exact: true }).click();
+		await parallel.getByRole("status").filter({ hasText: "已暂停" }).waitFor();
+		await parallel.getByRole("button", { name: "关闭多卡并行", exact: true }).click();
+		assert.equal((await api("/healthz")).sessionId, healthBefore.sessionId);
+		assert.deepEqual(errors, []); assert.deepEqual(forbiddenFrames, []);
+
 	} catch (error) {
 		if (artifacts && page) {
 			await mkdir(artifacts, { recursive: true });

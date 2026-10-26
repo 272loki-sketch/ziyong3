@@ -113,3 +113,17 @@
 .npc-parallel-manager.is-embedded .npc-parallel-manager-actions .npc-parallel-button{font-size:12px;min-height:36px}
 .npc-parallel-manager.is-embedded .npc-parallel-frame-wrap iframe{min-height:0}
 @media(max-width:500px){.npc-parallel-manager.is-embedded .npc-parallel-manager-header{padding:8px 12px}}
+
+.npc-parallel-settings { margin: 12px 0; padding: 4px 12px 12px; border: 1px solid var(--hairline, #ebe6df); border-radius: 10px; min-width: 0; }
+.npc-parallel-settings > legend { padding: 0 6px; font-size: 11px; font-weight: 620; color: var(--text-soft, #6a635c); }
+.npc-parallel-field-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin: 6px 0 10px; }
+.npc-parallel-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 11px; }
+.npc-parallel-field > span { font-weight: 600; }
+.npc-parallel-field small { color: var(--text-soft, #6a635c); font-size: 9px; }
+.npc-parallel-field input, .npc-parallel-field select, .npc-parallel-field textarea { width: 100%; min-width: 0; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--hairline-strong, #d9d2c8); border-radius: 7px; background: var(--surface, #fffcfa); color: inherit; font: inherit; }
+.npc-parallel-field textarea { resize: vertical; line-height: 1.6; }
+.npc-parallel-field-wide { margin-bottom: 10px; }
+.npc-parallel-roster { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; font-size: 11px; }
+.npc-parallel-roster > span { font-weight: 600; }
+.npc-parallel-roster > div { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.npc-parallel-roster-item { display: inline-flex; align-items: center; gap: 4px; }

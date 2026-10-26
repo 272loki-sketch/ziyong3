@@ -1,3 +1,5 @@
+import {validateNpcAdmissionRequest} from '../src/stage/npc-parallel.ts';
+import type { PlotOptionsEngine } from "../src/plot-options/engine.ts";
 import { inspectBoundRegex, type BoundRegexSource, type RegexInspectorSnapshot } from "../src/regex-inspector.ts";
 import { writeJsonAtomicWithBackup } from "../src/atomic-json.ts";
 import { listRealTests, readRealTest } from "./real-tests.ts";
@@ -29,14 +31,17 @@ import {
 	loadProfile,
 	materializeEnvKeysInConfig,
 	mergeModelsById,
+	mergeEnabledAgentProfile,
 	migrateActiveConfigIntoProfiles,
 	normalizeAgentConfig,
 	normalizeModels,
 	publicProvider,
 	repairDefaultProvider,
 	saveAgentConfig,
+	ownedProfileProviders,
 	saveProfile,
 	seedProviderFromRuntime,
+	syncLiveProvidersToProfiles,
 	syncAgentConfigToRuntime,
 	type AgentModelEntry,
 	type AgentProvider,
@@ -94,29 +99,33 @@ import {
 	updateStoreConfig,
 } from "../src/memory/index.ts";
 import { findHistoricalImage } from "../src/historical-images.ts";
+import { handleNovelAiRequest } from "./novelai-http.ts";
 import { normalizeStepModels, type SideModelStep } from "../src/model-routing.ts";
 import { resolveConfigPath } from "../src/paths.ts";
+import { countCompletedNarrativeTurns } from "../src/stage/literary-profile.ts";
+import { rebuildHistory, type BranchEntryLike } from "../src/stage/assemble.ts";
 import { loadStageMaterials } from "../src/stage/materials.ts";
+import { listWorldbookFiles, resolveWorldbooks, scopedLorebookPaths, setScopedLorebooks, selectedLorebookPaths, worldbookSelections, worldbookCardKey } from "../src/worldbook-bindings.ts";
 import { acknowledgeStageSkillBuiltin, deleteStageSkill, saveStageSkill, scanSkillFiles, type WorkflowSkillStage } from "../src/stage/skill-store.ts";
 import {
-	buildWorldProfilePrompt,
+	analyzeCardWorldProfile,
+	carryCardWorldProfile,
 	defaultCardWorldProfile,
 	loadCardWorldProfile,
 	manifestFromProfile,
 	normalizeCardWorldProfile,
 	saveCardWorldProfile,
 	worldProfileFingerprint,
+	worldProfileAnalysisRunning,
 } from "../src/stage/literary-world-profile.ts";
 import type { WorldlineView } from "../src/worldline.ts";
 import {
 	appendLorebookFileEntry,
-	applyDisabledLore,
 	applyLoreSourceState,
 	loreSourceKey,
 	patchLorebookRawEntry,
 	deleteLorebookRawEntry,
 	exportStLorebook,
-	loadLorebookFile,
 	loadLorebookRegexScripts,
 	loreFingerprint,
 	mergeEntries,
@@ -125,7 +134,6 @@ import {
 	normalizeEntriesWithKeys,
 	overlayPathFor,
 	searchEntries,
-	setLorebookEntriesEnabledByUid,
 	setMountedLorebooks,
 	type LoreEntryPatch,
 } from "../src/lorebook.ts";
@@ -248,7 +256,10 @@ export interface TavernGreetingSnapshot {
 }
 
 export interface RestHost {
+	plotOptions?: PlotOptionsEngine;
 	cwd: string;
+	/** Current session for chat-scoped books; independent workspaces have independent hosts. */
+	worldbookSessionId?(): string;
 	/** Synchronous canonical story/greeting scope snapshot; optional for synthetic/legacy hosts. */
 	readTavernGreetingSnapshot?(): TavernGreetingSnapshot;
 	/** Guarded host/tree switch. Must verify the selected greeting before returning true. */
@@ -256,6 +267,8 @@ export interface RestHost {
 
 	isStreaming(): boolean;
 	retrySettlement?(): Promise<unknown>;
+ regenerateSupplementary?(sessionId:string,sourceEntryId:string,receiptHash:string):Promise<{aborted:boolean;error?:string}>;
+ retryNpcAdmission?(expectedSessionId:string,expectedSourceEntryId:string,candidateHashes:string[]):Promise<unknown>;
 	retryVeridisRewrite?(expectedSessionId: string, expectedSourceEntryId: string): Promise<{ aborted: boolean; error?: string }>;
 	listModels(): { current: CurrentModelInfo | null; models: ModelInfo[] };
 	selectModel(provider: string, id: string): Promise<CurrentModelInfo>;
@@ -310,6 +323,8 @@ export interface RestHost {
 	searchSessions(q: string): Promise<SessionSearchHit[]>;
 	/** 世界状态用户主权编辑（applyPatch 语义，落盘+ await statesync） */
 	applyStatePatch(patch: Record<string, unknown>): Promise<{ applied: string[]; warnings: string[] }>;
+	retryLedger?(expected: import("../src/stage/ledger-status.ts").LedgerConfirmationExpected): Promise<{aborted:boolean;error?:string;ledgerUpdated?:boolean;noChanges?:boolean}>;
+	confirmLedger?(expected: import("../src/stage/ledger-status.ts").LedgerConfirmationExpected, patch: Record<string, unknown>): { applied: string[]; warnings: string[] };
 	notify(level: "info" | "warning" | "error", text: string): void;
 	/** 世界线时间线视图（会话树 rp-save + 旁路 meta） */
 	worldlineView(): import("../src/worldline.ts").WorldlineView;
@@ -340,12 +355,12 @@ export interface RestHost {
 		step: SideModelStep,
 		systemPrompt: string,
 		userText: string,
-		opts?: { maxTokens?: number; reasoning?: string; signal?: AbortSignal; forceNonStreaming?: boolean; onDelta?: (event: { kind: "text"; delta: string } | { kind: "error"; text: string }) => void },
+		opts?: { maxTokens?: number; reasoning?: string; signal?: AbortSignal; timeoutMs?: number; forceNonStreaming?: boolean; onDelta?: (event: { kind: "text"; delta: string } | { kind: "error"; text: string }) => void },
 	): Promise<string | { error: string }>;
 	/** 将当前角色卡画像钉到当前会话分支。 */
 	appendWorldManifest(data: unknown): void;
 	/** 长旁路分析提交前用于拒绝分支或角色卡漂移。 */
-	worldProfileContext(): { leafId: string | null; card: string };
+	worldProfileContext(): { leafId: string | null; card: string; sessionId?: string; branch?: BranchEntryLike[] };
 	worldStateView(): unknown;
 	/** 当前分支最近回合的只读演出诊断投影，不写入任何权威状态。 */
 	requestRecords(id?:string):unknown;
@@ -440,6 +455,12 @@ function readBody(req: IncomingMessage): Promise<string> {
 	return readBodyRaw(req, MAX_BODY).then((b) => b.toString("utf8"));
 }
 
+const worldProfileAnalyses = new WeakSet<RestHost>();
+function worldProfileSourceKey(context: ReturnType<RestHost["worldProfileContext"]>): string {
+	const semanticLeaf = context.branch ? [...context.branch].reverse().find(entry => entry.type !== "model_change" && entry.type !== "thinking_level_change")?.id ?? null : context.leafId;
+	return JSON.stringify([context.sessionId, context.card, semanticLeaf]);
+}
+
 function sendJson(res: ServerResponse, code: number, obj: unknown): void {
 	res.writeHead(code, { "content-type": "application/json; charset=utf-8" });
 	res.end(JSON.stringify(obj));
@@ -473,7 +494,7 @@ export function loadConfig(cwd: string): RpConfig {
  * 规则表 = 预设自带 regex_scripts + 卡自带 regex_scripts(顺序同酒馆 PRESET → SCOPED)。
  */
 /** Shared binding list: inspector and actual display chain read the same original sources. */
-function loadBoundRegexMaterials(cwd: string) {
+function loadBoundRegexMaterials(cwd: string, sessionId?: string) {
  const config = loadConfig(cwd);
  let raw: Record<string, unknown> | null = null, charName = "", cardError: string | undefined;
  try { raw=readCardRawJson(resolvePath(cwd,config.card)).raw as Record<string,unknown>; charName=loadCardFile(resolvePath(cwd,config.card)).name; }
@@ -491,20 +512,21 @@ function loadBoundRegexMaterials(cwd: string) {
   try { const effective=loadEffectivePreset(cwd);if(!effective.doc)throw Error("missing preset");sources.push({id:"preset",kind:"preset",name:effective.doc?.name||basename(config.preset),path:config.preset,draft:effective.fromOverride,scripts:effective.doc?extractRegexScripts(effective.doc.raw):[]}); }
   catch { sources.push({id:"preset",kind:"preset",name:basename(config.preset),path:config.preset,scripts:[],error:"预设读取失败"}); }
  }
- for (const [index,relative] of mountedLorebookPaths(config).entries()) {
+ const lorePaths = raw ? resolveWorldbooks(cwd, config, { rawCard: raw, sessionId }).books.filter(book => book.source === "file").map(book => book.path) : selectedLorebookPaths(config, sessionId);
+ for (const [index,relative] of lorePaths.entries()) {
   try { const path=resolvePath(cwd,relative); if(!existsSync(path))throw Error();sources.push({id:"lorebook:"+index,kind:"lorebook",name:basename(relative),path:relative,scripts:loadLorebookRegexScripts(path)}); }
   catch {sources.push({id:"lorebook:"+index,kind:"lorebook",name:basename(relative),path:relative,scripts:[],error:"世界书读取失败"});}
  }
  sources.push({id:"card",kind:"card",name:charName||basename(config.card),path:config.card,scripts:raw?extractRegexScripts(raw):[],...(cardError?{error:cardError}:{})});
  return {config,raw,charName,sources};
 }
-export function loadCardFrontSnapshot(cwd: string): CardFrontSnapshot {
- const {config,raw,charName,sources}=loadBoundRegexMaterials(cwd);
+export function loadCardFrontSnapshot(cwd: string, sessionId?: string): CardFrontSnapshot {
+ const {config,raw,charName,sources}=loadBoundRegexMaterials(cwd, sessionId);
  const regexSources: RegexScriptSource[]=sources.filter(source=>source.kind!=="card").map(source=>({source:source.path,scripts:source.scripts}));
  return buildCardFrontSnapshot(config,raw,charName,regexSources);
 }
-export function loadRegexInspectorSnapshot(cwd:string): RegexInspectorSnapshot {
- const {config,charName,sources}=loadBoundRegexMaterials(cwd);
+export function loadRegexInspectorSnapshot(cwd:string, sessionId?: string): RegexInspectorSnapshot {
+ const {config,charName,sources}=loadBoundRegexMaterials(cwd, sessionId);
  return {cardPath:config.card,charName,userName:config.userName,skinEnabled:!(config.cardSkinOff??[]).includes(config.card),...inspectBoundRegex(sources)};
 }
 
@@ -647,27 +669,19 @@ function clampInt(v: unknown, min: number, max: number, dflt: number): number {
 
 export type LoreSource = "card" | "file" | "agent";
 
-/** 与台上素材同源：卡内书 → 已挂载独立书 → 本卡补充；先应用来源覆盖再去重。 */
-function loadMergedLoreWithSource(cwd: string, config: RpConfig): {
+/** 管理合并视图与实际生成共用来源解析，不按正文抹掉独立条目。 */
+function loadMergedLoreWithSource(cwd: string, config: RpConfig, sessionId?: string): {
 	entries: LorebookEntry[]; sourceOf: (e: LorebookEntry) => LoreSource; cardName: string; paths: string[];
 } {
 	const card = loadCardFile(resolvePath(cwd, config.card));
-	const paths = mountedLorebookPaths(config);
-	const sources = new Map<LorebookEntry, LoreSource>();
-	const tag = (entries: LorebookEntry[], source: LoreSource, path: string) =>
-		applyLoreSourceState(entries, config, source, path).map((entry) => { sources.set(entry, source); return entry; });
-	const fileGroups = paths.map((path) => {
-		const abs = resolvePath(cwd, path);
-		return existsSync(abs) ? tag(loadLorebookFile(abs), "file", path) : [];
-	});
-	const overlay = overlayPathFor(cwd, card.name);
-	const entries = mergeEntries(tag(card.book, "card", config.card), ...fileGroups,
-		existsSync(overlay) ? tag(loadLorebookFile(overlay), "agent", config.card) : []);
-	return { entries, sourceOf: (e) => sources.get(e) ?? "card", cardName: card.name, paths };
+	const resolved = resolveWorldbooks(cwd, config, { card, sessionId });
+	const sources = new Map<string, LoreSource>(resolved.books.map(book => [book.id, book.source]));
+	return { entries: mergeEntries(...resolved.books.map(book => book.entries)), sourceOf: entry => sources.get(entry.bookId!) ?? "card",
+		cardName: card.name, paths: resolved.books.filter(book => book.source === "file").map(book => book.path) };
 }
 
-export function loadMergedLore(cwd: string, config: RpConfig): LorebookEntry[] {
-	return loadMergedLoreWithSource(cwd, config).entries;
+export function loadMergedLore(cwd: string, config: RpConfig, sessionId?: string): LorebookEntry[] {
+	return loadMergedLoreWithSource(cwd, config, sessionId).entries;
 }
 
 function collectActiveLoreForExport(cwd: string, config: RpConfig): LorebookEntry[] {
@@ -681,7 +695,7 @@ function currentCardIdentity(cwd: string, config: RpConfig): string {
 }
 
 type LoreTargetInput = { source?: string; path?: string; cardIdentity?: string };
-type LoreTarget = { source: LoreSource; path: string; abs: string; name: string; entries: Array<LorebookEntry & { entryKey: string }>; cardIdentity?: string };
+type LoreTarget = { source: LoreSource; path: string; abs: string; name: string; entries: Array<LorebookEntry & { entryKey: string }>; rawBook: Record<string, unknown>; cardIdentity?: string };
 function loreTarget(cwd: string, config: RpConfig, input: LoreTargetInput, requireIdentity = true): LoreTarget {
 	const path = (input.path ?? "").replace(/\\/g, "/").trim();
 	const source = input.source || (path === "agent" ? "agent" : path ? "file" : "");
@@ -692,21 +706,46 @@ function loreTarget(cwd: string, config: RpConfig, input: LoreTargetInput, requi
 		}
 		const card = loadCardFile(resolvePath(cwd, config.card));
 		const abs = source === "card" ? resolvePath(cwd, config.card) : overlayPathFor(cwd, card.name);
-		let rawEntries: unknown;
+		let rawBook: Record<string, unknown> = {};
 		if (source === "card") {
 			const raw = readCardRawJson(abs).raw;
 			const data = raw.data && typeof raw.data === "object" ? raw.data as Record<string, unknown> : raw;
 			const book = ("character_book" in data ? data.character_book : raw.character_book) as Record<string, unknown> | undefined;
-			rawEntries = book?.entries;
-		} else if (existsSync(abs)) rawEntries = (readJsonFile(abs) as Record<string, unknown>).entries;
+			if (book && typeof book === "object") rawBook = book;
+		} else if (existsSync(abs)) rawBook = readJsonFile(abs) as Record<string, unknown>;
 		return { source, path: config.card, abs, cardIdentity, name: source === "card" ? card.name : "agent 补充设定",
-			entries: normalizeEntriesWithKeys(rawEntries) };
+			rawBook, entries: normalizeEntriesWithKeys(rawBook.entries) };
 	}
 	if (source !== "file" || !path) throw new Error("缺少明确世界书来源 source 和路径 path");
 	const known = listLorebookFiles(cwd, config).find((book) => book.path === path);
 	if (!known) throw new Error("不是已知的世界书文件");
 	const abs = resolvePath(cwd, path);
-	return { source: "file", path, abs, name: known.name, entries: normalizeEntriesWithKeys((readJsonFile(abs) as Record<string, unknown>).entries) };
+	const rawBook = readJsonFile(abs) as Record<string, unknown>;
+	return { source: "file", path, abs, name: known.name, rawBook, entries: normalizeEntriesWithKeys(rawBook.entries) };
+}
+/** 所有生效书可按明确来源寻址；角色 API 只投影角色绑定，不冒称全局书为附加书。 */
+function tavernWorldbooks(cwd: string, config: RpConfig, sessionId?: string) {
+	return resolveWorldbooks(cwd, config, { sessionId }).books;
+}
+function tavernCardIdentity(cwd: string, config: RpConfig): string {
+	if (config.card && existsSync(resolvePath(cwd, config.card))) return currentCardIdentity(cwd, config);
+	// 没有当前卡时仍可管理已挂载独立书；之后选卡会让此快照失效。
+	return createHash("sha256").update(config.card.replace(/\\/g, "/")).update("\0missing-card").digest("hex");
+}
+function tavernWorldbookTarget(cwd: string, config: RpConfig, requested: string, sessionId?: string): { name: string; target: LoreTarget } {
+	const resolved = resolveWorldbooks(cwd, config, { sessionId });
+	const books = resolved.books;
+	const exact = books.filter(book => book.name === requested);
+	const matches = !requested ? (resolved.primary ? [resolved.primary] : books.slice(0, 1)) : exact.length ? exact : books.filter(book => book.source === "file" &&
+		[book.title, book.path, basename(book.path), basename(book.path).replace(/\.json$/i, "")].includes(requested));
+	if (matches.length !== 1) throw new Error(matches.length ? "世界书名称不唯一，请使用明确路径" : requested ? `世界书未挂载：${requested}` : "当前角色没有世界书");
+	const book = matches[0];
+	return { name: book.name, target: { source: book.source, path: book.path, abs: book.abs, name: book.title, rawBook: book.rawBook, entries: normalizeEntriesWithKeys(book.rawBook.entries) } };
+}
+function loreTargetRevision(target: LoreTarget, config: RpConfig): string {
+	// 原文件与有效停用覆盖同属已读快照；只变覆盖也不能让旧副本覆盖新开关。
+	return createHash("sha256").update(readFileSync(target.abs)).update("\0")
+		.update(JSON.stringify([config.disabledLore ?? [], config.loreEntryOverrides ?? {}, mountedLorebookPaths(config), config.lorebookBindings ?? {}])).digest("hex");
 }
 function loreTargetQuery(query: URLSearchParams): LoreTargetInput {
 	return { source: query.get("source") ?? undefined, path: query.get("path") ?? undefined,
@@ -724,7 +763,12 @@ function withLoreRollback<T>(cwd: string, target: LoreTarget, run: () => T): T {
 	const original = readFileSync(target.abs);
 	const configFile = configPath(cwd);
 	const configBefore = existsSync(configFile) ? readFileSync(configFile) : null;
-	try { return run(); }
+	try {
+		const before = target.source === "card" ? loadCardFile(target.abs) : undefined;
+		const result = run();
+		if (before) carryCardWorldProfile(cwd, target.path, before, loadCardFile(target.abs));
+		return result;
+	}
 	catch (error) {
 		try {
 			if (!readFileSync(target.abs).equals(original)) {
@@ -745,7 +789,7 @@ function requireLoreEntry(target: LoreTarget, fp: string, entryKey?: string): Lo
 	return matches[0];
 }
 /** 来源豁免只绕过旧的全局 disabledLore；原生 enabled:false 仍由卡/书原文决定。 */
-function updateLoreOverride(cwd: string, config: RpConfig, target: LoreTarget, rows: Array<{ fingerprint: string; entryKey?: string }>, enabled: boolean): void {
+function updateLoreOverride(cwd: string, config: RpConfig, target: LoreTarget, rows: Array<{ fingerprint: string; entryKey?: string }>, enabled: boolean): RpConfig {
 	const overrides = { ...config.loreEntryOverrides };
 	for (const row of rows) {
 		const key = loreSourceKey(target.source, target.path, row.fingerprint, row.entryKey);
@@ -756,6 +800,7 @@ function updateLoreOverride(cwd: string, config: RpConfig, target: LoreTarget, r
 	if (Object.keys(overrides).length) next.loreEntryOverrides = overrides;
 	else delete next.loreEntryOverrides;
 	if (JSON.stringify(config.loreEntryOverrides) !== JSON.stringify(next.loreEntryOverrides)) writeJsonWithBackup(configPath(cwd), next);
+	return next;
 }
 
 const previewText = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
@@ -782,7 +827,7 @@ interface CardLibItem {
 	mtimeMs: number;
 }
 
-function listCardLibrary(cwd: string, config: RpConfig): CardLibItem[] {
+export function listCardLibrary(cwd: string, config: RpConfig): CardLibItem[] {
 	const out: CardLibItem[] = [];
 	for (const spec of cardDirSpecs(cwd, config)) {
 		if (!existsSync(spec.abs)) continue;
@@ -816,7 +861,7 @@ function listCardLibrary(cwd: string, config: RpConfig): CardLibItem[] {
 }
 
 /** 校验 query 里的卡路径确属卡库（一切卡文件读操作的门），返回绝对路径 */
-function assertLibraryCard(cwd: string, config: RpConfig, relPath: string): string {
+export function assertLibraryCard(cwd: string, config: RpConfig, relPath: string): string {
 	const item = listCardLibrary(cwd, config).find((c) => c.path === relPath);
 	if (!item) throw new Error("不是卡库中的角色卡");
 	return resolvePath(cwd, relPath);
@@ -1107,58 +1152,8 @@ function listPresetFiles(cwd: string): Array<{ file: string; name: string }> {
 
 const LOREBOOKS_DIR = "assets/lorebooks";
 
-/** 世界书扫描目录：assets/lorebooks + 各挂载书所在目录（用户素材常在项目外） */
-function lorebookDirSpecs(cwd: string, config: RpConfig): Array<{ abs: string; relBase: string }> {
-	const specs = [{ abs: join(cwd, LOREBOOKS_DIR), relBase: LOREBOOKS_DIR }];
-	for (const rel of mountedLorebookPaths(config)) {
-		const base = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : ".";
-		const abs = resolvePath(cwd, base);
-		if (!specs.some((s) => s.abs === abs)) specs.push({ abs, relBase: base });
-	}
-	return specs;
-}
-
-const lorebookMetaCache = new Map<string, { mtimeMs: number; count: number | null; displayName: string }>();
-
-function listLorebookFiles(cwd: string, config: RpConfig): Array<{ path: string; name: string; entryCount: number }> {
-	const out: Array<{ path: string; name: string; entryCount: number }> = [];
-	for (const spec of lorebookDirSpecs(cwd, config)) {
-		if (!existsSync(spec.abs)) continue;
-		for (const f of readdirSync(spec.abs)) {
-			if (!f.endsWith(".json")) continue;
-			const abs = join(spec.abs, f);
-			let mtimeMs = 0;
-			try {
-				mtimeMs = statSync(abs).mtimeMs;
-			} catch {
-				continue;
-			}
-			const cached = lorebookMetaCache.get(abs);
-			// Prefer JSON `name` over bare filename — zip tools (Windows Compress-Archive)
-			// often corrupt non-ASCII filenames while leaving UTF-8 content intact.
-			let displayName = f.replace(/\.json$/i, "");
-			let count: number | null;
-			if (cached && cached.mtimeMs === mtimeMs) {
-				count = cached.count;
-				displayName = cached.displayName || displayName;
-			} else {
-				try {
-					const raw = readJsonFile(abs) as Record<string, unknown>;
-					const entries = normalizeEntries(raw.entries);
-					count = raw.entries && typeof raw.entries === "object" ? entries.length : null; // 空世界书也可浏览；卡/预设没有 entries
-					if (typeof raw.name === "string" && raw.name.trim()) {
-						displayName = raw.name.trim();
-					}
-				} catch {
-					count = null;
-				}
-				lorebookMetaCache.set(abs, { mtimeMs, count, displayName });
-			}
-			if (count === null) continue;
-			out.push({ path: `${spec.relBase}/${f}`, name: displayName, entryCount: count });
-		}
-	}
-	return out;
+function listLorebookFiles(cwd: string, config: RpConfig, sessionId?: string): Array<{ path: string; name: string; entryCount: number }> {
+	return listWorldbookFiles(cwd, config, sessionId);
 }
 
 // ---------- persona 投影（PLAN-PANELS-V2 §2.5：config.userName/userPersona=当前 persona 的镜像） ----------
@@ -1191,6 +1186,22 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 	};
 
 	try {
+		if (await handleNovelAiRequest(req, res, host)) return true;
+  if (url === "/api/plot-options" || url.startsWith("/api/plot-options/")) {
+   if (!host.plotOptions) { sendJson(res, 501, { error: "日常剧情筹备不可用" }); return true; }
+   res.setHeader("cache-control", "no-store");
+   if (route === "GET /api/plot-options") sendJson(res, 200, host.plotOptions.view());
+   else if (route === "GET /api/plot-options/library") sendJson(res, 200, host.plotOptions.library((query.get("q") ?? "").slice(0, 300), Math.max(0, Number(query.get("offset")) || 0)));
+   else if (["PUT /api/plot-options/settings", "POST /api/plot-options/refresh", "POST /api/plot-options/reindex", "POST /api/plot-options/cancel"].includes(route)) {
+    const body = JSON.parse(await readBody(req));
+    if (typeof body.contextKey !== "string") throw Error("缺少剧情选项作用域");
+    if (typeof body.controlKey !== "string" || body.controlKey !== host.plotOptions.controlKey()) { sendJson(res, 409, { error: "故事分支或当前楼层已变化，请刷新剧情选项" }); return true; }
+    const result = route.endsWith("/settings") ? host.plotOptions.settings({ ...(body.embeddingBatchSize !== undefined ? { embeddingBatchSize: body.embeddingBatchSize } : {}), ...(body.semantic !== undefined ? { semantic: body.semantic } : {}), ...(body.enabled !== undefined ? { enabled: body.enabled } : {}), ...(body.interval !== undefined ? { interval: body.interval } : {}) }, body.contextKey)
+     : route.endsWith("/reindex") ? host.plotOptions.rebuildSemantic(body.contextKey) : route.endsWith("/cancel") ? host.plotOptions.cancelDirection(body.contextKey) : host.plotOptions.refresh(body.contextKey, body.cardId);
+    sendJson(res, 200, result);
+   } else sendJson(res, 404, { error: "未知剧情选项接口" });
+   return true;
+  }
 		if (route === "GET /api/tavern/greeting-context") {
 			if (!host.readTavernGreetingSnapshot) { sendJson(res, 501, { error: "宿主不支持开场白上下文" }); return true; }
 			const { context } = host.readTavernGreetingSnapshot();
@@ -1238,6 +1249,21 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 			return true;
 		}
 		if (route === "POST /api/turn/retry-settlement") { if(refuseWhileStreaming())return true; if(!host.retrySettlement){sendJson(res,501,{error:"宿主不支持结算恢复"});return true;} sendJson(res,200,await host.retrySettlement());return true; }
+  if(route==='POST /api/turn/regenerate-supplementary'){
+   if(refuseWhileStreaming())return true;
+   const body=JSON.parse(await readBody(req));
+   if(!body||Array.isArray(body)||Object.keys(body).length!==3||!['expectedSessionId','expectedSourceEntryId','expectedReceiptHash'].every(key=>typeof body[key]==='string'&&body[key].trim()))throw Error('必须提供会话、正文和附属收据绑定');
+   if(refuseWhileStreaming())return true;
+   if(!host.regenerateSupplementary){sendJson(res,501,{error:'宿主不支持独立附属重新生成'});return true;}
+   const result=await host.regenerateSupplementary(body.expectedSessionId,body.expectedSourceEntryId,body.expectedReceiptHash);
+   sendJson(res,result.error||result.aborted?409:200,result);return true;
+  }
+		if(route==="POST /api/turn/retry-npc-admission"){
+   if(refuseWhileStreaming())return true;
+   if(!host.retryNpcAdmission){sendJson(res,501,{error:'宿主不支持复用候选采纳'});return true;}
+   const selected=validateNpcAdmissionRequest(JSON.parse(await readBody(req)));
+   sendJson(res,200,await host.retryNpcAdmission(selected.expectedSessionId,selected.expectedSourceEntryId,selected.candidateHashes));return true;
+  }
 		if (route === "POST /api/turn/retry-veridis") {
 			if (refuseWhileStreaming()) return true;
 			const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
@@ -2198,12 +2224,12 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 
 			// ---- 卡前端(一档皮肤,spec 2026-07-22 §7 P1) ----
 			case "GET /api/cardfront/regex": {
-    sendJson(res,200,loadRegexInspectorSnapshot(host.cwd));return true;
+    sendJson(res,200,loadRegexInspectorSnapshot(host.cwd, host.worldbookSessionId?.()));return true;
    }
    case "GET /api/cardfront": {
 				// 与 GET /api/card 同：当前卡用 resolvePath（支持按路径换卡的非库内路径）
 				// 载荷必须与 hello.cardfront 同源(buildCardFrontSnapshot)
-				sendJson(res, 200, loadCardFrontSnapshot(host.cwd));
+				sendJson(res, 200, loadCardFrontSnapshot(host.cwd, host.worldbookSessionId?.()));
 				return true;
 			}
 			case "PUT /api/cardfront": {
@@ -2238,7 +2264,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				}
 				res.writeHead(200, {
 					"content-type": "image/png",
-					"cache-control": "public, max-age=604800, immutable",
+					"cache-control": "private, no-cache",
 					etag: `"${mtime.toString(16)}"`,
 				});
 				res.end(readFileSync(abs));
@@ -2385,6 +2411,23 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 			}
 
 			// ---- 世界状态编辑（PLAN-PANELS §2.11）：用户主权，applyPatch 语义，不经模型 ----
+   case "POST /api/state/retry-ledger": {
+    if(refuseWhileStreaming())return true;
+    if(!host.retryLedger){sendJson(res,501,{error:"宿主不支持单独补写账本"});return true;}
+    const body=JSON.parse(await readBody(req));
+    if(!body||body.confirm!==true||Object.keys(body).some(key=>!["confirm","expected"].includes(key)))throw new Error("请明确确认本次只补写账本并可能产生模型费用");
+    if(!body.expected||["sessionId","card","sourceEntryId","revision"].some(key=>typeof body.expected[key]!=="string"||!body.expected[key].trim()))throw new Error("缺少补写账本的会话、卡、正文来源或版本");
+    const result=await host.retryLedger(body.expected);sendJson(res,result.error?409:200,result);return true;
+   }
+   case "POST /api/state/confirm-ledger": {
+    if (refuseWhileStreaming()) return true;
+    if (!host.confirmLedger) { sendJson(res, 501, {error: "宿主不支持账本核对确认"}); return true; }
+    const body = JSON.parse(await readBody(req));
+    if (body.confirm !== true) throw new Error("请明确确认已按最新正文核对整份账本");
+    if (!body.expected || ["sessionId", "card", "sourceEntryId", "revision"].some(key => typeof body.expected[key] !== "string" || !body.expected[key].trim())) throw new Error("缺少账本确认的会话、卡、正文来源或版本");
+    if (body.patch !== undefined && (!body.patch || typeof body.patch !== "object" || Array.isArray(body.patch))) throw new Error("缺少有效账本 patch");
+    sendJson(res, 200, host.confirmLedger(body.expected, body.patch ?? {})); return true;
+   }
 			case "PUT /api/state": {
 				if (refuseWhileStreaming()) return true;
 				const body = JSON.parse(await readBody(req)) as { patch?: Record<string, unknown> };
@@ -2502,7 +2545,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				res.writeHead(200, {
 					"content-type": isPng ? "image/png" : "image/jpeg",
 					// 头像 URL 常带 bust 参数；允许短缓存减少切换闪烁
-					"cache-control": "public, max-age=3600",
+					"cache-control": "private, no-cache",
 					"content-length": buf.length,
 				});
 				res.end(buf);
@@ -2637,16 +2680,21 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 			case "GET /api/lorebooks": {
 				const config = loadConfig(host.cwd);
 				const active = mountedLorebookPaths(config);
+				const resolved = resolveWorldbooks(host.cwd, config, { sessionId: host.worldbookSessionId?.() });
 				sendJson(res, 200, {
 					/** 多本同时挂载；兼容旧前端：active 现为 string[] */
 					active,
 					/** @deprecated 旧单本字段：取 active[0] 或 null */
 					activeOne: active[0] ?? null,
-					books: listLorebookFiles(host.cwd, config),
+					books: listLorebookFiles(host.cwd, config, host.worldbookSessionId?.()),
+					scopes: { global: active, character_aux: scopedLorebookPaths(config, "character_aux"), chat: scopedLorebookPaths(config, "chat", host.worldbookSessionId?.()) },
+					sessionId: host.worldbookSessionId?.(),
+					primary: resolved.primary ? { name: resolved.primary.name, source: resolved.primary.source, path: resolved.primary.path, entryCount: resolved.primary.entries.length } : null,
+					primaryResolution: resolved.primaryResolution, declaredPrimary: resolved.declaredPrimary,
 					embeddedCard: (() => {
 						const card = loadCardFile(resolvePath(host.cwd, config.card));
 						return { path: config.card, name: card.name, cardIdentity: currentCardIdentity(host.cwd, config),
-							entryCount: card.book.length,
+							entryCount: card.book.length, active: resolved.embedded?.active ?? false,
 							enabledCount: applyLoreSourceState(card.book, config, "card", config.card).filter((e) => e.enabled).length };
 					})(),
 				});
@@ -2664,12 +2712,17 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				const body = JSON.parse(await readBody(req)) as {
 					path?: string | null;
 					paths?: string[];
-					enabled?: boolean;
+					enabled?: boolean; scope?: "global" | "character_aux" | "chat"; cardIdentity?: string; sessionId?: string;
 				};
+				if (refuseWhileStreaming()) return true;
 				const config = loadConfig(host.cwd);
+				const scope = body.scope ?? "global", sessionId = host.worldbookSessionId?.();
+				if (!["global", "character_aux", "chat"].includes(scope)) throw new Error("未知世界书作用域");
+				if (scope !== "global" && body.cardIdentity !== currentCardIdentity(host.cwd, config)) throw new Error("角色卡已变化，请刷新后绑定世界书");
+				if (scope === "chat" && (!sessionId || body.sessionId !== sessionId)) throw new Error("聊天身份已变化，请刷新后绑定世界书");
 				const ensureBook = (p: string) => {
 					const abs = resolvePath(host.cwd, p);
-					if (!existsSync(abs) || loadLorebookFile(abs).length === 0) {
+					if (!listLorebookFiles(host.cwd, config, sessionId).some(book => worldbookCardKey(book.path) === worldbookCardKey(p)) || !existsSync(abs)) {
 						throw new Error(`不是有效的世界书文件：${p}`);
 					}
 				};
@@ -2682,7 +2735,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				} else if (typeof body.path === "string" && body.path.trim()) {
 					const p = body.path.replace(/\\/g, "/");
 					ensureBook(p);
-					const cur = new Set(mountedLorebookPaths(config));
+					const cur = new Set(scopedLorebookPaths(config, scope, sessionId));
 					const on = body.enabled !== false; // 默认挂上；传 false 卸下
 					// 若未显式传 enabled 且已在列表中 → 视为切换（toggle）
 					if (body.enabled === undefined) {
@@ -2694,10 +2747,10 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				} else {
 					throw new Error("缺少 path 或 paths");
 				}
-				const next = setMountedLorebooks(config, nextPaths);
+				const next = scope === "global" ? setMountedLorebooks(config, nextPaths) : setScopedLorebooks(config, scope, nextPaths, sessionId);
 				writeJsonWithBackup(configPath(host.cwd), next);
 				await host.softRefreshConfig();
-				sendJson(res, 200, { ok: true, active: nextPaths });
+				sendJson(res, 200, { ok: true, scope, active: nextPaths });
 				return true;
 			}
 
@@ -2756,54 +2809,67 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				return true;
 			}
 			case "GET /api/world-profile": {
-				const materials = loadStageMaterials(host.cwd);
+				const materials = loadStageMaterials(host.cwd, { sessionId: host.worldbookSessionId?.() });
 				const fingerprint = worldProfileFingerprint({ card: materials.card, entries: materials.entries, preset: materials.preset, greetingIndex: materials.config.greetingIndex });
-				const profile = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card);
+				const profile = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card, host.worldProfileContext().branch);
 				sendJson(res, 200, {
 					profile,
 					card: { key: profile?.cardKey ?? defaultCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card).cardKey, name: materials.card.name },
 					materialsChanged: !!profile && profile.sourceFingerprint !== fingerprint,
+					analyzing: worldProfileAnalyses.has(host) || worldProfileAnalysisRunning(host.cwd, materials.config.card, materials.card),
+					worldEnabled: materials.config.literaryWorldEnabled === true,
+					configuredModel: materials.config.stepModels?.worldProfile ?? null,
 				});
 				return true;
 			}
 			case "POST /api/world-profile/analyze": {
-				if (host.isStreaming()) { sendJson(res, 409, { error: "演出进行中，不能重建角色卡世界画像" }); return true; }
-				const sourceContext = host.worldProfileContext();
-				const materials = loadStageMaterials(host.cwd);
-				const skill = scanSkillFiles(host.cwd).find((item) => item.workflow === "world-profile");
-				if (!skill) throw new Error("缺少 workflow: world-profile 的角色卡世界画像 Skill");
-				const fingerprint = worldProfileFingerprint({ card: materials.card, entries: materials.entries, preset: materials.preset, greetingIndex: materials.config.greetingIndex });
-				const previous = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card);
-				const prompt = buildWorldProfilePrompt({ skillBody: skill.body, card: materials.card, entries: materials.entries, preset: materials.preset, greetingIndex: materials.config.greetingIndex, previous });
-				let result = await host.runSideText("worldProfile", prompt.systemPrompt, prompt.userText, { maxTokens: 12288 });
-				if (typeof result !== "string") throw new Error(`画像分析失败：${result.error}`);
-				const targetContext = host.worldProfileContext();
-				if (sourceContext.leafId !== targetContext.leafId || sourceContext.card !== targetContext.card) throw new Error("画像分析期间切换了分支或角色卡，结果已丢弃");
-				const base = previous ?? defaultCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card);
-				let profile = normalizeCardWorldProfile(result, base, { preserveStatus: !!previous, sourceFingerprint: fingerprint });
-				if (!profile) {
-					const retry = await host.runSideText("worldProfile", prompt.systemPrompt, prompt.userText, { maxTokens: 12288, forceNonStreaming: true });
-					if (typeof retry === "string") { result = retry; profile = normalizeCardWorldProfile(retry, base, { preserveStatus: !!previous, sourceFingerprint: fingerprint }); }
-				}
-				if (!profile) {
-					const rawPath = join(host.cwd, ".liyuan", "world", "profile-last-invalid.txt");
-					mkdirSync(dirname(rawPath), { recursive: true });
-					writeFileSync(rawPath, result, "utf8");
-					throw new Error(`画像输出不可解析；原始输出已保存到 ${rawPath}`);
-				}
-				saveCardWorldProfile(host.cwd, materials.config.card, profile, materials.card);
-				const manifestApplied = targetContext.card === materials.config.card;
-				if (manifestApplied) host.appendWorldManifest(manifestFromProfile(profile));
-				sendJson(res, 200, { ok: true, profile, manifestApplied, ...(manifestApplied ? {} : { note: "卡级画像已保存；当前会话绑定另一张卡，未向该会话写入 Manifest" }) });
+				if (host.isStreaming() || worldProfileAnalyses.has(host)) { sendJson(res, 409, { error: "演出或画像分析进行中，请等待完成后再分析" }); return true; }
+				worldProfileAnalyses.add(host);
+				try {
+					await readBody(req);
+					if (host.isStreaming()) throw new Error("演出已开始，请等待完成后再分析画像");
+					const sourceContext = host.worldProfileContext();
+					const materials = loadStageMaterials(host.cwd, { sessionId: host.worldbookSessionId?.() });
+					if (worldProfileAnalysisRunning(host.cwd, materials.config.card, materials.card)) { sendJson(res, 409, { error: "这张卡的世界画像正在后台分析，请等待完成" }); return true; }
+					const skill = materials.skillFiles.find(item => item.workflow === "world-profile");
+					if (!skill) throw new Error("缺少 workflow: world-profile 的角色卡世界画像 Skill");
+					const fingerprint = worldProfileFingerprint({ ...materials, greetingIndex: materials.config.greetingIndex });
+					const previous = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card, sourceContext.branch);
+					const sourceKey = worldProfileSourceKey(sourceContext);
+					const controller = new AbortController();
+					const onAborted = () => controller.abort(new Error("画像分析请求已取消"));
+					const onClosed = () => { if (!res.writableEnded) onAborted(); };
+					req.once("aborted", onAborted);
+					res.once?.("close", onClosed);
+					const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(Math.max(60_000, Math.min(1800_000, (materials.config.analysisTimeoutMinutes ?? 10) * 60_000)))]);
+					const guard = () => {
+						signal.throwIfAborted();
+						const current = loadStageMaterials(host.cwd, { sessionId: host.worldbookSessionId?.() });
+						if (host.isStreaming() || worldProfileSourceKey(host.worldProfileContext()) !== sourceKey || current.config.card !== materials.config.card || worldProfileFingerprint({ ...current, greetingIndex: current.config.greetingIndex }) !== fingerprint)
+							throw new Error("画像分析期间会话、分支或素材已变化，结果未覆盖旧画像；请刷新后重试");
+						const saved = loadCardWorldProfile(host.cwd, current.config.card, current.card.name, fingerprint, current.card, host.worldProfileContext().branch);
+						if (JSON.stringify(saved) !== JSON.stringify(previous)) throw new Error("画像已由其他请求更新，请刷新后重试");
+					};
+					try {
+						const profile = await analyzeCardWorldProfile({ ...materials, skillBody: skill.body, cwd: host.cwd, cardPath: materials.config.card, greetingIndex: materials.config.greetingIndex, previous,
+							completedTurns: countCompletedNarrativeTurns(sourceContext.branch ?? []), recentHistory: rebuildHistory(sourceContext.branch ?? []).history,
+							guard, run: (sp, ut, forceNonStreaming) => host.runSideText("worldProfile", sp, ut, { maxTokens: 12288, signal, forceNonStreaming }) });
+						guard();
+						saveCardWorldProfile(host.cwd, materials.config.card, profile, materials.card);
+						const manifestApplied = sourceContext.card === materials.config.card;
+						if (manifestApplied) host.appendWorldManifest(manifestFromProfile(profile));
+						sendJson(res, 200, { ok: true, profile, manifestApplied, ...(manifestApplied ? {} : { note: "画像已保存；当前会话绑定另一张卡，未向该会话写入适配" }) });
+					} finally { req.removeListener("aborted", onAborted); res.removeListener?.("close", onClosed); }
+				} finally { worldProfileAnalyses.delete(host); }
 				return true;
 			}
 			case "PUT /api/world-profile": {
-				if (host.isStreaming()) { sendJson(res, 409, { error: "演出进行中，不能修改角色卡世界画像" }); return true; }
+				if (host.isStreaming() || worldProfileAnalyses.has(host)) { sendJson(res, 409, { error: "演出或画像分析进行中，不能修改角色卡世界画像" }); return true; }
 				const sourceContext = host.worldProfileContext();
-				const materials = loadStageMaterials(host.cwd);
+				const materials = loadStageMaterials(host.cwd, { sessionId: host.worldbookSessionId?.() });
 				const fingerprint = worldProfileFingerprint({ card: materials.card, entries: materials.entries, preset: materials.preset, greetingIndex: materials.config.greetingIndex });
-				const previous = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card)
-					?? defaultCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card);
+				const previous = loadCardWorldProfile(host.cwd, materials.config.card, materials.card.name, fingerprint, materials.card, sourceContext.branch);
+				if (!previous) throw new Error("尚无可用世界画像，请先分析这张卡；保存设置不能代替模型分析");
 				const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
 				const candidate = {
 					...previous,
@@ -2814,12 +2880,13 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 					...(Array.isArray(body.userRequirements) ? { userRequirements: body.userRequirements } : {}),
 					...(Array.isArray(body.optimizationNotes) ? { optimizationNotes: body.optimizationNotes } : {}),
 				};
-				const profile = normalizeCardWorldProfile(candidate, previous, { sourceFingerprint: fingerprint });
+				const profile = normalizeCardWorldProfile(candidate, { ...previous, ...(Array.isArray(body.userRequirements) ? { userRequirements: [] } : {}), ...(Array.isArray(body.optimizationNotes) ? { optimizationNotes: [] } : {}) }, { sourceFingerprint: previous.sourceFingerprint });
 				if (!profile) throw new Error("画像修改不可解析");
 				const targetContext = host.worldProfileContext();
-				if (sourceContext.leafId !== targetContext.leafId || sourceContext.card !== targetContext.card) throw new Error("画像修改期间切换了分支或角色卡，结果已丢弃");
+				const current = loadStageMaterials(host.cwd, { sessionId: host.worldbookSessionId?.() });
+				if (host.isStreaming() || worldProfileAnalyses.has(host) || worldProfileAnalysisRunning(host.cwd, current.config.card, current.card) || worldProfileSourceKey(sourceContext) !== worldProfileSourceKey(targetContext) || current.config.card !== materials.config.card || worldProfileFingerprint({ ...current, greetingIndex: current.config.greetingIndex }) !== fingerprint || JSON.stringify(loadCardWorldProfile(host.cwd, current.config.card, current.card.name, fingerprint, current.card, targetContext.branch)) !== JSON.stringify(previous)) throw new Error("画像修改期间会话、素材或画像已变化，请刷新后重试");
 				saveCardWorldProfile(host.cwd, materials.config.card, profile, materials.card);
-				host.appendWorldManifest(manifestFromProfile(profile));
+				if (targetContext.card === materials.config.card) host.appendWorldManifest(manifestFromProfile(profile));
 				sendJson(res, 200, { ok: true, profile });
 				return true;
 			}
@@ -2843,80 +2910,75 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				sendJson(res, 200, { ok: true, ...r, ...getMemoryStatus(host.cwd, host.memoryScope()) });
 				return true;
 			}
-			/**
-			 * 程序卡世界书兼容面：对齐酒馆助手 getWorldbook / replaceWorldbook 的必要子集。
-			 *
-			 * 只允许访问当前挂载书；写侧只接受 uid+enabled，并落到 disabledLore 覆盖层，
-			 * 不改用户世界书源文件。这样程序卡能管理模块启停，同时保持梨园现有主权与回滚语义。
-			 */
+			/** 程序卡启停兼容面：完整来源快照，不经过送模合并去重，不开放正文替换。 */
+			case "GET /api/tavern/worldbooks": {
+				const resolved = resolveWorldbooks(host.cwd, loadConfig(host.cwd), { sessionId: host.worldbookSessionId?.() });
+				sendJson(res, 200, worldbookSelections(resolved));
+				return true;
+			}
 			case "GET /api/tavern/worldbook": {
 				const config = loadConfig(host.cwd);
-				const mounted = mountedLorebookPaths(config);
-				const requested = (query.get("name") ?? "").replace(/\\/g, "/").trim();
-				const path = requested
-					? mounted.find(
-							(p) =>
-								p === requested ||
-								basename(p).replace(/\.json$/i, "") === requested ||
-								basename(p) === requested,
-						)
-					: mounted[0];
-				if (!path) throw new Error(requested ? `世界书未挂载：${requested}` : "当前角色没有挂载世界书");
-				const abs = resolvePath(host.cwd, path);
-				if (!existsSync(abs)) throw new Error(`世界书文件不存在：${path}`);
-				const entries = applyDisabledLore(loadLorebookFile(abs), config.disabledLore);
+				const { name, target } = tavernWorldbookTarget(host.cwd, config, (query.get("name") ?? "").replace(/\\/g, "/").trim(), host.worldbookSessionId?.());
+				const entries = applyLoreSourceState(target.entries, config, target.source, target.path);
 				sendJson(res, 200, {
-					name: basename(path).replace(/\.json$/i, ""),
-					path,
-					entries: entries.map((e) => ({
-						uid: e.uid,
-						name: e.comment,
-						comment: e.comment,
-						key: e.keys,
-						keysecondary: e.secondaryKeys,
-						content: e.content,
-						constant: e.constant,
-						selective: e.selective,
-						order: e.order,
-						enabled: e.enabled,
-					})),
+					name, source: target.source, path: target.path, cardIdentity: tavernCardIdentity(host.cwd, config), revision: loreTargetRevision(target, config), sessionId: host.worldbookSessionId?.(),
+					entries: entries.map(e => {
+						const original = (target.rawBook.entries as Record<string, Record<string, unknown>>)[e.entryKey!];
+						const fields = original?.extensions && typeof original.extensions === "object" ? original.extensions as Record<string, unknown> : {};
+						const position = original?.position ?? fields.position ?? 0;
+						return { ...original, ...fields, uid: e.uid, entryKey: e.entryKey, fingerprint: loreFingerprint(e.content),
+							name: e.comment, comment: e.comment, key: e.keys, keys: e.keys, keysecondary: e.secondaryKeys, content: e.content,
+							constant: e.constant, selective: e.selective, order: e.order, enabled: e.enabled, disable: !e.enabled,
+							position: position === "before_char" ? 0 : position === "after_char" ? 1 : position, depth: original?.depth ?? fields.depth ?? 4 };
+					}),
 				});
 				return true;
 			}
 			case "PUT /api/tavern/worldbook": {
 				if (refuseWhileStreaming()) return true;
-				const body = JSON.parse(await readBody(req)) as {
-					name?: string;
-					entries?: Array<{ uid?: number; enabled?: boolean }>;
+				const body = JSON.parse(await readBody(req)) as LoreTargetInput & {
+					revision?: string; sessionId?: string; entries?: Array<{ uid?: number; enabled?: boolean; entryKey?: string; fingerprint?: string }>;
 				};
-				if (!Array.isArray(body.entries)) throw new Error("缺少 entries");
+				// 读取请求体期间可能开始生成、切卡或卸书；只依据当前配置校验已读来源。
+				if (refuseWhileStreaming()) return true;
 				const config = loadConfig(host.cwd);
-				const mounted = mountedLorebookPaths(config);
-				const requested = (body.name ?? "").replace(/\\/g, "/").trim();
-				const path = requested
-					? mounted.find(
-							(p) =>
-								p === requested ||
-								basename(p).replace(/\.json$/i, "") === requested ||
-								basename(p) === requested,
-						)
-					: mounted[0];
-				if (!path) throw new Error(requested ? `世界书未挂载：${requested}` : "当前角色没有挂载世界书");
-				const abs = resolvePath(host.cwd, path);
-				if (!existsSync(abs)) throw new Error(`世界书文件不存在：${path}`);
-				const desired = new Map<number, boolean>();
-				for (const item of body.entries) {
-					if (Number.isInteger(item?.uid) && typeof item.enabled === "boolean") desired.set(item.uid!, item.enabled);
+				if ((body.source !== "card" && body.source !== "file" && body.source !== "agent") || typeof body.path !== "string" ||
+					body.cardIdentity !== tavernCardIdentity(host.cwd, config)) throw new Error("世界书来源缺失或角色卡已切换/修订，请重新读取世界书");
+				if (body.sessionId !== host.worldbookSessionId?.()) throw new Error("世界书聊天来源已变化，请重新读取");
+				if (!tavernWorldbooks(host.cwd, config, host.worldbookSessionId?.()).some(book => book.source === body.source && book.path === body.path))
+					throw new Error("世界书来源已变化或未挂载，请刷新后重试");
+				const bound = tavernWorldbooks(host.cwd, config, host.worldbookSessionId?.()).find(book => book.source === body.source && book.path === body.path)!;
+				const target: LoreTarget = { ...bound, entries: normalizeEntriesWithKeys(bound.rawBook.entries) };
+				if (body.revision !== loreTargetRevision(target, config)) throw new Error("世界书已修订，请重新读取后重试");
+				if (!Array.isArray(body.entries)) throw new Error("缺少 entries");
+				const effective = new Map(applyLoreSourceState(target.entries, config, target.source, target.path).map(e => [e.entryKey, { ...e, fingerprint: loreFingerprint(e.content) }]));
+				const seen = new Set<string>();
+				const updates: Array<{ fingerprint: string; entryKey: string; enabled: boolean }> = [];
+				for (const row of body.entries) {
+					if (!row || !Number.isInteger(row.uid) || typeof row.enabled !== "boolean" || typeof row.entryKey !== "string" || typeof row.fingerprint !== "string" || seen.has(row.entryKey))
+						throw new Error("世界书条目来源无效或行键重复，请重新读取世界书");
+					const entry = effective.get(row.entryKey);
+					if (!entry || entry.fingerprint !== row.fingerprint || entry.uid !== row.uid) throw new Error("世界书条目已变化，请重新读取世界书");
+					seen.add(row.entryKey);
+					if (entry.enabled !== row.enabled) updates.push({ fingerprint: row.fingerprint, entryKey: row.entryKey, enabled: row.enabled });
 				}
-				const result = setLorebookEntriesEnabledByUid(abs, desired);
-				// 程序卡接管过的条目以源书 enabled/disable 为真源，清掉梨园用户覆盖避免双重状态。
-				const touched = new Set(result.touchedFingerprints);
-				const disabled = (config.disabledLore ?? []).filter((fp) => !touched.has(fp));
-				const next = { ...config, disabledLore: [...disabled] } as Record<string, unknown>;
-				if ((next.disabledLore as string[]).length === 0) delete next.disabledLore;
-				writeJsonWithBackup(configPath(host.cwd), next);
-				await host.softRefreshConfig();
-				sendJson(res, 200, { ok: true, path, changed: result.changed });
+				// 所有行先校验；未变的关闭模块不写入，未知字段/其它来源/全局旧停用清单不改。
+				if (updates.length) {
+					withLoreRollback(host.cwd, target, () => {
+						writeLoreTarget(target, book => {
+							for (const row of updates) if (!patchLorebookRawEntry(book, row.fingerprint, { enabled: row.enabled }, row.entryKey)) throw new Error("世界书条目不存在");
+						});
+						let nextConfig = config;
+						for (const enabled of [false, true]) {
+							const rows = updates.filter(row => row.enabled === enabled);
+							if (rows.length) nextConfig = updateLoreOverride(host.cwd, nextConfig, target, rows, enabled);
+						}
+					});
+				}
+				const saved = { ok: true, source: target.source, path: target.path, changed: updates.length,
+					cardIdentity: tavernCardIdentity(host.cwd, config), revision: loreTargetRevision(target, loadConfig(host.cwd)) };
+				if (updates.length) await host.softRefreshConfig();
+				sendJson(res, 200, saved);
 				return true;
 			}
 			case "POST /api/lorebooks/import": {
@@ -2942,6 +3004,10 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 					throw new Error("只能删除 assets/lorebooks/ 下的世界书（项目外的素材文件不动）");
 				}
 				const abs = join(host.cwd, LOREBOOKS_DIR, base);
+				const current = loadConfig(host.cwd);
+				const binding = resolveWorldbooks(host.cwd, current, { sessionId: host.worldbookSessionId?.() });
+				if (binding.primary?.source === "file" && binding.primary.path === p) throw new Error("不能删除当前角色绑定的主世界书，请先明确修改绑定");
+				if (Object.values(current.lorebookBindings?.character ?? {}).some(paths => paths.includes(p)) || Object.values(current.lorebookBindings?.chat ?? {}).some(cards => Object.values(cards).some(paths => paths.includes(p)))) throw new Error("世界书仍有角色或聊天绑定，请先卸下相应作用域");
 				if (!existsSync(abs)) throw new Error("文件不存在");
 				unlinkSync(abs);
 				const config = loadConfig(host.cwd);
@@ -3014,7 +3080,9 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				if (refuseWhileStreaming()) return true;
 				const patch = JSON.parse(await readBody(req)) as CardFieldPatch;
 				const config = loadConfig(host.cwd);
+				const before = loadCardFile(resolvePath(host.cwd, config.card));
 				updateCardFields(resolvePath(host.cwd, config.card), patch);
+				carryCardWorldProfile(host.cwd, config.card, before, loadCardFile(resolvePath(host.cwd, config.card)));
 				await host.softRefreshConfig(); // 卡字段进 system prompt，必须重装
 				sendJson(res, 200, { ok: true });
 				return true;
@@ -3258,11 +3326,17 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				const config = normalizeAgentConfig(parsed);
 				materializeEnvKeysInConfig(config);
 				const name = (body.name ?? prev.name).trim();
-				const rec = saveProfile(host.cwd, id, name, config);
-				// 若正在启用这份，同步到 runtime 并重绑当前模型（contextWindow 等）
 				const active = listProfiles(host.cwd).find((p) => p.active);
-				if (active?.id === id) {
-					persistAgentConfig(host, config);
+				// 启用中的这份：请求体以完整运行配置为底（含其它配置的渠道）。
+				// 仓库只存本配置自有的渠道；其它渠道的改动回写到各自的归属配置。
+				const isActive = active?.id === id;
+				const owned = isActive ? ownedProfileProviders(host.cwd, id, config) : config.providers;
+				const rec = saveProfile(host.cwd, id, name, { ...config, providers: Object.keys(owned).length ? owned : config.providers });
+				// 若正在启用这份，同步到 runtime 并重绑当前模型（contextWindow 等）
+				if (isActive) {
+					const before = loadAgentConfig(host.cwd).config;
+					const after = persistAgentConfig(host, mergeEnabledAgentProfile(before, config));
+					syncLiveProvidersToProfiles(host.cwd, before, after);
 					await rebindCurrentModel(host);
 				}
 				host.notify("info", `配置「${rec.name}」已更新`);
@@ -3347,7 +3421,11 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				} else {
 					throw new Error("缺少 text 或 config");
 				}
+				const before = loadAgentConfig(host.cwd).config;
 				const config = persistAgentConfig(host, normalizeAgentConfig(parsed));
+				// 渠道定义改动（思考档、上下文、流式等）回写到该渠道的归属配置，
+				// 避免下次启用某份配置时被仓库旧副本还原。
+				syncLiveProvidersToProfiles(host.cwd, before, config);
 				await rebindCurrentModel(host);
 				host.notify("info", "当前 Agent 配置已保存");
 				sendJson(res, 200, {
@@ -3643,7 +3721,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				const card = loadCardFile(resolvePath(host.cwd, cardPath)); // 先验卡，坏卡不落盘
 				const config = loadConfig(host.cwd) as unknown as Record<string, unknown>;
 				// 卡专属字段随卡走：显示名/开场白选择清掉。
-				// 世界书与角色卡解耦：换卡不碰 lorebooks / disabledLore（条目启停跨卡保留）。
+				// 旧 lorebooks 保持全局；新角色/聊天绑定按卡路径解析，不携带到另一张卡。
 				delete config.displayName;
 				delete config.greetingIndex;
 				config.card = cardPath;
@@ -3690,8 +3768,9 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				const stJson = exportStLorebook(card.name, card.book);
 				writeFileSync(dest, `${JSON.stringify(stJson, null, "\t")}\n`, "utf8");
 				const rel = `${LOREBOOKS_DIR}/${file}`;
-				// 追加挂载，不顶掉其它已启用的书
-				const next = setMountedLorebooks(config, [...mountedLorebookPaths(config), rel]);
+				// 显式导入只绑定所选角色，不把它升级为跨卡全局书。
+				const forCard = { ...config, card: cardPath };
+				const next = { ...setScopedLorebooks(forCard, "character_aux", [...scopedLorebookPaths(forCard, "character_aux"), rel]), card: config.card };
 				writeJsonWithBackup(configPath(host.cwd), next);
 				await host.softRefreshConfig();
 				host.notify("info", `已导入配套世界书「${card.name}」（${card.book.length} 条）并加入挂载`);
@@ -3907,7 +3986,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 					const entries = applyLoreSourceState(target.entries, config, target.source, target.path);
 					sendJson(res, 200, { name: target.name, json: exportStLorebook(target.name, entries) });
 				} else {
-					const { entries, cardName } = loadMergedLoreWithSource(host.cwd, config);
+					const { entries, cardName } = loadMergedLoreWithSource(host.cwd, config, host.worldbookSessionId?.());
 					const name = `${cardName}-梨园世界书`;
 					sendJson(res, 200, { name, json: exportStLorebook(name, entries) });
 				}

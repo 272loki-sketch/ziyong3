@@ -14,7 +14,7 @@ const root = resolve(new URL("../..", import.meta.url).pathname);
 test("显眼酒馆插件入口：状态/原设置、桌面390px布局、context重绑且关闭不改会话", { timeout: 60_000 }, async t => {
 	const app = await readFile(join(root, "web/src/App.tsx"), "utf8");
 	const settings = await readFile(join(root, "web/src/components/SettingsPanel.tsx"), "utf8");
-	assert.match(app, /className="tavern-plugin-entry"[^>]*aria-label="插件中心：酒馆助手、提示词模板、MVU、众生侧写与 Veridis Rewrite"/);
+	assert.match(app, /className="tavern-plugin-entry"[^>]*aria-label="插件中心：酒馆助手、提示词模板、MVU、众生侧写、Veridis Rewrite 与 Fish Audio 角色配音"/);
 	assert.match(app, /<TavernPluginsManager onClose=/);
 	assert.match(app, /contextTick=\{agentTick\}/);
 	assert.doesNotMatch(settings, /TavernPluginsPanel/, "设置不再重复酒馆插件管理入口");
@@ -40,6 +40,7 @@ window.__sessionCreations=1;window.__toasts=[];window.__changes=[];window.addEve
 		await writeFile(join(cwd, "index.html"), `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/fixture.css"><style>.database-navigation{display:flex;position:relative}.panel-error{padding:12px;color:#922;background:#fee;border-radius:8px}.tavern-plugin-card{overflow-wrap:anywhere}</style></head><body><div id="root"></div><script type="module" src="/fixture.js"></script></body></html>`);
 		server = createServer(async (req, res) => {
 			const url = new URL(req.url, "http://localhost");
+			if (url.pathname === "/tavern-plugin-sw.js") { res.writeHead(200, { "content-type": "text/javascript" }); return res.end("self.addEventListener('install',()=>self.skipWaiting()); self.addEventListener('activate',event=>event.waitUntil(self.clients.claim()));"); }
 			const json = (code, value) => { res.writeHead(code, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }); res.end(JSON.stringify(value)); };
             if(["/api/npc-parallel/status","/api/veridis-rewrite/status"].includes(url.pathname))return json(200,{installed:false,enabled:false,autoUpdate:false,busy:false,ecologyEnabled:false,scopeKey:"fixture",sourceEntryId:"fixture",revision:0,settings:{}});
 			if (url.pathname.startsWith("/api/tavern-plugins/") && req.method !== "GET") apiWrites.push(`${req.method} ${url.pathname}`);
@@ -72,7 +73,7 @@ window.__sessionCreations=1;window.__toasts=[];window.__changes=[];window.addEve
 		const entry = page.getByRole("button", { name: "酒馆插件：酒馆助手与提示词模板" }); assert.equal(await entry.isVisible(), true); assert.equal(await page.getByRole("button", { name: "数据库", exact: true }).isVisible(), true);
 		await page.evaluate(() => { window.__sessionNode = document.querySelector("#session-marker"); }); await entry.click();
 		let dialog = page.getByRole("dialog", { name: "酒馆插件管理" }); await dialog.waitFor();
-		assert.equal(await dialog.locator('.plugin-overview-card').count(), 5);
+		assert.equal(await dialog.locator('.plugin-overview-card').count(), 6);
 		assert.equal(statusReads, 0, "overview is static metadata, not an execution or installation registry");
 		await dialog.getByRole('button', {name:'管理酒馆助手',exact:true}).click();
 		await page.getByRole("alert").filter({ hasText: "synthetic status failure" }).waitFor();
@@ -103,6 +104,7 @@ window.__sessionCreations=1;window.__toasts=[];window.__changes=[];window.addEve
 		page.once('dialog',d=>d.accept());await page.getByRole('button',{name:'放弃未确认的更改并离开'}).click();await dialog.waitFor({state:'detached'});
 		await entry.click();await dialog.waitFor();await dialog.getByRole('button',{name:'管理酒馆助手',exact:true}).click();await helper.waitFor();
 		await page.keyboard.press("Escape"); await dialog.locator('.plugin-overview-card').first().waitFor();
+		await page.waitForFunction(() => document.activeElement?.getAttribute('data-plugin-card') === 'helper');
 		await page.keyboard.press("Escape"); await dialog.waitFor({ state: "detached" });
 		assert.equal(await page.locator("#session-marker").evaluate(node => node === window.__sessionNode), true); assert.equal(await page.evaluate(() => window.__sessionCreations), 1); assert.equal(await page.evaluate(() => document.activeElement?.id), "open-plugins");
 
@@ -118,7 +120,7 @@ window.__sessionCreations=1;window.__toasts=[];window.__changes=[];window.addEve
 		await page.getByRole("button", { name: "关闭酒馆插件管理", exact: true }).click(); await dialog.waitFor({ state: "detached" });
 		await entry.click(); dialog = page.getByRole("dialog", { name: "酒馆插件管理" }); await dialog.waitFor();
 		await page.setViewportSize({width:320,height:740});
-		assert.equal(await dialog.locator('.plugin-overview-card').count(),5);
+		assert.equal(await dialog.locator('.plugin-overview-card').count(),6);
 		assert.equal(await page.locator('body').evaluate(el=>el.scrollWidth<=innerWidth),true);
 		let veridisFail=true, veridisWrites=0;
 		const veridisStatus={installed:true,enabled:true,autoUpdate:false,busy:false,scopeKey:'synthetic',sourceEntryId:'round',revision:0,version:'fixture',settings:{rules:[]}};
@@ -135,6 +137,12 @@ window.__sessionCreations=1;window.__toasts=[];window.__changes=[];window.addEve
 		assert.equal(await dialog.getByRole('button',{name:'启用净化',exact:true}).isDisabled(),true);
 		await dialog.getByRole('button',{name:'宿主规则设置',exact:true}).click();
 		await dialog.getByRole('textbox',{name:'Veridis Rewrite 宿主规则 JSON'}).fill('{');
+		page.once('dialog',d=>d.dismiss());
+		await page.keyboard.press('Escape');
+		assert.equal(await dialog.getByRole('textbox',{name:'Veridis Rewrite 宿主规则 JSON'}).inputValue(),'{','cancelled navigation preserves rule draft');
+		page.once('dialog',d=>d.dismiss());
+		await dialog.getByRole('button',{name:'宿主规则设置',exact:true}).click();
+		assert.equal(await dialog.getByRole('textbox',{name:'Veridis Rewrite 宿主规则 JSON'}).inputValue(),'{','collapsing cannot silently discard dirty JSON');
 		await dialog.getByRole('button',{name:'保存规则设置',exact:true}).click();
 		await dialog.getByText('规则 JSON 必须是有效对象，请修正后重试。').waitFor();
 		await dialog.getByRole('textbox',{name:'Veridis Rewrite 宿主规则 JSON'}).fill('{"rules":[]}');
@@ -166,6 +174,43 @@ window.__sessionCreations=1;window.__toasts=[];window.__changes=[];window.addEve
 		await dialog.getByText('已校验 CURRENT',{exact:true}).waitFor();releaseOld();
 		await page.waitForTimeout(150);
 		assert.equal(await dialog.getByText('已校验 STALE',{exact:true}).count(),0,'late status cannot overwrite a new context');
+		await dialog.getByRole('button',{name:'宿主规则设置',exact:true}).click();
+		await dialog.getByRole('textbox',{name:'Veridis Rewrite 宿主规则 JSON'}).fill('{"rules":["synthetic draft"]}');
+		await page.evaluate(()=>window.__advanceContext());
+		await dialog.getByRole('alert').filter({hasText:'故事来源已变化'}).waitFor();
+		assert.equal(await dialog.getByRole('textbox',{name:'Veridis Rewrite 宿主规则 JSON'}).inputValue(),'{"rules":["synthetic draft"]}');
+		assert.equal(await dialog.getByRole('button',{name:'保存规则设置',exact:true}).isDisabled(),true);
+		page.once('dialog',d=>d.dismiss());
+		await dialog.getByRole('button',{name:'重新读取',exact:true}).click();
+		assert.equal(await dialog.getByRole('textbox',{name:'Veridis Rewrite 宿主规则 JSON'}).inputValue(),'{"rules":["synthetic draft"]}');
+		page.once('dialog',d=>d.accept());
+		await dialog.getByRole('button',{name:'重新读取',exact:true}).click();
+		await dialog.getByRole('button',{name:'宿主规则设置',exact:true}).waitFor({state:'visible'});
+		await page.waitForFunction(()=>!document.querySelector('.veridis-panel [role="alert"]') && !document.querySelector('.plugin-rule-editor'));
+		await page.keyboard.press('Escape');
+		await dialog.getByRole('button',{name:'读取全部状态',exact:true}).waitFor();
+		await page.route('**/api/fish-tts/status',route=>route.fulfill({json:{config:{enabled:false},keyConfigured:false}}));
+		await dialog.getByRole('button',{name:'读取全部状态',exact:true}).click();
+		await dialog.getByRole('button',{name:'刷新全部状态',exact:true}).waitFor();
+		assert.match(await dialog.getByRole('button',{name:'管理酒馆助手',exact:true}).innerText(),/已启用/);
+		assert.match(await dialog.getByRole('button',{name:'管理MVU 变量框架',exact:true}).innerText(),/未安装/);
+		assert.match(await dialog.getByRole('button',{name:'管理Veridis Rewrite',exact:true}).innerText(),/依赖未就绪/);
+		assert.match(await dialog.getByRole('button',{name:'管理Fish Audio 角色配音',exact:true}).innerText(),/已关闭/);
+		await page.route('**/api/fish-tts/status',route=>route.fulfill({status:503,json:{error:'synthetic Fish status failure'}}));
+		await dialog.getByRole('button',{name:'刷新全部状态',exact:true}).click();
+		await dialog.getByRole('button',{name:'刷新全部状态',exact:true}).waitFor();
+		assert.match(await dialog.getByRole('button',{name:'管理Fish Audio 角色配音',exact:true}).innerText(),/读取失败/);
+		assert.match(await dialog.getByRole('button',{name:'管理酒馆助手',exact:true}).innerText(),/已启用/,'one status failure does not hide healthy integrations');
+		await page.route('**/api/npc-parallel/status',route=>route.fulfill({json:{enabled:false,executionEnabled:false,ecologyEnabled:true,busy:false,scopeKey:'fixture',sourceEntryId:'fixture',revision:0,model:{provider:'synthetic',id:'fixture'},settings:{enabled:true,maxPerRound:3,cooldownRounds:3,minWords:200,maxWords:600,person:'third',style:'',ignored:[],weights:{}}}}));
+		await page.route('**/api/npc-parallel/roster',route=>route.fulfill({json:{names:[]}}));
+		await dialog.getByRole('button',{name:'管理众生侧写',exact:true}).click();
+		await dialog.getByLabel('写作要求').fill('synthetic unsaved draft');
+		page.once('dialog',d=>d.dismiss());
+		await dialog.getByRole('button',{name:'关闭酒馆插件管理',exact:true}).click();
+		assert.equal(await dialog.getByLabel('写作要求').inputValue(),'synthetic unsaved draft');
+		page.once('dialog',d=>d.accept());
+		await page.keyboard.press('Escape');
+		await dialog.getByRole('button',{name:'读取全部状态',exact:true}).waitFor();
 		await page.locator(".tavern-app-manager-backdrop").click({ position: { x: 2, y: 2 } }); await dialog.waitFor({ state: "detached" });
 		assert.ok(statusReads >= 8); assert.equal(apiWrites.length, 5); assert.equal((await page.evaluate(() => window.__changes)).length, apiWrites.length);
 		assert.equal(await page.locator("#session-marker").evaluate(node => node === window.__sessionNode), true); assert.equal(await page.evaluate(() => window.__sessionCreations), 1); assert.deepEqual(forbidden, []);

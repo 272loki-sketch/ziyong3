@@ -194,13 +194,25 @@ test("无 audit 六次实调可以恰好用完预算；有 audit 时第七次不
 	}
 });
 
-test("真实 attempts 包含 #call provider 重试，额度耗尽不盲自动重入", { timeout: 5000 }, async () => {
+test("真实 attempts 包含 #call provider 重试，额度耗尽不盲自动重入", { timeout: 5000 }, async t => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const f = fixture(); let throws = true;
 	f.deps.runSideModel = async (_s, _p, u) => { const task = JSON.parse(u).task as string; f.calls.push(task); if (throws) { throws = false; throw new Error("faux transient"); } return response(task); };
 	try {
-		const engine = new CorpusEngine(f.deps, 7), { doc } = await engine.create("sample.txt"); await engine.waitIdle();
+		const engine = new CorpusEngine(f.deps, 7), { doc } = await engine.create("sample.txt");
+		const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+		await flush();
+		assert.deepEqual(f.calls, ["digest-map"]); assert.equal(doc.modelUsage?.attempts, 1);
+		t.mock.timers.tick(4999); await flush();
+		assert.deepEqual(f.calls, ["digest-map"]); assert.equal(doc.modelUsage?.attempts, 1);
+		t.mock.timers.tick(1); await engine.waitIdle();
 		assert.equal(f.calls.length, 7); assert.equal(f.calls.filter(t => t === "digest-map").length, 2);
 		assert.equal(engine.getDoc(doc.id)?.status, "failed"); assert.equal(f.readyCalls(), 0);
+		assert.deepEqual(doc.modelUsage, { version: 1, attempts: 7, limit: 7, exhausted: true });
+		assert.deepEqual(loadCorpusDocuments(f.cwd)[0]?.modelUsage, doc.modelUsage);
+		t.mock.timers.tick(5000); await flush(); await engine.waitIdle();
+		assert.equal(f.calls.length, 7); assert.equal(doc.modelUsage?.attempts, 7);
+		assert.throws(() => engine.retry(doc.id), /预算已耗尽/);
 		const raised = new CorpusEngine(f.deps, 8); raised.resume(doc.id); await raised.waitIdle();
 		assert.equal(raised.getDoc(doc.id)?.status, "ready"); assert.equal(raised.getDoc(doc.id)?.modelUsage?.attempts, 8);
 		assert.equal(f.calls.length, 8); assert.equal(f.calls.at(-1), "digest-audit");

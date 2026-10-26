@@ -1,0 +1,15 @@
+.fish-tts-panel,.fish-tts-player{min-width:0;max-width:840px;color:var(--text,#3d3833);font-size:13px;line-height:1.65;overflow-wrap:anywhere}
+.fish-tts-panel{margin:auto}.fish-tts-intro{margin:0 0 16px;color:var(--text-soft,#6a635c)}
+.fish-tts-panel fieldset{min-width:0;margin:18px 0;padding:16px;border:1px solid var(--hairline-strong,#d9d2c8);border-radius:12px}
+.fish-tts-panel legend{padding:0 8px;font-weight:650}.fish-tts-panel label,.fish-tts-player>label{display:flex;flex-direction:column;gap:5px;margin:10px 0}
+.fish-tts-panel input:not([type=checkbox]),.fish-tts-panel select,.fish-tts-player textarea{width:100%;min-width:0;box-sizing:border-box;min-height:38px;padding:8px 10px;border:1px solid var(--hairline-strong,#d9d2c8);border-radius:7px;background:var(--surface,#fffcfa);color:inherit;font:inherit}
+.fish-tts-player textarea{resize:vertical}.fish-tts-panel .fish-tts-check{flex-direction:row;align-items:center;gap:8px}.fish-tts-check input{flex:0 0 auto}
+.fish-tts-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.fish-tts-actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin:12px 0}
+.fish-tts-panel button,.fish-tts-player button{max-width:100%;min-height:36px;padding:7px 12px;border:1px solid var(--hairline-strong,#d9d2c8);border-radius:7px;background:var(--surface,#fffcfa);color:inherit;font:inherit;cursor:pointer}
+.fish-tts-panel button.is-primary,.fish-tts-player button.is-primary{background:var(--accent,#bc4123);color:#fff;border-color:var(--accent,#bc4123)}
+.fish-tts-panel button:disabled,.fish-tts-player button:disabled{opacity:.48;cursor:not-allowed}.fish-tts-panel :focus-visible,.fish-tts-player :focus-visible{outline:2px solid var(--accent,#bc4123);outline-offset:2px}
+.fish-tts-hint,.fish-tts-player small{color:var(--text-soft,#6a635c);font-size:12px}.fish-tts-error,.fish-tts-success{padding:10px;border-radius:8px;background:var(--surface-dim,#f3efe9)}.fish-tts-error{color:var(--danger,#ae3333)}.fish-tts-success{color:var(--accent,#bc4123)}
+.fish-tts-voice{margin:12px 0;padding:12px;border:1px solid var(--hairline,#ebe6df);border-radius:10px}.fish-tts-voice:first-child{margin-top:0}
+.fish-tts-player{padding:14px;margin:12px 0;border:1px solid var(--hairline-strong,#d9d2c8);border-radius:10px;background:var(--surface,#fffcfa)}
+.fish-tts-player audio{display:block;width:100%;margin:12px 0}.fish-tts-player audio[hidden]{display:none}.fish-tts-segments{padding-left:24px;max-height:280px;overflow:auto}.fish-tts-segments li{padding:6px 0}.fish-tts-segments strong{display:block;color:var(--accent,#bc4123)}.fish-tts-segments span{white-space:pre-wrap}.fish-tts-help{margin-top:20px}.fish-tts-help summary{cursor:pointer}.fish-tts-message{margin-top:8px}
+@media(max-width:600px){.fish-tts-grid{grid-template-columns:1fr;gap:0}.fish-tts-panel fieldset{padding:10px}.fish-tts-player{padding:10px}.fish-tts-actions button{flex:1 1 110px}}

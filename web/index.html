@@ -3,8 +3,7 @@
 	<head>
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
-		<meta name="theme-color" content="#f7f4f0" media="(prefers-color-scheme: light)" />
-		<meta name="theme-color" content="#1a1614" media="(prefers-color-scheme: dark)" />
+		<meta name="theme-color" content="#f7f4f0" />
 		<meta name="mobile-web-app-capable" content="yes" />
 		<meta name="apple-mobile-web-app-capable" content="yes" />
 		<meta name="apple-mobile-web-app-status-bar-style" content="default" />
@@ -21,7 +20,9 @@
 			/* 尽早应用主题，避免白昼闪一下 */
 			try {
 				var t = localStorage.getItem("liyuan.theme");
-				if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+				if (t !== "dark" && t !== "eye-care") t = "light";
+				document.documentElement.setAttribute("data-theme", t);
+				document.querySelector('meta[name="theme-color"]').setAttribute("content", t === "dark" ? "#141110" : t === "eye-care" ? "#e8eee2" : "#f7f4f0");
 			} catch (e) {}
 			/* rebuild 后 SW 若仍用旧 HTML 指已删 JS，会白屏：探测 root 为空则卸 SW 强刷一次 */
 			window.addEventListener("load", function () {

@@ -95,7 +95,7 @@ test("installEventBus: eventOn/eventEmit 可互通", () => {
 	assert.equal(got, "ok");
 });
 
-test("installParentTavernShim: generate 返回字符串 Promise", async () => {
+test("installParentTavernShim: legacy bridge never fabricates a model result or a successful cancellation", async () => {
 	// jsdom-less: 模拟 window
 	const g = globalThis as typeof globalThis & {
 		window?: object;
@@ -128,10 +128,12 @@ test("installParentTavernShim: generate 返回字符串 Promise", async () => {
 	assert.equal(typeof fakeWin.getChatMessages, "function");
 	assert.equal(typeof fakeWin.setChatMessage, "function");
 	assert.equal(typeof (fakeWin.toastr as { info?: unknown }).info, "function");
-	const text = await th.generate({ user_input: "你好修仙" });
-	assert.equal(typeof text, "string");
-	assert.ok(text.includes("梨园") || text.includes("你好修仙"));
-	th.stopAllGeneration();
+    let sent = 0;
+    registerTavernChatBridge({setInput:()=>{},sendPrompt:()=>{sent++;}});
+    await assert.rejects(th.generate({ user_input: "SYNTHETIC native candidate request" }), /不会伪造模型结果/);
+    assert.throws(()=>th.stopAllGeneration(), /未执行取消/);
+    assert.equal(sent,0,"candidate request must not become a user/story input");
+    registerTavernChatBridge(null);
 	if (prev === undefined) delete (globalThis as { window?: unknown }).window;
 	else (globalThis as { window: unknown }).window = prev;
 });

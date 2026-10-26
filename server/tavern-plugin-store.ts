@@ -56,25 +56,45 @@ export class TavernPluginStore {
   for(const [id,hash] of Object.entries(refs.messages as Record<string,string>))if(visible.has(id))state.messages[id]=this.object(objects,hash) as TavernPluginState["messages"][string];
   for(const [name,hash] of Object.entries(refs.worldbooks as Record<string,string>))state.worldbooks[name]=this.object(objects,hash) as TavernPluginState["worldbooks"][string];return {revision:snapshots.at(-1)?.revision??0,state};
  }
- /** Persisted per-session/card/source allowance; independent of branch state revisions. */
- claimModelRequest(binding:TavernPluginBinding,limit:number,guard:()=>void):{calls:number}{
-  if(!Number.isSafeInteger(limit)||limit<1)throw new Error("插件调用预算无效");
+ /** Read-only cumulative accounting. Requests are not a lifetime quota. */
+ modelRequestUsage(binding:TavernPluginBinding):{used:number;unlimited:true}{
+  const {root}=this.scope(binding),path=join(root,"model-request-budget.json");
+  if(!existsSync(path))return{used:0,unlimited:true};
+  const data=JSON.parse(this.file(path,MAX_INDEX).toString("utf8"));
+  this.validateRequestClaims(data);
+  return{used:data.claims[digest(Buffer.from(binding.sourceEntryId))]??0,unlimited:true};
+ }
+ /** Compatibility projection for older hosts; null means no request-count ceiling. */
+ modelRequestBudget(binding:TavernPluginBinding,_legacyLimit?:number):{limit:null;used:number;remaining:null;unlimited:true}{
+  return{...this.modelRequestUsage(binding),limit:null,remaining:null};
+ }
+ private validateRequestClaims(data:any):void{
+  if(data?.version!==1||!data.claims||Array.isArray(data.claims)||typeof data.claims!=="object")throw new Error("插件请求计数账本无效，未调用模型");
+  for(const [key,value]of Object.entries(data.claims))if(!HASH.test(key)||!Number.isSafeInteger(value)||(value as number)<1)throw new Error("插件请求计数账本无效，未调用模型");
+ }
+ /** Increment exactly once before dispatch, retaining all previous counts and guards. */
+ recordModelRequest(binding:TavernPluginBinding,guard:()=>void,recoveryAttemptId?:string):{calls:number}{
+  if(recoveryAttemptId!==undefined&&!/^[a-f0-9-]{36}$/.test(recoveryAttemptId))throw new Error("恢复调用身份无效");
   const {root}=this.scope(binding),path=join(root,"model-request-budget.json"),lock=acquireTavernPluginLock(root);
   try{
-   guard();lock.assertOwned();
-   let claims:Record<string,number>=Object.create(null);
-   if(existsSync(path)){const data=JSON.parse(this.file(path,MAX_INDEX).toString("utf8"));
-    if(data.version!==1||!data.claims||Array.isArray(data.claims)||typeof data.claims!=="object")throw new Error("插件调用预算账本无效，未调用模型");
-    for(const [key,value] of Object.entries(data.claims)){if(!HASH.test(key)||!Number.isSafeInteger(value)||(value as number)<1||(value as number)>limit)throw new Error("插件调用预算账本无效，未调用模型");claims[key]=value as number;}
+   guard();lock.assertOwned();const claims:Record<string,number>=Object.create(null);
+   if(existsSync(path)){
+    const data=JSON.parse(this.file(path,MAX_INDEX).toString("utf8"));this.validateRequestClaims(data);
+    for(const[key,value]of Object.entries(data.claims))claims[key]=value as number;
    }
-   const key=digest(Buffer.from(binding.sourceEntryId)),calls=claims[key]??0;
-   if(calls>=limit)throw new Error(`原脚本本来源的合成/辅助模型请求已达${limit}次预算，未继续收费调用`);
+   const key=digest(Buffer.from(recoveryAttemptId?JSON.stringify([binding.sourceEntryId,'manual-recovery',recoveryAttemptId]):binding.sourceEntryId)),calls=claims[key]??0;
+   if(!Number.isSafeInteger(calls+1))throw new Error("插件请求计数超出安全整数范围，未调用模型");
    claims[key]=calls+1;const next={version:1,claims};
-   if(Buffer.byteLength(JSON.stringify(next))>MAX_INDEX)throw Object.assign(new Error("插件调用预算账本达到存储限制，未丢弃历史额度"),{code:"EDQUOT"});
+   if(Buffer.byteLength(JSON.stringify(next))>MAX_INDEX)throw Object.assign(new Error("插件请求计数账本达到存储限制，未丢弃历史记录"),{code:"EDQUOT"});
    if(existsSync(path+".bak"))this.file(path+".bak",MAX_INDEX);
-   guard();lock.assertOwned();writeJsonAtomicWithBackup(path,next,{spacing:0});return {calls:calls+1};
+   guard();lock.assertOwned();writeJsonAtomicWithBackup(path,next,{spacing:0});return{calls:calls+1};
   }finally{lock.release();}
  }
+ /** Legacy calling shape retained without enforcing the retired numeric quota. */
+ claimModelRequest(binding:TavernPluginBinding,_legacyLimit:number,guard:()=>void,recoveryAttemptId?:string):{calls:number}{
+  return this.recordModelRequest(binding,guard,recoveryAttemptId);
+ }
+
  save(binding:TavernPluginBinding,expected:number,state:TavernPluginState,guard:()=>void):{revision:number}{validateTavernPluginState(state,new Set([...binding.visibleEntryIds,binding.sourceEntryId]));const {root,objects,index}=this.scope(binding),lock=acquireTavernPluginLock(root);
   try{const snapshots=this.snapshots(index),revision=snapshots.at(-1)?.revision??0;guard();lock.assertOwned();if(!Number.isSafeInteger(expected)||expected!==revision)throw Object.assign(new Error("插件状态已更新，请刷新后重试"),{statusCode:409});
    let used=readdirSync(objects).reduce((n,name)=>n+lstatSync(join(objects,name)).size,0);const put=(value:unknown)=>{const bytes=Buffer.from(JSON.stringify(value)+"\n"),hash=digest(bytes),path=join(objects,hash+".json");if(existsSync(path)){this.object(objects,hash);return hash;}if((used+=bytes.length)>MAX_SCOPE)throw Object.assign(new Error("插件派生状态达到512MiB作用域预算，请维护后重试"),{code:"EDQUOT"});writeJsonAtomicWithBackup(path,value,{spacing:0});return hash;};

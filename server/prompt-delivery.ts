@@ -1,4 +1,6 @@
+import type { PlotChoiceInput, PlotSelection } from "../src/plot-options/types.ts";
 import { createHash } from "node:crypto";
+export const plotSubmissionKey = (text: string, choice?: PlotChoiceInput): string => JSON.stringify([text, choice ? [choice.contextKey, choice.optionId] : null]);
 export type DeliveryChannel = "story" | "assistant" | "command";
 export type SubmissionIdentity = { sessionId: string; messageId: string };
 export function readSubmissionIdentity(frame: { sessionId?: unknown; messageId?: unknown }): SubmissionIdentity | "legacy" | "invalid" {
@@ -34,17 +36,18 @@ export class PromptDeliveryLedger {
 	reject(channel: DeliveryChannel, identity: SubmissionIdentity): void { this.#records.delete(this.key(channel, identity)); }
 }
 /** 完整树含旁支；同文但不同 id 不去重。 */
-export function findPersistedSubmission(entries: unknown[], messageId: string): { entryId: string; text: string } | undefined {
+export function findPersistedSubmission(entries: unknown[], messageId: string): { entryId: string; text: string; plotChoice?: PlotChoiceInput } | undefined {
 	for (const entry of entries) {
 		if (!entry || typeof entry !== "object") continue;
 		const e = entry as { id?: unknown; type?: unknown; message?: { role?: unknown; details?: unknown; content?: unknown } };
 		if (e.type !== "message" || e.message?.role !== "user" || typeof e.id !== "string") continue;
-		const details = e.message.details as { rpClientMessageId?: unknown } | undefined;
+		const details = e.message.details as { rpClientMessageId?: unknown; rpPlotSelection?: PlotSelection } | undefined;
 		if (details?.rpClientMessageId !== messageId) continue;
 		const content = e.message.content;
 		const text = typeof content === "string" ? content : Array.isArray(content)
 			? content.map((part) => part?.type === "text" && typeof part.text === "string" ? part.text : "").join("") : "";
-		return { entryId: e.id, text };
+		const selection = details.rpPlotSelection;
+		return { entryId: e.id, text, ...(selection ? { plotChoice: { contextKey: selection.contextKey, optionId: selection.option.id } } : {}) };
 	}
 	return undefined;
 }

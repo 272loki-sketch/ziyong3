@@ -1,3 +1,5 @@
+import { scopedUrl } from "./workspace.ts";
+import { sharedStatusRequest } from "./plugins/status-request.ts";
 import type { GenerationMode } from "./generation-mode.ts";
 
 /**
@@ -42,15 +44,15 @@ function invalidateAfterWrite(writePath: string): void {
 		// 卡内嵌世界书另存并挂载：同时改 lorebooks 文件列表 + config 挂载
 		{
 			test: /^\/api\/card\/import-embedded-lore$/,
-			prefixes: ["/api/lorebook", "/api/lorebooks", "/api/config", "/api/card", "/api/cards", "/api/cardfront"],
+			prefixes: ["/api/lorebook", "/api/lorebooks", "/api/config", "/api/card", "/api/cards", "/api/cardfront", "/api/world-profile"],
 		},
 		// 换卡 / 卡详情写：必须连带清 cardfront，否则 180s 内仍吃上一张卡的皮肤缓存
 		{ test: /^\/api\/cardfront/, prefixes: ["/api/cardfront"] },
-		{ test: /^\/api\/cards?/, prefixes: ["/api/card", "/api/cards", "/api/cardfront", "/api/lorebook", "/api/lorebooks"] },
+		{ test: /^\/api\/cards?/, prefixes: ["/api/card", "/api/cards", "/api/cardfront", "/api/lorebook", "/api/lorebooks", "/api/world-profile"] },
 		{ test: /^\/api\/persona/, prefixes: ["/api/personas", "/api/config"] },
-		{ test: /^\/api\/lorebook/, prefixes: ["/api/lorebook", "/api/lorebooks", "/api/config", "/api/card", "/api/cards", "/api/cardfront"] },
+		{ test: /^\/api\/lorebook/, prefixes: ["/api/lorebook", "/api/lorebooks", "/api/config", "/api/card", "/api/cards", "/api/cardfront", "/api/world-profile"] },
 		{ test: /^\/api\/codex/, prefixes: ["/api/codex"] },
-		{ test: /^\/api\/preset/, prefixes: ["/api/preset", "/api/presets"] },
+		{ test: /^\/api\/preset/, prefixes: ["/api/preset", "/api/presets", "/api/world-profile"] },
 		{ test: /^\/api\/mcp/, prefixes: ["/api/mcp"] },
 		{ test: /^\/api\/skills/, prefixes: ["/api/skills"] },
 		{ test: /^\/api\/memory/, prefixes: ["/api/memory"] },
@@ -58,7 +60,7 @@ function invalidateAfterWrite(writePath: string): void {
 		{ test: /^\/api\/models/, prefixes: ["/api/models", "/api/models/catalog", "/api/agent-config"] },
 		{ test: /^\/api\/channels/, prefixes: ["/api/models", "/api/models/catalog", "/api/agent-config", "/api/agent-profiles"] },
 		{ test: /^\/api\/tavern-plugins/, prefixes: ["/api/tavern-plugins"] },
-		{ test: /^\/api\/config/, prefixes: ["/api/config", "/api/lorebook", "/api/lorebooks", "/api/cardfront"] },
+		{ test: /^\/api\/config/, prefixes: ["/api/config", "/api/lorebook", "/api/lorebooks", "/api/cardfront", "/api/world-profile"] },
 		{ test: /^\/api\/world-profile/, prefixes: ["/api/world-profile"] },
 		{ test: /^\/api\/world-state/, prefixes: ["/api/world-state"] },
 		{ test: /^\/api\/outline/, prefixes: ["/api/outline"] },
@@ -223,7 +225,7 @@ export interface ModelsResponse {
 }
 
 export interface ModelRef { provider: string; id: string }
-export type SideModelStep = "veridisRewrite" | "npcParallel" | "writer" | "literaryContinuity" | "literaryDirector" | "literaryCharacter" | "literaryPersona" | "literaryWorld" | "worldProfile" | "literaryWorldFacts" | "literaryWorldAudit" | "ecologySearch" | "ecologyGlobal" | "ecologyCard" | "ecologyRuntime" | "directorSetting" | "directorIdeas" | "directorReviewFacts" | "directorReviewStyle" | "outlineBootstrap" | "outlineChat" | "outlineReconcile" | "outlineResearch" | "outlineCorpusResearch" | "novelDigest" | "outlineAudit" | "contractDeclare" | "scribe" | "compaction" | "presetSort";
+export type SideModelStep = "dailyPlot" | "veridisRewrite" | "npcParallel" | "writer" | "literaryContinuity" | "literaryDirector" | "literaryCharacter" | "literaryPersona" | "literaryWorld" | "worldProfile" | "literaryWorldFacts" | "literaryWorldAudit" | "ecologySearch" | "ecologyGlobal" | "ecologyCard" | "ecologyRuntime" | "directorSetting" | "directorIdeas" | "directorReviewFacts" | "directorReviewStyle" | "outlineBootstrap" | "outlineChat" | "outlineReconcile" | "outlineResearch" | "outlineCorpusResearch" | "novelDigest" | "outlineAudit" | "contractDeclare" | "scribe" | "compaction" | "presetSort";
 export type StepModelOverrides = Partial<Record<SideModelStep, ModelRef>>;
 
 export interface AuthProviderInfo {
@@ -539,7 +541,7 @@ export interface PersonaInfo {
 
 /** 头像 URL（带 cache-bust，保存后立刻刷新） */
 export const personaAvatarUrl = (id: string, bust?: string | number) =>
-	`/api/personas/avatar?id=${encodeURIComponent(id)}${bust != null ? `&t=${bust}` : ""}`;
+	scopedUrl(`/api/personas/avatar?id=${encodeURIComponent(id)}${bust != null ? `&t=${bust}` : ""}`);
 
 export interface PersonasResponse {
 	personas: PersonaInfo[];
@@ -570,7 +572,12 @@ export interface LorebooksResponse {
 	/** @deprecated 旧单本字段 */
 	activeOne?: string | null;
 	books: LorebookFileInfo[];
-	embeddedCard: { path: string; name: string; cardIdentity: string; entryCount: number; enabledCount: number };
+	embeddedCard: { path: string; name: string; cardIdentity: string; entryCount: number; enabledCount: number; active?: boolean };
+	primary?: { name: string; source: "card" | "file" | "agent"; path: string; entryCount: number } | null;
+	primaryResolution?: "bound" | "embedded" | "none";
+	declaredPrimary?: string | null;
+	sessionId?: string;
+	scopes?: { global: string[]; character_aux: string[]; chat: string[] };
 }
 
 /** 规范化挂载列表（兼容旧 API 返回 string / null） */
@@ -623,8 +630,17 @@ export interface TavernPluginInfo {
 export interface TavernPluginsStatus { plugins: TavernPluginInfo[]; checking: boolean }
 export type TavernPluginAction = "install" | "check" | "update" | "rollback";
 // Deliberately bypass the panel GET cache: source activation and auto-update happen outside this browser.
-export const getTavernPluginsStatus = () => api<TavernPluginsStatus>("/api/tavern-plugins/status");
+const tavernStatusRequest = sharedStatusRequest(() => api<TavernPluginsStatus>("/api/tavern-plugins/status"));
+export const getTavernPluginsStatus = (options?: { fresh?: boolean }) => {
+	if (options?.fresh) tavernStatusRequest.invalidate();
+	return tavernStatusRequest.get();
+};
+async function tavernMutation(action: () => Promise<unknown>): Promise<unknown> {
+	tavernStatusRequest.invalidate();
+	try { return await action(); }
+	finally { tavernStatusRequest.invalidate(); }
+}
 export const configureTavernPlugin = (id: TavernPluginId, patch: { enabled?: boolean; autoUpdate?: boolean }) =>
-	apiPut<unknown>("/api/tavern-plugins/config", { id, ...patch });
+	tavernMutation(() => apiPut<unknown>("/api/tavern-plugins/config", { id, ...patch }));
 export const runTavernPluginAction = (action: TavernPluginAction, id: TavernPluginId) =>
-	apiPost<unknown>(`/api/tavern-plugins/${action}`, { id });
+	tavernMutation(() => apiPost<unknown>(`/api/tavern-plugins/${action}`, { id }));

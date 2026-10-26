@@ -24,7 +24,8 @@ function syntheticContext({ sessionId='synthetic-session', scopeKey='scope-a', s
 }
 
 test('bridge saves can be explicitly retried and rebinding preserves imported mutable references without crossing scopes', async () => {
- const previous={window:globalThis.window,document:globalThis.document,CustomEvent:globalThis.CustomEvent,SillyTavern:globalThis.SillyTavern,LiyuanTavern:globalThis.LiyuanTavern};
+ const previous={location:globalThis.location,window:globalThis.window,document:globalThis.document,CustomEvent:globalThis.CustomEvent,SillyTavern:globalThis.SillyTavern,LiyuanTavern:globalThis.LiyuanTavern};
+ globalThis.location={search:""};
  globalThis.window={dispatchEvent(){}};
  globalThis.CustomEvent=class CustomEvent { constructor(type,init={}){this.type=type;this.detail=init.detail;} };
  globalThis.document={querySelector(){return null;}};
@@ -35,7 +36,7 @@ test('bridge saves can be explicitly retried and rebinding preserves imported mu
   assert.equal(Object.prototype.toString.call(yamlNamespace),'[object Module]');
   assert.equal(Object.isExtensible(yamlNamespace),false);
   globalThis.window.YAML=yamlNamespace;
-  const {host}=await import(`${pathToFileURL(join(root,'web/public/tavern-compat/bridge.js')).href}?recovery-${Date.now()}`);
+  const {host}=await import(`${pathToFileURL(join(root,'web/public/tavern-compat/bridge-worldbooks.js')).href}?recovery-${Date.now()}`);
   await host.bind(syntheticContext());
   const oldLibModule=host.modules['/lib.js'];
   assert.strictEqual(host.resolve('/lib.js','yaml'),yamlNamespace);
@@ -125,7 +126,7 @@ test('bridge saves can be explicitly retried and rebinding preserves imported mu
   assert.deepEqual(frozenListBefore,[1]);
   assert.deepEqual(yamlNamespace.parse('synthetic: still-unchanged'),{synthetic:'still-unchanged'});
  } finally {
-  for(const key of ['window','document','CustomEvent','SillyTavern','LiyuanTavern']){
+  for(const key of ['location','window','document','CustomEvent','SillyTavern','LiyuanTavern']){
    if(previous[key]===undefined)delete globalThis[key];else globalThis[key]=previous[key];
   }
  }
@@ -135,8 +136,8 @@ test('message frame retries transient status errors and clears failed state on e
  const cwd=await mkdtemp(join(tmpdir(),'liyuan-tavern-frame-recovery-'));
  let server,browser,page,statusRequests=0,unexpectedWrites=0,helperEnabled=true;
  const browserErrors=[],requestedPaths=[];
- const bridgeSource=await readFile(join(root,'web/public/tavern-compat/bridge.js'),'utf8');
- const hostSource=await readFile(join(root,'web/public/tavern-compat/host.js'),'utf8');
+ const bridgeSource=await readFile(join(root,'web/public/tavern-compat/bridge-worldbooks.js'),'utf8');
+ const hostSource=await readFile(join(root,'web/public/tavern-compat/host-worldbooks.js'),'utf8');
  const templateContext=syntheticContext({scopeKey:'scope-two',sourceEntryId:'entry-two'});
  // A read-only display fixture starts with a fully saved host state. Otherwise
  // host normalization itself legitimately queues a derived-state save at flush.
@@ -164,7 +165,7 @@ test('message frame retries transient status errors and clears failed state on e
     res.end(`<!doctype html><html><body><div id="status"></div><div id="extensions_settings"></div><div id="extensions_settings2"></div><div id="chat"></div><div id="send_form"></div><script>window.EjsTemplate={prepareContext:async()=>({syntheticValue:'SAFE_EJS_VALUE'}),evalTemplate:async text=>String(text).replace('<%= syntheticValue %>','SAFE_EJS_VALUE')};</script><script type="module" src="/tavern-compat/host.js"></script></body></html>`);return;
    }
    if(url.pathname==='/tavern-compat/host.js'){res.writeHead(200,{'content-type':'text/javascript'});res.end(hostSource);return;}
-   if (['/tavern-compat/i18n.js', '/tavern-compat/settings-ui.js', '/tavern-compat/mvu-adapter.js'].includes(url.pathname)) { res.writeHead(200, {'content-type':'text/javascript'}); res.end(await readFile(join(root, 'web/public', url.pathname), 'utf8')); return; }
+   if (['/tavern-compat/i18n.js', '/tavern-compat/settings-ui.js', '/tavern-compat/mvu-adapter.js', '/tavern-compat/native-resources.js'].includes(url.pathname)) { res.writeHead(200, {'content-type':'text/javascript'}); res.end(await readFile(join(root, 'web/public', url.pathname), 'utf8')); return; }
    if(url.pathname==='/tavern-compat/bridge.js'){res.writeHead(200,{'content-type':'text/javascript'});res.end(bridgeSource);return;}
    if(url.pathname==='/tavern-compat/vendor/yaml/index.js'){res.writeHead(200,{'content-type':'text/javascript'});res.end('export default {};');return;}
    if(url.pathname==='/api/tavern-plugins/context'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(templateContext));return;}
@@ -179,13 +180,14 @@ test('message frame retries transient status errors and clears failed state on e
   const pagePromise=browser.newPage({serviceWorkers:'block'});let pageTimer;
   page=await Promise.race([pagePromise,new Promise((_,reject)=>{pageTimer=setTimeout(()=>reject(new Error('browser.newPage exceeded 8s watchdog')),8_000);pageTimer.unref();})]).finally(()=>clearTimeout(pageTimer));page.setDefaultTimeout(8000);page.setDefaultNavigationTimeout(8000);stage('browser-ready');page.on('pageerror',error=>browserErrors.push(error.message));
   await page.route('**/*',route=>new URL(route.request().url()).origin===base?route.continue():route.abort());
-  await page.goto(base);await page.locator('#legacy-fallback').waitFor();stage('app-mounted');
+  await page.goto(base);stage('app-mounted');
   await page.locator('iframe[title="原酒馆插件交互显示"]').waitFor({timeout:8000});
   assert.equal(statusRequests,2,'one transient failure is retried through a shared status request');stage('transient-status-retried');
   async function failCurrentFrame(){
    const iframe=page.locator('iframe[title="原酒馆插件交互显示"]');await iframe.waitFor();
    const element=await iframe.elementHandle();const frame=await element?.contentFrame();assert.ok(frame,'current render iframe is attached');await frame.evaluate(()=>parent.postMessage({type:'liyuan-tavern-error',error:'SYNTHETIC_RENDER_FAILURE'},location.origin));
    await page.getByRole('alert').waitFor();
+   assert.ok((await page.getByRole('alert').innerText()).includes('SYNTHETIC_RENDER_FAILURE'),'display errors retain the actual bounded cause, not only a generic retry message');
   }
   async function recoverBy(change){await failCurrentFrame();await change();await page.locator('iframe[title="原酒馆插件交互显示"]').waitFor();assert.equal(await page.getByRole('alert').count(),0);}
   await failCurrentFrame();

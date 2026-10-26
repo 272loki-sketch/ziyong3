@@ -14,6 +14,18 @@ test("managed completion uses the exact enabled model and returns original text/
 test("masked stored custom preset keys are restored only for the same endpoint and model",async()=>{const f=fixture();try{const payload={custom_url:"https://example.test/v1",model:"custom",messages:[{role:"user",content:"synthetic"}],custom_include_headers:"Authorization: Bearer host-managed"};const settings={profile:JSON.stringify({apiPresets:[{apiConfig:{url:payload.custom_url,model:"custom",apiKey:"STORED_SYNTHETIC_KEY"}}]})};const result=await requestDatabasePluginCompletion(f.cwd,payload,settings,{publicUrl:async()=>{},fetch:async(_,options)=>{assert.equal((options?.headers as any).authorization,"Bearer STORED_SYNTHETIC_KEY");const body=JSON.parse(options?.body as string);assert.equal(body.stream,false);return new Response(JSON.stringify({choices:[{message:{content:"synthetic result"},finish_reason:"stop"}]}));}});assert.equal(result.choices[0].message.content,"synthetic result");await assert.rejects(requestDatabasePluginCompletion(f.cwd,{...payload,model:"different"},settings,{publicUrl:async()=>{}}),/鉴权未保存/);}finally{f.cleanup()}});
 test("database request validation refuses invalid messages and malformed tools",()=>{assert.throws(()=>validateDatabasePluginChatPayload({messages:[{role:"developer",content:"not supported"}]}),/消息/);assert.throws(()=>validateDatabasePluginChatPayload({messages:[{role:"user",content:"ok"}],tools:[{type:"function",function:{name:"bad"}}]}),/工具/);});
 
+test('oversized database requests expose exact numeric composition without content or dispatch',async()=>{
+ const secret='SYNTHETIC_PRIVATE_CONTENT';
+ const payload={messages:[{role:'system',content:secret+'x'.repeat(240000-secret.length)},{role:'user',content:'abc'}]};
+ validateDatabasePluginChatPayload({messages:[payload.messages[0]]});
+ let calls=0;
+ await assert.rejects(requestDatabasePluginCompletion('/unused',payload,{}, {complete:async()=>{calls++;throw Error('must not dispatch');}}),(error:Error)=>{
+  assert.match(error.message,/240003\/240000 UTF-16/);assert.match(error.message,/system=240000,user=3/);
+  assert.match(error.message,/0:240000,1:3/);assert.doesNotMatch(error.message,/SYNTHETIC_PRIVATE_CONTENT/);return true;
+ });
+ assert.equal(calls,0);
+});
+
 test("a registered private gateway honors explicit user auth during model-status without applying public-only rules",async()=>{const f=fixture();try{const result=await probeDatabasePluginModels(f.cwd,{custom_url:"http://127.0.0.1:12345/v1",custom_include_headers:"Authorization: Bearer EXPLICIT_ACCOUNT_KEY"},{fetch:async(_,options)=>{assert.equal((options?.headers as any).authorization,"Bearer EXPLICIT_ACCOUNT_KEY");return new Response('{"data":[{"id":"gemini-3.8-flash"}]}');},publicUrl:async()=>{throw new Error("registered connection must not be rejected")}});assert.equal(result.data[0].id,"gemini-3.8-flash");}finally{f.cleanup()}});
 
 test("a source change during auth/DNS validation prevents later network/model invocation",async()=>{const f=fixture();try{let valid=true,calls=0;await assert.rejects(probeDatabasePluginModels(f.cwd,{custom_url:"/api/database-plugin/connections/fill/enabled/v1"},{auth:async()=>{valid=false;return{apiKey:"NO_SEND"}},guard:()=>{if(!valid)throw new Error("source changed")},fetch:async()=>{calls++;return new Response('{}')}}),/source changed/);assert.equal(calls,0);valid=true;await assert.rejects(requestDatabasePluginCompletion(f.cwd,{custom_url:"https://example.test/v1",model:"fixture",messages:[{role:"user",content:"synthetic"}]},{},{publicUrl:async()=>{valid=false},fetch:async()=>{calls++;return new Response('{}')}},undefined,()=>{if(!valid)throw new Error("source changed")}),/source changed/);assert.equal(calls,0);}finally{f.cleanup()}});

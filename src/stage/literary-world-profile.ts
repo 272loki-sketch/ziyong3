@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, normalize } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 
 import { readJsonFile } from "../jsonio.ts";
+import { classifyModelFailure } from "./model-failure.ts";
+import { clipPromptText } from "./prompt-budget.ts";
 import type { CharacterCard, LorebookEntry } from "../types.ts";
 import type { RpPreset } from "../preset.ts";
 import type { BranchEntryLike } from "./assemble.ts";
@@ -36,6 +38,8 @@ export interface CardWorldProfile {
 	version: 1;
 	cardKey: string;
 	cardName: string;
+	/** Host-owned content revision binding; cardKey remains stable across managed edits. */
+	contentKey?: string;
 	revision: number;
 	analyzedTurns: number;
 	status: WorldProfileStatus;
@@ -58,6 +62,7 @@ export interface WorldSimulationManifest {
 	version: 1;
 	cardKey: string;
 	profileRevision: number;
+	contentKey?: string;
 	profileStatus: WorldProfileStatus;
 	digest: string;
 	primaryScale: CardWorldProfile["primaryScale"];
@@ -118,7 +123,7 @@ export function worldProfileFingerprint(input: {
 }): string {
 	const material = {
 		card: input.card,
-		lore: input.entries.map((entry) => ({ source: entry.source, title: entry.comment, keys: entry.keys, content: entry.content })),
+		lore: input.entries.map((entry) => ({ source: entry.source, bookId: entry.bookId, entryKey: entry.entryKey, enabled: entry.enabled, title: entry.comment, keys: entry.keys, content: entry.content })),
 		preset: input.preset ? {
 			name: input.preset.name,
 			blocks: input.preset.blocks.filter((block) => block.enabled).map((block) => ({ name: block.name, channel: block.channel, content: block.content })),
@@ -136,6 +141,7 @@ export function defaultCardWorldProfile(cwd: string, cardPath: string, cardName:
 	return {
 		version: 1,
 		cardKey: worldCardKey(cwd, cardPath, card),
+		contentKey: worldCardKey(cwd, cardPath, card),
 		cardName,
 		revision: 0,
 		analyzedTurns: 0,
@@ -159,7 +165,7 @@ export function defaultCardWorldProfile(cwd: string, cardPath: string, cardName:
 export function normalizeCardWorldProfile(
 	value: unknown,
 	base: CardWorldProfile,
-	opts?: { preserveStatus?: boolean; sourceFingerprint?: string; analyzedTurns?: number },
+	opts?: { preserveStatus?: boolean; sourceFingerprint?: string; analyzedTurns?: number; requireModules?: boolean },
 ): CardWorldProfile | null {
 	let source = objectOf(value);
 	if (!source) return null;
@@ -167,6 +173,8 @@ export function normalizeCardWorldProfile(
 	// provider 文风差异让完整画像不可用。
 	const wrapped = [source.profile, source.result, source.data].find((item) => item && typeof item === "object" && !Array.isArray(item));
 	if (wrapped && !source.modules && !source.digest) source = wrapped as Record<string, unknown>;
+	// An arbitrary JSON object (or partial response) is not an analyzed profile.
+	if (!clean(source.digest, 1200) || (opts?.requireModules && !Array.isArray(source.modules))) return null;
 	const analyzedTurnsSource = Number(source.analyzedTurns);
 	const analyzedTurns = opts?.analyzedTurns ?? (Number.isFinite(analyzedTurnsSource) ? analyzedTurnsSource : base.analyzedTurns);
 	const allowedModes = new Set<WorldModuleMode>(["observe", "active", "suspended"]);
@@ -194,6 +202,7 @@ export function normalizeCardWorldProfile(
 			skillPack: allowedSkillPacks.has(requestedPack) ? requestedPack : WORLD_MODULE_PACK_BY_KIND[kind],
 		}];
 	}).slice(0, 16);
+	if (opts?.requireModules && modules.length !== (source.modules as unknown[]).length) return null;
 	const scales = new Set(["intimate", "scene", "local", "institutional", "regional", "epic"]);
 	const steps = new Set(["moment", "scene", "hour", "day", "week", "strategic-turn"]);
 	const activities = new Set(["quiet", "low", "normal", "active", "epic"]);
@@ -201,6 +210,7 @@ export function normalizeCardWorldProfile(
 		version: 1,
 		cardKey: base.cardKey,
 		cardName: base.cardName,
+		...(base.contentKey ? { contentKey: base.contentKey } : {}),
 		revision: Math.max(base.revision + 1, Math.round(Number(source.revision) || 0)),
 		analyzedTurns: Math.max(0, Math.round(analyzedTurns)),
 		status: opts?.preserveStatus ? base.status : source.status === "stable" ? "stable" : "draft",
@@ -220,26 +230,56 @@ export function normalizeCardWorldProfile(
 	};
 }
 
-export function loadCardWorldProfile(cwd: string, cardPath: string, cardName: string, sourceFingerprint = "", card?: CharacterCard): CardWorldProfile | null {
+/** Only an explicit card binding on this ancestor chain may bridge a legacy content revision. */
+function profileManifestFromBoundBranch(cwd: string, cardPath: string, branch: BranchEntryLike[]): WorldSimulationManifest | undefined {
+	const lastBinding = [...branch].reverse().find(entry => entry.type === "custom" && entry.customType === "rp-card");
+	const bindingIndex = lastBinding ? branch.lastIndexOf(lastBinding) : -1;
+	if (bindingIndex < 0) return;
+	const binding = branch[bindingIndex].data as { card?: unknown } | undefined;
+	const absolute = (path: string) => normalize(isAbsolute(path) ? path : join(cwd, path));
+	if (typeof binding?.card !== "string" || absolute(binding.card) !== absolute(cardPath)) return;
+	return worldManifestFromBranch(branch.slice(bindingIndex + 1)) ?? undefined;
+}
+
+const validCardKey = (value: unknown): value is string => typeof value === "string" && /^(?:[a-f0-9]{12}|[a-f0-9]{16})$/.test(value);
+
+export function loadCardWorldProfile(cwd: string, cardPath: string, cardName: string, sourceFingerprint = "", card?: CharacterCard, branch: BranchEntryLike[] = []): CardWorldProfile | null {
+	const contentKey = worldCardKey(cwd, cardPath, card);
 	const path = worldProfilePath(cwd, cardPath, card);
 	const legacyPath = worldProfilePath(cwd, cardPath);
-	const sourcePath = existsSync(path) ? path : legacyPath;
-	if (!existsSync(sourcePath)) return null;
+	const boundManifest = profileManifestFromBoundBranch(cwd, cardPath, branch);
+	const boundKey = boundManifest?.contentKey ?? boundManifest?.cardKey;
+	const boundPath = validCardKey(boundKey) ? join(cwd, ".liyuan", "world", "cards", boundKey, "profile.json") : undefined;
+	const sourcePath = [path, legacyPath, boundPath].find(candidate => candidate && existsSync(candidate));
+	if (!sourcePath) return null;
 	try {
-		const base = defaultCardWorldProfile(cwd, cardPath, cardName, sourceFingerprint, card);
-		const parsed = normalizeCardWorldProfile(readJsonFile(sourcePath), { ...base, revision: -1 }, { sourceFingerprint: undefined });
-		return parsed ? { ...parsed, revision: Math.max(0, parsed.revision) } : null;
+		const raw = readJsonFile(sourcePath) as Record<string, unknown>;
+		if (!raw || typeof raw !== "object" || raw.cardName !== cardName || sourcePath === boundPath && raw.cardKey !== boundManifest?.cardKey) return null;
+		const base = defaultCardWorldProfile(cwd, cardPath, cardName, "", card);
+		// A saved content binding, exact legacy path or same-source branch is evidence;
+		// a matching display name alone is never enough to associate two cards.
+		if (validCardKey(raw.cardKey) && (raw.contentKey === contentKey || sourcePath === legacyPath || sourcePath === boundPath && raw.cardKey === boundManifest?.cardKey)) base.cardKey = raw.cardKey;
+		const parsed = normalizeCardWorldProfile(raw, { ...base, revision: -1 }, { sourceFingerprint: undefined, requireModules: true });
+		return parsed ? { ...parsed, revision: Math.max(0, parsed.revision), updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : "", contentKey: validCardKey(raw.contentKey) ? raw.contentKey : basename(dirname(sourcePath)) } : null;
 	} catch {
 		return null;
 	}
 }
 
 export function saveCardWorldProfile(cwd: string, cardPath: string, profile: CardWorldProfile, card?: CharacterCard): void {
+	if (!validCardKey(profile.cardKey)) throw new Error("世界画像身份无效，未写入");
 	const path = worldProfilePath(cwd, cardPath, card);
-	mkdirSync(dirname(path), { recursive: true });
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
-	writeFileSync(temporary, `${JSON.stringify(profile, null, "\t")}\n`, "utf8");
+	writeFileSync(temporary, `${JSON.stringify({ ...profile, contentKey: worldCardKey(cwd, cardPath, card) }, null, "\t")}\n`, { mode: 0o600 });
 	renameSync(temporary, path);
+}
+
+/** Call only around an explicit edit of this exact source, never on card selection/import. */
+export function carryCardWorldProfile(cwd: string, cardPath: string, before: CharacterCard, after: CharacterCard): void {
+	if (worldCardKey(cwd, cardPath, before) === worldCardKey(cwd, cardPath, after)) return;
+	const profile = loadCardWorldProfile(cwd, cardPath, before.name, "", before);
+	if (profile) saveCardWorldProfile(cwd, cardPath, { ...profile, cardName: after.name }, after);
 }
 
 export function manifestFromProfile(profile: CardWorldProfile): WorldSimulationManifest {
@@ -248,6 +288,7 @@ export function manifestFromProfile(profile: CardWorldProfile): WorldSimulationM
 		version: 1,
 		cardKey: profile.cardKey,
 		profileRevision: profile.revision,
+		...(profile.contentKey ? { contentKey: profile.contentKey } : {}),
 		profileStatus: profile.status,
 		digest: profile.digest,
 		primaryScale: profile.primaryScale,
@@ -291,6 +332,18 @@ export function buildWorldProfilePrompt(input: {
 	const selectedGreeting = input.greetingIndex && input.greetingIndex > 0
 		? input.card.alternateGreetings[input.greetingIndex - 1] ?? input.card.firstMes
 		: input.card.firstMes;
+	const previousProfile = input.previous ? { ...input.previous } : null;
+	if (previousProfile) delete previousProfile.contentKey;
+	// Match the aggregate lore budget used by other side projections, retaining
+	// provenance on exactly the entries delivered rather than the unbounded input.
+	const worldLore: Array<{ source?: string; title: string; content: string }> = [];
+	let loreChars = 0;
+	for (const entry of input.entries.filter(entry => entry.enabled !== false && entry.content.trim()).slice(0, 40)) {
+		if (loreChars >= 24_000) break;
+		const content = clipPromptText(entry.content, Math.min(2_000, 24_000 - loreChars));
+		worldLore.push({ source: entry.source, title: entry.comment || entry.keys[0] || "", content });
+		loreChars += content.length;
+	}
 	return {
 		systemPrompt: `你在为梨园建立一张角色卡长期复用的独立世界适配画像。Skill 是分析与适配规则的唯一权威；代码只负责输入、解析、版本和持久化。只返回一个合法 JSON 对象，不输出 Markdown、解释、思考过程或 profile/result 包装。顶层必须直接含 digest、labels、primaryScale、defaultTimeStep、worldActivity、modules、disabledModules、userRequirements、optimizationNotes、unresolvedQuestions、evidence。\n\n# 工作流 Skill\n${input.skillBody}`,
 		userText: JSON.stringify({
@@ -303,10 +356,47 @@ export function buildWorldProfilePrompt(input: {
 				tags: input.card.tags.slice(0, 30),
 			},
 			selected_greeting: selectedGreeting,
-			world_lore: input.entries.slice(0, 40).map((entry) => ({ source: entry.source, title: entry.comment || entry.keys[0], content: entry.content.slice(0, 2000) })),
+			world_lore: worldLore,
 			preset: input.preset ? { name: input.preset.name, enabledBlockNames: input.preset.blocks.filter((block) => block.enabled).map((block) => block.name) } : null,
-			previous_profile: input.previous ?? null,
+			previous_profile: previousProfile,
 			recent_play: (input.recentHistory?.slice(-8) ?? []).map((item) => ({ role: item.role, text: item.text.slice(0, 2000) })),
 		}, null, 2),
 	};
+}
+
+const worldProfileLeases = new Set<string>();
+const worldProfileLeaseKey = (cwd: string, cardPath: string, card: CharacterCard) => JSON.stringify([normalize(cwd), worldCardKey(cwd, cardPath, card)]);
+export function worldProfileAnalysisRunning(cwd: string, cardPath: string, card: CharacterCard): boolean {
+	return worldProfileLeases.has(worldProfileLeaseKey(cwd, cardPath, card));
+}
+
+/** Shared manual/settlement analysis: bounded transport retry, no invented default profile. */
+export async function analyzeCardWorldProfile(input: Parameters<typeof buildWorldProfilePrompt>[0] & {
+	cwd: string;
+	cardPath: string;
+	completedTurns: number;
+	run: (systemPrompt: string, userText: string, forceNonStreaming: boolean) => Promise<string | { error: string }>;
+	guard?: () => void;
+}): Promise<CardWorldProfile> {
+	const leaseKey = worldProfileLeaseKey(input.cwd, input.cardPath, input.card);
+	if (worldProfileLeases.has(leaseKey)) throw new Error("这张卡的世界画像正在分析，请等待完成后重试");
+	worldProfileLeases.add(leaseKey);
+	try {
+		const fingerprint = worldProfileFingerprint(input);
+		const base = input.previous ?? defaultCardWorldProfile(input.cwd, input.cardPath, input.card.name, fingerprint, input.card);
+		const prompt = buildWorldProfilePrompt(input);
+		for (const forceNonStreaming of [false, true]) {
+			input.guard?.();
+			const result = await input.run(prompt.systemPrompt, prompt.userText, forceNonStreaming);
+			input.guard?.();
+			if (typeof result !== "string") {
+				const failure = classifyModelFailure(result.error);
+				if (!forceNonStreaming && failure.retryable && (failure.kind === "transport" || failure.kind === "timeout" || failure.kind === "format")) continue;
+				throw new Error(`画像分析失败：${result.error}`);
+			}
+			const profile = normalizeCardWorldProfile(result, base, { preserveStatus: !!input.previous, sourceFingerprint: fingerprint, analyzedTurns: input.completedTurns, requireModules: true });
+			if (profile) return { ...profile, revision: base.revision + 1, status: base.status, contentKey: worldCardKey(input.cwd, input.cardPath, input.card), ...(input.previous ? { worldActivity: base.worldActivity, disabledModules: base.disabledModules, modules: profile.modules.map(module => ({ ...module, mode: base.modules.find(previous => previous.id === module.id)?.mode ?? module.mode })), optimizationNotes: [...new Set([...base.optimizationNotes, ...profile.optimizationNotes])] } : {}) };
+		}
+		throw new Error("画像输出不是完整的世界适配 JSON，未覆盖已有画像；请检查画像模型的请求记录后重试");
+	} finally { worldProfileLeases.delete(leaseKey); }
 }

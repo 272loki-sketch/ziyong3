@@ -1,3 +1,4 @@
+import { workspaceStorageKey, workspaceStale, markWorkspaceStale } from "./workspace.ts";
 /** 同源 WS；连接重试与投递确认分离。命令不自动重放，普通输入先写本机 outbox 再发。 */
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -12,7 +13,7 @@ export interface WsHandle {
 	storageError: string | null;
 	discard: (messageId: string) => void;
 }
-const browserStorage: OutboxStorage = { getItem: (key) => sessionStorage.getItem(key), setItem: (key, value) => sessionStorage.setItem(key, value) };
+const browserStorage: OutboxStorage = { getItem: (key) => sessionStorage.getItem(workspaceStorageKey(key)), setItem: (key, value) => sessionStorage.setItem(workspaceStorageKey(key), value) };
 export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: ConnState) => void): WsHandle {
 	const wsRef = useRef<WebSocket | null>(null);
 	const boxRef = useRef<PromptOutbox | null>(null);
@@ -60,7 +61,7 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 	flushSafeReadsRef.current = flushSafeReads;
 	const flush = useCallback((type: ReliablePrompt["type"]) => {
 		const ws = wsRef.current, target = targetsRef.current[type];
-		if (!ws || ws.readyState !== WebSocket.OPEN || !target || !readyRef.current.has(type)) return;
+		if (workspaceStale() || !ws || ws.readyState !== WebSocket.OPEN || !target || !readyRef.current.has(type)) return;
 		for (const frame of gateRef.current.frames(boxRef.current!, type)) {
 			if (sentRef.current.has(frame.messageId)) continue;
 			try {
@@ -84,7 +85,7 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 		const clearHandshakeTimer = () => { if (handshakeTimer) clearTimeout(handshakeTimer); handshakeTimer = undefined; };
 		const connect = () => {
 			clearRetryTimer();
-			if (closed || !canOpenWire(wsRef.current?.readyState)) return;
+			if (closed || workspaceStale() || !canOpenWire(wsRef.current?.readyState)) return;
 			onStateRef.current("connecting");
 			gateRef.current.ready.clear(); gateRef.current.reliable.clear(); gateRef.current.sent.clear();
 			helloLanesRef.current.clear(); safeReadsRef.current.disconnect(); lastReadSentAtRef.current.clear();
@@ -117,6 +118,7 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 				if (closed || wsRef.current !== ws) return;
 				let frame: ServerFrame;
 				try { frame = JSON.parse(String(ev.data)) as ServerFrame; } catch { return; }
+    if (frame.type === "workspace_changed") {markWorkspaceStale();ws.close();return;}
 				if (frame.type === "hello" || frame.type === "assistant_hello") {
 					if (frame.type === "hello" && frame.sessionId) onStateRef.current("open");
 					const type = frame.type === "hello" ? "prompt" : "assistant_prompt";
@@ -176,6 +178,8 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 					boxRef.current!.disconnect(); refresh();
 				}
 				if (closed || !current) return;
+				if(ev.code===4410){markWorkspaceStale();return;}
+    if(workspaceStale())return;
 				if (ev.code === 4401) { location.reload(); return; } // outbox 跨 reload 保留
 				onStateRef.current("closed"); timer = setTimeout(connect, retryMs); retryMs = nextRetryMs(retryMs);
 			};
@@ -195,7 +199,8 @@ export function useWire(onFrame: (frame: ServerFrame) => void, onState: (s: Conn
 	}, [flush, flushSafeReads, refresh]);
 	const send = useCallback((frame: ClientFrame): SendResult => {
 		const refuse = (reason: string, messageId?: string): SendResult => { onFrameRef.current({ type: "notify", level: "warning", text: reason }); return { accepted: false, reason, ...(messageId ? { messageId } : {}) }; };
-		const ws = wsRef.current;
+		if(workspaceStale())return refuse("主窗口已切换，请先刷新；当前草稿保留");
+  const ws = wsRef.current;
 		if (frame.type === "prompt" || frame.type === "assistant_prompt") {
 			const target = frame.sessionId ?? targetsRef.current[frame.type];
 			if (!target) {

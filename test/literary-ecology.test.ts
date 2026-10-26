@@ -255,9 +255,8 @@ test("ecology：三件工作流 Skill 均可被装载", () => {
 		const skills = scanSkillFiles(cwd);
 		assert.match(workflowSkill(skills, "ecology-global")?.body ?? "", /叙事发动机/);
 		assert.match(workflowSkill(skills, "ecology-card")?.body ?? "", /人物语法/);
-		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /生态维护人物、场所与事件/);
-		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /Small_theater/);
-		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /生态结算不补写镜头内行动/);
+		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /维护这些人物和地点的持续状态/);
+		assert.match(workflowSkill(skills, "ecology-runtime")?.body ?? "", /不补写正文没写的镜头内行动/);
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 

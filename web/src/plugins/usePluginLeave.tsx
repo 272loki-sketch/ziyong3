@@ -6,12 +6,11 @@ export const PluginLeaveContext = createContext<Leave | null>(null);
 /** Drain only the known same-origin adapters. Never infer persistence from a delay. */
 export async function flushPluginFrame(frame: HTMLIFrameElement): Promise<void> {
 	const hostWindow = frame.contentWindow as (Window & {
-		LiyuanNpcParallel?: { flush?: () => Promise<void> };
 		LiyuanVeridisRewrite?: { flush?: () => Promise<void>; failed?: boolean; pending?: number };
 		LiyuanTavernPlugins?: { host?: { flush?: () => Promise<void> } };
 		LiyuanDatabasePluginHost?: { flush?: () => Promise<unknown> };
 	}) | null;
-	const host = hostWindow?.LiyuanNpcParallel ?? hostWindow?.LiyuanVeridisRewrite ?? hostWindow?.LiyuanTavernPlugins?.host ?? hostWindow?.LiyuanDatabasePluginHost;
+	const host = hostWindow?.LiyuanVeridisRewrite ?? hostWindow?.LiyuanTavernPlugins?.host ?? hostWindow?.LiyuanDatabasePluginHost;
 	if (!host?.flush) {
 		// An inaccessible/loading canvas has never been offered for editing.
 		if (frame.getAttribute("aria-hidden") === "true") return;

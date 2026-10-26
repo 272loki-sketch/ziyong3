@@ -1,7 +1,20 @@
+import { ledgerStatusFromBranch } from "../src/stage/ledger-status.ts";
+import { supplementaryDeliveryProjection, supplementaryMvuInput } from "./wire.ts";
+import { FishTtsHttp } from "./fish-tts-http.ts";
+import { persistNavigation } from "./navigation-receipt.ts";
+import { analysisRequestTimeoutMs, createRequestDeadline, requestAbortError } from "../src/request-budget.ts";
+import { PlotSemanticSearch } from "../src/plot-options/semantic.ts";
+import { plotEmbeddingProvider } from "../src/plot-options/embedding.ts";
+import { PlotOptionsEngine } from "../src/plot-options/engine.ts";
+import { plotHash } from "../src/plot-options/library.ts";
+import { validPlotChoice } from "../src/plot-options/types.ts";
+import { createPlotLibraryLoader } from "../src/plot-options/loader.ts";
+import { outlineFromBranch } from "../src/outline/state.ts";
+import { projectOutline } from "../src/outline/projection.ts";
 import {prepareDisplayText} from "../src/postprocess.ts";
 import {VeridisRewriteHttp} from "./veridis-rewrite-http.ts";
 import {rewriteReceiptFromBranch} from "../src/stage/veridis-rewrite.ts";
-import {NpcParallelHttp} from "./npc-parallel-http.ts";
+import {NpcSidewriteHttp} from "./npc-sidewrite-http.ts";
 import {npcReceiptFromBranch} from "../src/stage/npc-parallel.ts";
 import {captureSdkCall,RequestJournal} from "../src/stage/request-journal.ts";
 import {inspectRequests} from "./request-inspector.ts";
@@ -24,6 +37,8 @@ import { DatabasePluginHttp } from "./database-plugin-http.ts";
 import { DatabasePluginRuntime } from "./database-plugin-runtime.ts";
 import { createDatabasePluginReadonlyLorebooks } from "./database-plugin-lorebooks.ts";
 import { tavernPluginScope } from "./tavern-plugin-store.ts";
+import { mvuDisplaySuffixes } from "./mvu-display.ts";
+import { mvuStatus } from "./mvu-assets.ts";
 import { shouldRestoreRerollFallback } from "./turn-fallback.ts";
 import { TavernPluginHttp, createTavernPluginGenerator, managedMvuEndpoint } from "./tavern-plugin-http.ts";
 import { TavernPluginRuntime, validateTavernPluginCandidate } from "./tavern-plugin-runtime.ts";
@@ -33,6 +48,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { dirname, extname, isAbsolute, join, normalize, resolve } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
+import { PlaySlots } from "./play-slots.ts";
+import { AccessAttemptLimiter, isAccessGuardedPath, isSameOriginRequest, isTrustedUnprotectedHost, requestPathname, resolveStaticFile } from "./http-security.ts";
 import {
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
@@ -44,7 +61,7 @@ import {
 } from "@liyuan/agent-runtime";
 
 import {
-	ACCESS_COOKIE,
+	ACCESS_COOKIE, accessCookie,
 	clearPassword,
 	issueToken,
 	loadAccess,
@@ -58,7 +75,7 @@ import {
 import { loadAgentConfig, normalizeAgentConfig, syncAgentConfigToRuntime } from "../src/agent-config.ts";
 import { streamSimple } from "@liyuan/ai/compat";
 import { loadCardFile, readCardRawJson } from "../src/card.ts";
-import { buildGreeting } from "../src/greeting.ts";
+import { greetingBranchLeaf, buildGreeting } from "../src/greeting.ts";
 import { effectiveGenerationMode, isGenerationMode } from "../src/stage/generation-mode.ts";
 import { loadStageConfig } from "../src/stage/materials.ts";
 import { configuredModels } from "../src/configured-models.ts";
@@ -70,10 +87,11 @@ import { worldManifestFromBranch } from "../src/stage/literary-world-profile.ts"
 import { parseLegacyCalendarSource, projectPresentation, projectTavernVariables } from "../src/presentation.ts";
 import { ecologyWireView, literaryEcologyFromBranch, normalizeLiteraryEcologyState } from "../src/stage/literary-ecology.ts";
 import { loadStageMaterials } from "../src/stage/materials.ts";
+import { nativeWorldbookContext } from "../src/worldbook-bindings.ts";
 import { requestText, webResearchBatch } from "./web-research.ts";
 import { readPublicWebDocument, sourceReaderTransport } from "./web-source-reader.ts";
 import { researchNetworkEnvironment } from "./web-research-network.ts";
-import { resolveStepModel } from "../src/model-routing.ts";
+import { findAvailableModelById, resolveStepModel } from "../src/model-routing.ts";
 import { OutlineEngine } from "../src/outline/engine.ts";
 import { CorpusEngine } from "../src/outline/corpus.ts";
 import { CorpusScheduler } from "../src/outline/corpus-scheduler.ts";
@@ -138,7 +156,7 @@ import {
 	narrativeMemoryWindow,
 	committedNarrativeText,
 } from "../src/memory/index.ts";
-import { handleApiRequest, loadCardFrontSnapshot, loadConfig, writeJsonWithBackup, type CurrentModelInfo, type RestHost, type TavernGreetingExpected, type TavernGreetingSnapshot } from "./rest.ts";
+import { handleApiRequest, loadCardFrontSnapshot, loadConfig, writeJsonWithBackup, type CurrentModelInfo, type RestHost, type TavernGreetingExpected, type TavernGreetingSnapshot, assertLibraryCard, listCardLibrary } from "./rest.ts";
 import { toWireHistory as greetingWireHistory } from "./wire.ts";
 import { diagnosticsFromBranch } from "../src/stage/diagnostics.ts";
 
@@ -160,10 +178,12 @@ import {
 	type WireStats,
 } from "./wire.ts";
 import { createAssistantHost, type AssistantHost, type StoryBridge } from "./assistant.ts";
+import { mainWorkspaceHtml, WORKSPACE_HOSTS } from "./main-workspace.ts";
+import { WORKSPACE_BOOTSTRAP } from "./workspace-bootstrap.ts";
 import { AuthorizedSockets } from "./ws-authorization.ts";
 import { performanceByNarrative } from "./performance-projection.ts";
-import { PromptDeliveryLedger, findPersistedSubmission, readSubmissionIdentity, type DeliveryChannel } from "./prompt-delivery.ts";
-import { collectSideModelResult } from "./side-model-result.ts";
+import { PromptDeliveryLedger, findPersistedSubmission, plotSubmissionKey, readSubmissionIdentity, type DeliveryChannel } from "./prompt-delivery.ts";
+import { collectSideModelResult, readAssistantText } from "./side-model-result.ts";
 import { registerAssistantRunner } from "../src/assistant-gateway.ts";
 import { sameCardPath } from "../src/paths.ts";
 import { toggleDisabledLore } from "../src/lorebook.ts";
@@ -186,8 +206,12 @@ import { mcpEnabledFromBranch } from "../src/stage/mcp-stage.ts";
 import { loadNovelPackage } from "../src/novel-play/store.ts";
 import { effectiveNovelPlayBinding, novelPlayCardBinding, novelPlayStateFromBranch, NOVEL_PLAY_UPGRADE_ENTRY_TYPE, type NovelPlayUpgradeEntry } from "../src/novel-play/runtime.ts";
 import { ensureNovelPlayLorebook } from "../src/novel-play/application.ts";
+import { configureNetworkDefaults } from "../src/network-defaults.ts";
 
+configureNetworkDefaults();
 const cwd = process.cwd();
+const playSlotChild = process.env.LIYUAN_PLAY_SLOT_CHILD === "1";
+if (playSlotChild && process.connected) process.once("disconnect", () => process.exit(0));
 ensureNovelPlayLorebook(cwd);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? 7620);
@@ -267,6 +291,7 @@ const runtime = await createAgentSessionRuntime(createRuntime, {
 let session: AgentSession = runtime.session;
 let unsubscribe: (() => void) | undefined;
 let outline: OutlineEngine | undefined;
+let plotOptions: PlotOptionsEngine | undefined;
 let corpus: CorpusEngine | undefined;
 let corpusScheduler: CorpusScheduler | undefined;
 let researchSearchScheduler: ResearchSearchScheduler | undefined;
@@ -394,7 +419,7 @@ const startUpdateDownload = async (mirror?: string): Promise<void> => {
 };
 
 // 启动 3s 后后台静默检查（不卡启动、不打扰；失败无声）
-setTimeout(() => void runUpdateCheck(false).catch(() => {}), 3000);
+if (!playSlotChild) setTimeout(() => void runUpdateCheck(false).catch(() => {}), 3000);
 
 // ---------- 会话统计与世界状态（右栏信息面板的数据源） ----------
 
@@ -447,7 +472,7 @@ watch(stateDir, (_evt, filename) => {
 	clearTimeout(stateDebounce);
 	stateDebounce = setTimeout(() => {
 		try {
-			broadcast({ type: "state", state: currentState() });
+			broadcast({ type: "state", state: currentState(), ledgerStatus: { ...ledgerStatusFromBranch(session.sessionManager.getBranch() as BranchEntryLike[]), scope: {sessionId: session.sessionId, card: cardPath} } });
 		} catch {
 			// 读取竞态（写入未完成）：下次事件再推
 		}
@@ -567,7 +592,7 @@ const annotateSwipes = (messages: import("./wire.ts").WireMsg[]): import("./wire
 /** 当前卡显示向皮肤（wire 上屏：先正则再 unwrap） */
 const currentDisplaySkin = () => {
 	try {
-		const snap = loadCardFrontSnapshot(cwd);
+		const snap = loadCardFrontSnapshot(cwd, session.sessionId);
 		if (!snap.enabled || !snap.hasSkin || !snap.rules.length) return null;
 		return {
 			rules: snap.rules,
@@ -597,6 +622,11 @@ const branchMessages = (): unknown[] => {
 		for (const entry of branch) if(entry.customType==="rp-turn-settlement" && entry.data && typeof entry.data==="object"){const data=entry.data as {narrativeEntryId?:string;presentationDone?:boolean};if(data.narrativeEntryId){if(data.presentationDone===false)presentationPending.add(data.narrativeEntryId);else if(data.presentationDone===true)presentationPending.delete(data.narrativeEntryId);}}
 		const performanceMessage = (entry: Record<string, unknown>): Record<string, unknown> => {
 			const message: Record<string, unknown> = { ...(entry.message as Record<string, unknown>), details: { ...((entry.message as Record<string, unknown>).details as Record<string, unknown> ?? {}), rpEntryId: String(entry.id), rpTavernScope: tavernPluginScope({sessionId:session.sessionId,card:cardPath||undefined}) } };
+			const details = message.details as Record<string, unknown>;
+			// Never trust stored display projections; derive them from current-branch receipts.
+			delete details.rpSupplementaryText;
+			delete details.rpSupplementaryDelivery;
+			if (message.role === "assistant") Object.assign(details, supplementaryDeliveryProjection(branch, String(entry.id), details.rpAuthorDraft, details.rpNarrative));
 			const performance = performances.get(String(entry.id));
 			const calls = diagnostics.get(String(entry.id));
 			if(presentationPending.has(String(entry.id)))message.details={...(message.details as Record<string,unknown>??{}),rpPresentationDelivery:{status:"pending"}};
@@ -688,7 +718,7 @@ const branchMessages = (): unknown[] => {
 
 let settlementProgress: string | undefined;
 const helloFrame = (): ServerFrame => {
-	const cardfront = loadCardFrontSnapshot(cwd);
+	const cardfront = loadCardFrontSnapshot(cwd, session.sessionId);
 	const skin =
 		cardfront.enabled && cardfront.hasSkin && cardfront.rules.length
 			? {
@@ -709,7 +739,26 @@ const helloFrame = (): ServerFrame => {
 		charName: names.charName,
 		userName: names.userName,
 		messages: (() => {
-			const messages = annotateSwipes(toWireHistory(branchMessages(), names, { skin }));
+   let displaySuffixes: ReadonlyMap<string, string> | undefined;
+   try {
+    const helper = tavernPlugins.sources.status().plugins.find(plugin => plugin.id === "helper");
+    const mvu = skin && helper?.enabled && helper.installed ? mvuStatus(cwd) : undefined;
+    const binding = mvu?.enabled && mvu.installed ? tavernPlugins.binding() : undefined;
+    if (binding) displaySuffixes = mvuDisplaySuffixes(binding, tavernPlugins.store.read(binding).state, true);
+   } catch {
+    // A missing/corrupt optional derived state must not hide the saved author delivery.
+    console.warn("MVU 显示状态不可用；保留原作者交付。");
+   }
+   const npcBranch=session.sessionManager.getBranch() as BranchEntryLike[];
+   const originals=branchMessages();
+   const displayOverrides=new Map<string,string>();
+   for(const item of originals){
+    const details=(item as {details?:Record<string,unknown>})?.details,id=details?.rpEntryId;
+    if(typeof id!=="string")continue;
+    const rewrite=rewriteReceiptFromBranch(npcBranch,id,typeof details?.rpAuthorDraft==="string"?details.rpAuthorDraft:undefined);
+    if(rewrite?.status==="complete"&&rewrite.changed&&typeof rewrite.text==="string")displayOverrides.set(id,rewrite.text);
+   }
+			const messages = annotateSwipes(toWireHistory(originals, names, { skin, displaySuffixes, displayOverrides }));
 			for (let i = messages.length - 1; i >= 0; i--) {
 				if (messages[i].channel === "narrative") {
 					const branch = session.sessionManager.getBranch() as BranchEntryLike[];
@@ -746,23 +795,22 @@ const helloFrame = (): ServerFrame => {
 						try { return new RegExp(rule.source, rule.flags).test(rawCurtain); } catch { return false; }
 					});
 					if (optionMatch && !optionsHandledBySkin) presentation.options = optionMatch[1].split(/\r?\n/).map((line) => line.trim().replace(/^(?:>|[-*]|\d+[.)、])\s*/, "")).filter(Boolean).slice(0, 9);
-					messages[i] = { ...messages[i], world: projectLiteraryWorldV1(modular), worldModules: modularWorldWireView(modular, manifest), worldAudit: worldAuditFromBranch(branch) ?? undefined, ecology: ecologyWireView(ecology), presentation, tavernVariables: projectTavernVariables(state, names.userName) };
+					messages[i] = { ...messages[i], world: projectLiteraryWorldV1(modular), worldModules: modularWorldWireView(modular, manifest), worldAudit: worldAuditFromBranch(branch) ?? undefined, ecology: ecologyWireView(ecology, branch), presentation, tavernVariables: projectTavernVariables(state, names.userName) };
 					break;
 				}
 			}
-			const npcBranch=session.sessionManager.getBranch() as BranchEntryLike[];
 			return messages.map(message=>{
                 if(!message.entryId)return message;
                 const rewrite=rewriteReceiptFromBranch(npcBranch,message.entryId,message.authorDelivery);
-                return{...message,npcParallel:npcReceiptFromBranch(npcBranch,message.entryId),veridisRewrite:rewrite,
-                    ...(rewrite?.status==="complete"&&rewrite.changed&&typeof rewrite.text==="string"?{text:prepareDisplayText(rewrite.text,skin)}:{})};
+                return{...message,npcParallel:(()=>{const receipt=npcReceiptFromBranch(npcBranch,message.entryId);return receipt?{...receipt,sessionId:session.sessionId}:undefined;})(),veridisRewrite:rewrite};
             });
 		})(),
 		state: currentState(),
+		ledgerStatus: { ...ledgerStatusFromBranch(session.sessionManager.getBranch() as BranchEntryLike[]), scope: {sessionId: session.sessionId, card: cardPath} },
 		world: (() => { const branch = session.sessionManager.getBranch() as BranchEntryLike[]; return projectLiteraryWorldV1(modularWorldFromBranch(branch, worldManifestFromBranch(branch))); })(),
 		worldAudit: worldAuditFromBranch(session.sessionManager.getBranch() as BranchEntryLike[]),
 		worldModules: (() => { const branch = session.sessionManager.getBranch() as BranchEntryLike[]; const manifest = worldManifestFromBranch(branch); return modularWorldWireView(modularWorldFromBranch(branch, manifest), manifest); })(),
-		ecology: ecologyWireView(literaryEcologyFromBranch(session.sessionManager.getBranch() as BranchEntryLike[])),
+		ecology: (() => { const branch = session.sessionManager.getBranch() as BranchEntryLike[]; return ecologyWireView(literaryEcologyFromBranch(branch), branch); })(),
 		stats: safeStats(),
 		panels: currentPanels(),
 		// 一档皮肤与消息同帧:首屏不得依赖二次 REST(缓存/竞态会让 StatusBlock 回落统一面板)
@@ -835,7 +883,7 @@ const readTavernGreetingSnapshot = (): TavernGreetingSnapshot => {
 	const hasStarted = visible.some((message) => message.channel !== "greeting") || visible.filter((message) => message.channel === "greeting").length > 1;
 	const greetingOnly = !hasStarted && (syntheticGreeting ? nonBackstageVisible.length === 0 : nonBackstageVisible.length === 1 && nonBackstageVisible[0].channel === "greeting");
 	return {
-		context: { sessionId: session.sessionId, card: boundCard, leafId: session.sessionManager.getLeafId() ?? null, messageCount, greetingIndex, greetings },
+		context: { sessionId: session.sessionId, card: boundCard, leafId: greetingBranchLeaf(branch), messageCount, greetingIndex, greetings },
 		hasStarted,
 		greetingOnly,
 		busy: tavernGreetingSelectionBusy || readStoryStreaming() || (assistantHost?.isStreaming() ?? false),
@@ -991,7 +1039,7 @@ const selectTavernGreeting = async (index: number, expected: TavernGreetingExpec
 	const branch = sm.getBranch() as unknown as Array<Record<string, unknown>>;
 	const greetingEntry = [...branch].reverse().find(isGreetingTreeEntry);
 	if (greetingEntry && greetingEntryFullIndex(greetingEntry) === index) return true;
-	if (!greetingEntry && originalLeaf !== null) return false;
+	if (!greetingEntry && greetingBranchLeaf(branch) !== null) return false;
 	tavernGreetingSelectionBusy = true;
 	let touchedTree = false;
 	const restoreOriginalLeaf = () => {
@@ -1031,6 +1079,8 @@ const selectTavernGreeting = async (index: number, expected: TavernGreetingExpec
         const latestConfig = JSON.parse(readFileSync(configFile, "utf8")) as Record<string,unknown>;
         if (latestConfig.card !== expected.card || (Number.isInteger(latestConfig.greetingIndex) ? latestConfig.greetingIndex : 0) !== expected.greetingIndex) { restoreOriginalLeaf(); return false; }
         writeJsonWithBackup(configFile, { ...latestConfig, greetingIndex:index });
+		// An opening selection is already a meaningful save, even before the first author reply.
+		sm.flush();
 		resyncAll();
 		broadcast({ type: "notify", level: "info", text: "已切换开场白 " + (position + 1) + "/" + fullPool.length });
 		return true;
@@ -1101,6 +1151,14 @@ const regenerateSwipe = async (): Promise<void> => {
 	await stage.regenerate(prep);
 };
 
+/** A successful user navigation must survive restart even before another story input. */
+const navigateStoryTree = async (targetId: string, options: Parameters<typeof session.navigateTree>[1]) => {
+ const owner = session, tree = owner.sessionManager, previousLeaf = tree.getLeafId();
+ const result = await owner.navigateTree(targetId, options);
+ if (!result.cancelled && session === owner && session.sessionManager === tree) persistNavigation(tree, previousLeaf);
+ return result;
+};
+
 /**
  * ST 式变体切换 / 再生成。
  * - prev：上一条 sibling（到头则提示）
@@ -1134,7 +1192,7 @@ const handleSwipe = async (dir: "prev" | "next" | "new"): Promise<void> => {
 			return;
 		}
 		const target = variants[idx - 1].leafId;
-		const result = await session.navigateTree(target, { summarize: false });
+		const result = await navigateStoryTree(target, { summarize: false });
 		if (!result.cancelled) resyncAll();
 		return;
 	}
@@ -1144,7 +1202,7 @@ const handleSwipe = async (dir: "prev" | "next" | "new"): Promise<void> => {
 		return;
 	}
 	const target = variants[idx + 1].leafId;
-	const result = await session.navigateTree(target, { summarize: false });
+	const result = await navigateStoryTree(target, { summarize: false });
 	if (!result.cancelled) resyncAll();
 };
 
@@ -1244,6 +1302,7 @@ const uiContext = {
 
 const bindSession = async () => {
 	outline?.cancel();
+	plotOptions?.cancel();
 	turnRuntimeDiagnostics.clear();
 	session = runtime.session;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- headless stub 集合，形状对齐 rpc-mode 的实现
@@ -1258,7 +1317,7 @@ const bindSession = async () => {
 				return { cancelled: result.cancelled };
 			},
 			navigateTree: async (targetId: string, options: unknown) => {
-				const result = await session.navigateTree(targetId, options as never);
+				const result = await navigateStoryTree(targetId, options as never);
 				return { cancelled: result.cancelled };
 			},
 			switchSession: (sessionPath: string, options: unknown) => runtime.switchSession(sessionPath, options as never),
@@ -1268,6 +1327,11 @@ const bindSession = async () => {
 			broadcast({ type: "error", text: `扩展错误（${err.event}）：${err.error}` });
 		},
 	});
+
+ // A deliberately created independent slot is already a meaningful save, even
+ // with only a greeting. The SDK's empty-session write deferral is inappropriate
+ // here: persist its canonical identity before any viewer can take it over.
+ if (playSlotChild) session.sessionManager.flush();
 
 	unsubscribe?.();
 	unsubscribe = session.subscribe((event) => {
@@ -1417,14 +1481,27 @@ const currentModelInfo = (): CurrentModelInfo | null => {
 	};
 };
 
+function loadCurrentMaterials(options: { nativeTavernPlugins?: boolean } = {}) {
+ return loadStageMaterials(cwd, { ...options, sessionId: session.sessionId });
+}
+
 const currentlyConfiguredModels = () => configuredModels(session.modelRegistry.getAvailable(), loadAgentConfig(cwd).config);
 
 const restHost: RestHost = {
 	cwd,
+	worldbookSessionId: () => session.sessionId,
 	readTavernGreetingSnapshot,
 	selectTavernGreeting,
 	isStreaming: () => session.isStreaming || stage.isStreaming,
 	retrySettlement: async () => { const result=await stage.retryPendingSettlement(); resyncAll(); return result; },
+ regenerateSupplementary:async(sessionId,sourceEntryId,receiptHash)=>{
+  if(session.isStreaming)return {aborted:false,error:'正在生成，请等待完成'};
+  try{const pending=stage.regenerateSupplementary(sessionId,sourceEntryId,receiptHash);resyncAll();if(stage.isSettling)broadcast({type:'agent',state:'settling'});return await pending;}finally{resyncAll();}
+ },
+ retryNpcAdmission:async(expectedSessionId,expectedSourceEntryId,candidateHashes)=>{
+  if(session.isStreaming)return{aborted:false,error:'正在生成，请先等待或停止'};
+  try{return await stage.retryPendingSettlement({expectedSessionId,expectedSourceEntryId,candidateHashes});}finally{resyncAll();}
+ },
 	retryVeridisRewrite: async (expectedSessionId, expectedSourceEntryId) => {
 		if (session.isStreaming) return { aborted: false, error: "正在生成，请先等待或停止" };
 		try { return await stage.retryVeridisRewrite(expectedSessionId, expectedSourceEntryId); }
@@ -1536,6 +1613,8 @@ const restHost: RestHost = {
 	},
 	/** 身份/配置/世界书挂载等：走扩展 /rprefresh，不整会话 reload */
 	async softRefreshConfig() {
+		// One settings owner; the database file is only a compatibility mirror of this role.
+		databasePlugin.syncDirectorModel();
 		if (session.isStreaming) {
 			// 流式中改设定：排队到本轮结束，避免与 prompt 抢通道
 			void session
@@ -1669,12 +1748,13 @@ const restHost: RestHost = {
 		return [];
 	},
 	// ---- 世界状态编辑（PLAN-PANELS §2.11）：用户主权 applyPatch，落盘即广播，命令桥收编进树 ----
+	retryLedger: async expected => { const result=await stage.retryLedger(expected); if(result.ledgerUpdated)syncStoryStateFromDisk(false); resyncAll(); return result; },
+	confirmLedger: (expected, patch) => { const result = stage.confirmLedger(expected, patch); syncStoryStateFromDisk(false); resyncAll(); return result; },
 	async applyStatePatch(patch) {
-		const file = join(stateDir, `${session.sessionId}.json`);
-		const r = applyPatch(loadState(file), patch);
-		saveState(file, r.state); // fs.watch 自动广播 state 帧
-		syncStoryStateFromDisk();
-		return { applied: r.applied, warnings: r.warnings };
+		const result = stage.editLedger(patch, currentState());
+		syncStoryStateFromDisk(false); // Compatibility memory only; the engine already flushed the authoritative snapshot.
+		resyncAll();
+		return result;
 	},
 	// ---- 世界线视图 / 软删除 / 线名 ----
 	worldlineView() {
@@ -1858,6 +1938,7 @@ const restHost: RestHost = {
 		pushUpdate();
 	},
 	updateRestart: () => {
+		playSlots.assertCanRestart();
 		// 启动脚本循环重拉（LIYUAN_SUPERVISED=1 时 exit 87 = 请求重启）；
 		// 直跑 node 的开发场景没有监护，退了就是退了（下次手动启动时应用）。
 		console.log("[liyuan] 收到重启应用更新请求，退出进程…");
@@ -1879,32 +1960,39 @@ const restHost: RestHost = {
 	},
 	// 预设 AI 分拣等旁路声明：调当前会话模型做一次性判断（复用 streamSimple，同 StageEngine.#sideText）
 	runSideText: async (step, systemPrompt, userText, opts) => {
-		const config = loadStageMaterials(cwd).config;
+		const plotRequestScope = step === "dailyPlot" ? { scope: { sessionId: session.sessionId, card: cardPath }, source: [...(session.sessionManager.getBranch() as BranchEntryLike[])].reverse().find(e => e.message?.role === "user" || e.message?.role === "assistant")?.id ?? "root" } : undefined;
+		const config = loadCurrentMaterials().config;
 		const availableModels = currentlyConfiguredModels();
 		const resolved = resolveStepModel(
 			step,
 			config.stepModels,
 			session.model as unknown as StageModelLike | undefined,
 			(provider, id) => availableModels.find((item) => item.provider === provider && item.id === id) as unknown as StageModelLike | undefined,
-			undefined,
+			id => findAvailableModelById(availableModels, id, session.model?.provider) as unknown as StageModelLike | undefined,
 			// 研究旁路共用模型家族：全文消化和导演检索都可回退到 outlineResearch。
 			step === "novelDigest" || step === "outlineCorpusResearch" ? ["outlineResearch"] : undefined,
 		);
 		const model = resolved.model;
-		if (!model) return { error: "无可用模型" };
+		if (!model) return { error: step === "dailyPlot" ? "日常剧情筹备岗位未配置或不在当前启用连接中；请在设置的模型插头重新选择，不借用主演或导演模型。" : step === "worldProfile" && resolved.requested ? `角色卡世界画像岗位 ${resolved.requested.provider}/${resolved.requested.id} 不在当前启用连接中。请在设置的“模型插头”中选择可用画像模型并保存；未使用其他模型代跑。` : "无可用模型" };
 		if (resolved.fallback && resolved.requested) {
 			console.error(`[side-model] ${step} 的 ${resolved.requested.provider}/${resolved.requested.id} 不可用，回退剧情总插头`);
 		}
 		let auth: { apiKey?: string; headers?: Record<string, string> } = {};
 		try {
-			auth = (await session.modelRegistry.getApiKeyAndHeaders(model as never)) as typeof auth;
+			const selectedAuth = await session.modelRegistry.getApiKeyAndHeaders(model as never);
+			if (selectedAuth.ok === false) return { error: selectedAuth.error ?? "画像模型鉴权配置不可用" };
+			auth = selectedAuth as typeof auth;
+			if (!auth.headers?.["user-agent"] && !auth.headers?.["User-Agent"]) auth.headers = { ...auth.headers, "user-agent": "Mozilla/5.0" };
 			// 该 OpenAI 兼容中转会拦截 SDK 默认的 OpenAI/JS User-Agent。
 			if ((model as unknown as { baseUrl?: string }).baseUrl?.includes("fuzhan.magicv4.ltd")) auth.headers = { ...(auth.headers ?? {}), "user-agent": "undici" };
 		} catch (e) {
 			return { error: e instanceof Error ? e.message : String(e) };
 		}
-			const bindingBranch=session.sessionManager.getBranch() as BranchEntryLike[],bindingSource=[...bindingBranch].reverse().find(entry=>entry.message?.role==="user"||entry.message?.role==="assistant")?.id??"";
-   const streamFn:StageStreamFn=(model,context,options)=>captureSdkCall(cwd,{sessionId:session.sessionId,card:cardPath},bindingSource,String(step),model,context,options,streamSimple as never);
+			const bindingBranch=session.sessionManager.getBranch() as BranchEntryLike[],bindingSource=plotRequestScope?.source ?? [...bindingBranch].reverse().find(entry=>entry.message?.role==="user"||entry.message?.role==="assistant")?.id??"";
+   const sideScope = plotRequestScope?.scope ?? { sessionId: session.sessionId, card: cardPath };
+   const streamFn:StageStreamFn=(model,context,options)=>captureSdkCall(cwd,sideScope,bindingSource,String(step),model,context,options,streamSimple as never);
+   const timeoutMs = opts?.timeoutMs ?? analysisRequestTimeoutMs(config);
+   const deadline = createRequestDeadline(opts?.signal, timeoutMs, "analysis", `步骤${step}请求`);
 			try {
 				const selectedModel = opts?.forceNonStreaming
 					? { ...(model as unknown as Record<string, unknown>), headers: { ...(((model as unknown as { headers?: Record<string, string> }).headers) ?? {}), "user-agent": "undici" }, compat: { ...(((model as unknown as { compat?: Record<string, unknown> }).compat) ?? {}), streaming: false } } as unknown as StageModelLike
@@ -1914,43 +2002,30 @@ const restHost: RestHost = {
 				{ systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }] },
 				{
 					apiKey: auth.apiKey, headers: auth.headers, maxTokens: opts?.maxTokens ?? 4096,
-					reasoning: opts?.reasoning ?? "off", signal: opts?.signal,
+					reasoning: opts?.reasoning ?? "off", signal: deadline.signal,
 					// CorpusEngine 已负责有限重试；避免 SDK 再隐式重试 9 次。
-					maxRetries: opts?.forceNonStreaming || opts?.onDelta ? 0 : 9,
-					timeoutMs: opts?.forceNonStreaming || opts?.onDelta ? 180_000 : undefined,
+					maxRetries: step === "dailyPlot" || step === "worldProfile" || opts?.forceNonStreaming || opts?.onDelta ? 0 : 9,
+					timeoutMs,
 				},
 			);
-			const final = await collectSideModelResult(s, opts);
-			const readAssistantText = (message: AssistantMsgLike | null): string => {
-				if (!message) return "";
-				const raw = message as unknown as Record<string, unknown>;
-				if (typeof raw.text === "string") return raw.text.trim();
-				if (typeof raw.content === "string") return raw.content.trim();
-				if (!Array.isArray(raw.content)) return "";
-				return raw.content.map((part: unknown) => {
-					if (typeof part === "string") return part;
-					if (!part || typeof part !== "object") return "";
-					const item = part as Record<string, unknown>;
-					if (typeof item.text === "string") return item.text;
-					if (typeof item.content === "string") return item.content;
-					if (typeof item.value === "string") return item.value;
-					return "";
-				}).join("").trim();
-			};
+			const final = await collectSideModelResult(s, { ...opts, signal: deadline.signal });
+			if (step === "dailyPlot" && final.stopReason === "length") return { error: "日常筹备模型输出触及上限，截断结果未采用；未自动重试" };
+			if (step === "worldProfile" && final.stopReason === "length") return { error: "画像模型输出触及上限，截断结果未采用" };
 			const text = readAssistantText(final);
-			if (text.length <= 1 && (text === "{" || text === "<")) {
+			if (step !== "worldProfile" && step !== "dailyPlot" && text.length <= 1 && (text === "{" || text === "<")) {
 				// 部分兼容中转的 SSE 会在结构化旁路首字符后断流；与 StageEngine.#sideText
 				// 同语义做一次非流式降级，避免画像/预设声明只落一个“{”。
 				const callModel = { ...(model as unknown as Record<string, unknown>), compat: { ...(((model as unknown as { compat?: Record<string, unknown> }).compat) ?? {}), streaming: false } } as unknown as StageModelLike;
-				const retry = streamFn(callModel, { systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }] }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: opts?.maxTokens ?? 4096, reasoning: opts?.reasoning ?? "off", signal: opts?.signal, maxRetries: opts?.onDelta ? 0 : 9, timeoutMs: 180_000 });
-				const retryFinal = await collectSideModelResult(retry, { ...opts, forceNonStreaming: true });
+				const retry = streamFn(callModel, { systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }] }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: opts?.maxTokens ?? 4096, reasoning: opts?.reasoning ?? "off", signal: deadline.signal, maxRetries: opts?.onDelta ? 0 : 9, timeoutMs });
+				const retryFinal = await collectSideModelResult(retry, { ...opts, signal: deadline.signal, forceNonStreaming: true });
 				const retryText = readAssistantText(retryFinal);
 				return retryText || { error: "非流式降级仍无文本" };
 			}
 			return text || { error: "最终消息无文本" };
 		} catch (err) {
-			return { error: err instanceof Error ? err.message : String(err) };
-		}
+			const cause = deadline.signal.aborted ? requestAbortError(deadline.signal) : err;
+			return { error: cause instanceof Error ? cause.message : String(cause) };
+		} finally { deadline.dispose(); }
 	},
 	appendWorldManifest(data) {
 		session.sessionManager.appendCustomEntry("rp-world-manifest", data);
@@ -1960,7 +2035,7 @@ const restHost: RestHost = {
 	worldProfileContext: () => {
 		const branch = session.sessionManager.getBranch() as Array<{ type?: string; customType?: string; data?: { card?: unknown } }>;
 		const bound = [...branch].reverse().find((entry) => entry.type === "custom" && entry.customType === "rp-card" && typeof entry.data?.card === "string");
-		return { leafId: session.sessionManager.getLeafId(), card: typeof bound?.data?.card === "string" ? bound.data.card : cardPath };
+		return { sessionId: session.sessionId, leafId: session.sessionManager.getLeafId(), card: typeof bound?.data?.card === "string" ? bound.data.card : cardPath, branch: session.sessionManager.getBranch() as BranchEntryLike[] };
 	},
 	worldStateView() {
 		const branch = session.sessionManager.getBranch() as BranchEntryLike[];
@@ -2017,7 +2092,7 @@ const restHost: RestHost = {
 	},
 		novelPlayUpgradePreview(targetDocId, targetRevision) {
 		const branch = session.sessionManager.getBranch() as BranchEntryLike[];
-		const raw = loadStageMaterials(cwd).rawCard;
+		const raw = loadCurrentMaterials().rawCard;
 		const from = effectiveNovelPlayBinding(cwd, raw, branch);
 		if (!from) throw new Error("当前会话不是小说开演");
 		const target = loadNovelPackage(cwd, targetDocId, targetRevision);
@@ -2034,7 +2109,7 @@ const restHost: RestHost = {
 	novelPlayUpgradeCommit(targetDocId, targetRevision, expectedLeafId, expectedFromRevision) {
 		const branch = session.sessionManager.getBranch() as BranchEntryLike[];
 		if (expectedLeafId && session.sessionManager.getLeafId() !== expectedLeafId) throw new Error("当前分支已变化，请重新预览升级");
-		const raw = loadStageMaterials(cwd).rawCard;
+		const raw = loadCurrentMaterials().rawCard;
 		const from = effectiveNovelPlayBinding(cwd, raw, branch);
 		if (!from) throw new Error("当前会话不是小说开演");
 		if (expectedFromRevision && from.revision !== expectedFromRevision) throw new Error("当前作品包已变化，请重新预览升级");
@@ -2055,17 +2130,39 @@ const restHost: RestHost = {
 	},
 };
 
+const plotLibrary = createPlotLibraryLoader(cwd);
+plotOptions = new PlotOptionsEngine({
+ cwd,
+ semanticSearch: new PlotSemanticSearch({ root: join(cwd, ".liyuan", "plot-options"), provider: () => plotEmbeddingProvider(cwd) }),
+ context: () => {
+  const m = loadCurrentMaterials(), branch = session.sessionManager.getBranch() as BranchEntryLike[];
+  const outlineState = outlineFromBranch(branch);
+  return { sessionId: session.sessionId, cardPath: m.config.card, cardIdentity: plotHash([m.config.card, m.rawCard, m.config.userPersona, m.config.userName, m.config.greetingIndex ?? 0]),
+   sourceId: [...branch].reverse().find(e => e.message?.role === "user" || e.message?.role === "assistant")?.id ?? "root",
+   branch, card: { name: m.card.name, description: m.card.description.slice(0, 7000), personality: m.card.personality.slice(0, 5000), scenario: m.card.scenario.slice(0, 4000) }, persona: (m.config.userPersona ?? "").slice(0, 6000), state: stateFromBranch(branch),
+   outline: projectOutline(outlineState, "director"), outlineHash: outlineState.hash, worldLore: m.entries,
+   modelKey: m.config.stepModels?.dailyPlot ? JSON.stringify(m.config.stepModels.dailyPlot) : "",
+   skill: workflowSkill(m.skillFiles, "daily-plot")?.body ?? "" };
+ },
+ busy: (): boolean => session.isStreaming || (typeof stage !== "undefined" && stage.isStreaming),
+ library: plotLibrary,
+ timeoutMs: () => analysisRequestTimeoutMs(loadStageConfig(cwd)),
+ run: (sp, ut, signal, timeoutMs) => restHost.runSideText("dailyPlot", sp, ut, { signal, timeoutMs, maxTokens: 6144 }),
+ appendControl: data => { session.sessionManager.appendCustomEntry("rp-plot-direction", data); session.sessionManager.flush(); resyncAll(); },
+});
+restHost.plotOptions = plotOptions;
+
 outline = new OutlineEngine({
 	cwd,
 	getSessionManager: () => session.sessionManager as never,
-	loadMaterials: () => loadStageMaterials(cwd),
+	loadMaterials: () => loadCurrentMaterials(),
 	runSideModel: (step, systemPrompt, userText, options) => restHost.runSideText(step, systemPrompt, userText, options),
 	webResearch: async (queries, maxResults, signal) => {
-		const { card, config } = loadStageMaterials(cwd);
+		const { card, config } = loadCurrentMaterials();
 		return webResearchBatch(queries, maxResults, { card, userName: config.userName, publicTerms: config.webResearchPublicTerms, signal, env: researchNetworkEnvironment(cwd) });
 	},
 	getContext: () => {
-		const materials = loadStageMaterials(cwd);
+		const materials = loadCurrentMaterials();
 		const branch = session.sessionManager.getBranch() as BranchEntryLike[];
 		const manifest = worldManifestFromBranch(branch);
 		const narrativeHistory = branch.slice(-80).flatMap((entry) => {
@@ -2083,7 +2180,7 @@ outline = new OutlineEngine({
 			history: narrativeHistory,
 			rpState: stateFromBranch(branch),
 			world: modularWorldFromBranch(branch, manifest),
-			ecology: ecologyWireView(literaryEcologyFromBranch(branch)),
+			ecology: ecologyWireView(literaryEcologyFromBranch(branch), branch),
 			literaryProfiles: literaryProfileFromBranch(branch),
 			directorArtifacts: branch.slice(-20).flatMap((entry) => {
 				const details = entry.message?.details;
@@ -2094,7 +2191,7 @@ outline = new OutlineEngine({
 	onState: () => resyncAll(),
 });
 
-const researchSchedule = loadStageMaterials(cwd).config.researchSearchSchedule
+const researchSchedule = loadCurrentMaterials().config.researchSearchSchedule
 	?? { enabled: false, hour: 6, minute: 0, maxPerRun: 3, topics: ["校园恋爱中的慢热互信", "日常剧情中的关系推进", "悬疑故事的信息分配"] };
 researchSearchScheduler = new ResearchSearchScheduler(cwd, researchSchedule, (topic) => outline!.researchSearch(topic));
 researchSearchScheduler.start();
@@ -2103,15 +2200,15 @@ if (researchSchedule.enabled) console.log(`[research-search-scheduler] 已启用
 corpus = new CorpusEngine({
 	cwd,
 	runSideModel: (step, systemPrompt, userText, options) => restHost.runSideText(step, systemPrompt, userText, options),
-	loadSkill: () => workflowSkill(loadStageMaterials(cwd).skillFiles, "novel-digest")?.body,
-	cardKey: () => loadStageMaterials(cwd).config.card,
+	loadSkill: () => workflowSkill(loadCurrentMaterials().skillFiles, "novel-digest")?.body,
+	cardKey: () => loadCurrentMaterials().config.card,
 	onReady: (document, digest, extracted) => outline!.digestReady(document, digest, extracted).then(() => undefined),
 	onRemoved: (docId) => outline!.removeCorpus(docId),
 	fetchText: requestText,
-}, loadStageMaterials(cwd).config.novelDigest?.maxCallsPerDoc ?? 800);
+}, loadCurrentMaterials().config.novelDigest?.maxCallsPerDoc ?? 800);
 // 服务重启后：恢复未完成的消化任务（断点续跑）
 corpus.restore();
-const autoSchedule = loadStageMaterials(cwd).config.novelDigest?.autoSchedule
+const autoSchedule = loadCurrentMaterials().config.novelDigest?.autoSchedule
 	?? { enabled: false, hour: 5, minute: 0, maxPerRun: 3, queries: ["学園 日常", "現代 日常 社会人", "青春 日常"] };
 corpusScheduler = new CorpusScheduler({
 	engine: corpus,
@@ -2478,7 +2575,14 @@ const MIME: Record<string, string> = {
 // ---------- 访问密码闸门（src/access.ts；设置面板「访问密码」区管理） ----------
 
 let accessData: AccessData | null = loadAccess(cwd);
-let accessFails = 0; // 连续失败计数：≥5 次后每次登录尝试强制延迟
+const accessAttempts = new AccessAttemptLimiter();
+const trustedLocalHosts = new Set(["localhost", "127.0.0.1", "[::1]", ...Object.values(networkInterfaces()).flatMap(list => (list ?? []).map(entry => entry.family === "IPv6" ? `[${entry.address}]` : entry.address))]);
+for (const host of (process.env.LIYUAN_TRUSTED_HOSTS ?? "").split(",").map(host => host.trim().toLowerCase()).filter(Boolean)) {
+	if (!/^[a-z0-9.[\]:-]+$/.test(host)) throw new Error("LIYUAN_TRUSTED_HOSTS 必须是逗号分隔的明确主机名或IP，不包含URL或凭据");
+	trustedLocalHosts.add(host);
+}
+function localAccessAllowed(req: IncomingMessage): boolean { return !!accessData || isTrustedUnprotectedHost(req, trustedLocalHosts); }
+
 
 function requestAuthed(req: IncomingMessage): boolean {
 	if (!accessData) return true;
@@ -2486,14 +2590,10 @@ function requestAuthed(req: IncomingMessage): boolean {
 }
 
 /** 需过闸的路径：业务 API 与用户数据托管；静态前端壳放行（登录页就在壳里） */
-function accessGuarded(url: string): boolean {
-	if (url.startsWith("/api/")) return !url.startsWith("/api/access/");
-	return url.startsWith("/npc-parallel/") || url === "/npc-parallel-host.html" || url.startsWith("/media/") || url.startsWith("/audio/") || url.startsWith("/uploads/") || url.startsWith("/tavern-compat/") || url === "/tavern-plugin-host.html" || url.startsWith("/scripts/extensions/third-party/JS-Slash-Runner/");
-}
+const accessGuarded = isAccessGuardedPath;
 
-function setAccessCookie(res: ServerResponse, token: string | null): void {
-	const base = `${ACCESS_COOKIE}=${token ?? ""}; Path=/; HttpOnly; SameSite=Strict`;
-	res.setHeader("set-cookie", token ? `${base}; Max-Age=31536000` : `${base}; Max-Age=0`);
+function setAccessCookie(res: ServerResponse, token: string | null, secure: boolean): void {
+	res.setHeader("set-cookie", accessCookie(token, secure));
 }
 
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -2522,7 +2622,7 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 
 async function handleAccessApi(req: IncomingMessage, res: ServerResponse, url: string): Promise<void> {
 	const json = (code: number, body: unknown, token?: string | null) => {
-		if (token !== undefined) setAccessCookie(res, token);
+		if (token !== undefined) setAccessCookie(res, token, req.headers.origin?.startsWith("https://") === true || (req.socket as typeof req.socket & { encrypted?: boolean }).encrypted === true);
 		res.writeHead(code, { "content-type": "application/json" });
 		res.end(JSON.stringify(body));
 	};
@@ -2536,18 +2636,25 @@ async function handleAccessApi(req: IncomingMessage, res: ServerResponse, url: s
 				json(400, { error: "未设置访问密码" });
 				return;
 			}
-			if (accessFails >= 5) await new Promise((r) => setTimeout(r, 1500)); // 暴力尝试限速
+			if (!accessAttempts.allow(req.socket.remoteAddress ?? "unknown")) {
+				res.setHeader("retry-after", "60");
+				json(429, { error: "登录尝试过于频繁，请稍后再试" });
+				return;
+			}
 			const body = await readJsonBody(req);
 			if (typeof body.password === "string" && verifyPassword(accessData, body.password)) {
-				accessFails = 0;
 				json(200, { ok: true }, issueToken(cwd, accessData));
 			} else {
-				accessFails++;
 				json(401, { error: "密码不正确" });
 			}
 			return;
 		}
 		if (req.method === "POST" && url === "/api/access/set") {
+			if (accessData && !accessAttempts.allow(req.socket.remoteAddress ?? "unknown")) {
+				res.setHeader("retry-after", "60");
+				json(429, { error: "密码验证过于频繁，请稍后再试" });
+				return;
+			}
 			const body = await readJsonBody(req);
 			// 已有密码时，任何变更（改/关）都必须先验旧密码
 			if (accessData && (typeof body.oldPassword !== "string" || !verifyPassword(accessData, body.oldPassword))) {
@@ -2567,14 +2674,15 @@ async function handleAccessApi(req: IncomingMessage, res: ServerResponse, url: s
 			}
 			const r = setPassword(cwd, next);
 			accessData = r.data;
-			accessFails = 0;
 			json(200, { required: true }, r.token); // 旧 token 全部失效；当前设备用新 token 续座
 			clients.revokeInvalid();
+			playSlots.revokeInvalidSockets();
 			return;
 		}
 		if (req.method === "POST" && url === "/api/access/logout") {
 			if (accessData) revokeToken(cwd, accessData, parseCookies(req.headers.cookie)[ACCESS_COOKIE]);
 			clients.revokeInvalid();
+			playSlots.revokeInvalidSockets();
 			json(200, { ok: true }, null);
 			return;
 		}
@@ -2585,8 +2693,13 @@ async function handleAccessApi(req: IncomingMessage, res: ServerResponse, url: s
 }
 
 const runDatabasePluginModel=createDatabasePluginGenerator({
+ observation:()=>databasePluginRuntime.requestObservation,
+ failureObserver:()=>databasePluginRuntime.requestFailureObserver,
+ recallModel:()=>databasePlugin.config().recallModel,
+ analysisTimeoutMinutes:()=>loadStageConfig(cwd).analysisTimeoutMinutes,
+ onActivity:detail=>{if(databasePluginRuntime.requestPhase)broadcast({type:"activity",activity:{kind:"note",name:"database",detail}});},
  findModel:ref=>currentlyConfiguredModels().find(m=>m.provider===ref.provider&&m.id===ref.id),
- defaultModel:()=>{const config=loadStageMaterials(cwd).config;return resolveStepModel("memoryEvents",config.stepModels,session.model,(provider,id)=>currentlyConfiguredModels().find(m=>m.provider===provider&&m.id===id)).model;},
+ defaultModel:()=>{const config=loadCurrentMaterials().config;return resolveStepModel("memoryEvents",config.stepModels,session.model,(provider,id)=>currentlyConfiguredModels().find(m=>m.provider===provider&&m.id===id)).model;},
  auth:model=>session.modelRegistry.getApiKeyAndHeaders(model as never),
   stream:(model,context,options)=>{const binding=databasePlugin.currentContext();return captureSdkCall(cwd,{sessionId:binding.scope.sessionId,card:binding.scope.card??""},binding.sourceEntryId,databasePluginRuntime.requestPhase??"database",model,context,options,streamSimple as never);},
 });
@@ -2608,7 +2721,7 @@ const databasePlugin = new DatabasePluginHttp(cwd, {
 	isStreaming: () => readStoryStreaming(),
 	context: () => {
 		const branch = session.sessionManager.getBranch() as BranchEntryLike[];
-		const materials = loadStageMaterials(cwd);
+		const materials = loadCurrentMaterials();
 		const messages = branch.filter(entry => entry.type === "message" && entry.id && entry.message && ["user", "assistant"].includes(entry.message.role ?? ""));
 		const chat = messages.flatMap(entry => {
 			const details = entry.message!.details as Record<string, unknown> | undefined;
@@ -2659,42 +2772,29 @@ const tavernPlugins: TavernPluginHttp = new TavernPluginHttp(cwd, {
  generate: (messages,signal,options)=>{if(!options)throw Error("脚本模型请求缺少捕获作用域");return runTavernPluginModel(messages,signal,options);},
  context: () => {
   const branch = session.sessionManager.getBranch() as BranchEntryLike[];
-  const materials = loadStageMaterials(cwd, { nativeTavernPlugins: tavernPlugins.sources.status().plugins.some(p => p.enabled && p.installed) });
+  const materials = loadCurrentMaterials( { nativeTavernPlugins: tavernPlugins.sources.status().plugins.some(p => p.enabled && p.installed) });
   const configured=currentlyConfiguredModels();const writerModel=resolveStepModel("writer",materials.config.stepModels,session.model,(provider,id)=>configured.find(m=>m.provider===provider&&m.id===id),(id)=>{const matches=configured.filter(m=>m.id===id);return matches.length===1?matches[0]:undefined;}).model;
   const mvuRef=materials.config.stepModels?.mvuParse,enabledProviders=loadAgentConfig(cwd).config.providers,mvuModel=mvuRef&&enabledProviders[mvuRef.provider]?.models?.some(item=>item.id===mvuRef.id)&&configured.find(m=>m.provider===mvuRef.provider&&m.id===mvuRef.id);
   let mvu: {model?:{provider:string;id:string;managedEndpoint:string}}={};
   if(mvuModel){try{const endpoint=managedMvuEndpoint(mvuModel.baseUrl);if(endpoint===managedMvuEndpoint(enabledProviders[mvuModel.provider]?.baseUrl))mvu={model:{provider:mvuModel.provider,id:mvuModel.id,managedEndpoint:endpoint}};}catch{}}
   const raw = (materials.rawCard.data && typeof materials.rawCard.data === "object" ? materials.rawCard.data : materials.rawCard) as Record<string, unknown>;
-  const cardBook = (raw.character_book && typeof raw.character_book === "object" ? raw.character_book : {}) as Record<string,unknown>;
-  const bookName = typeof cardBook.name === "string" && cardBook.name.trim() ? cardBook.name : `${materials.card.name}'s Lorebook`;
-  const readonlyBooks:Record<string,{entries:unknown[]}> = Object.create(null);
-  const originals = new Map<string,Record<string,unknown>>();
-  originals.set("card",cardBook);
-  const names = new Map<string,string>([["card",bookName]]);
-  for(const entry of materials.entries){
-   const source=entry.source??"card";let originalBook=originals.get(source);
-   if(!originalBook&&source.startsWith("lorebook:")){const relative=source.slice("lorebook:".length),path=isAbsolute(relative)?relative:join(cwd,relative);try{originalBook=JSON.parse(readFileSync(path,"utf8")) as Record<string,unknown>;}catch{originalBook={};}originals.set(source,originalBook);const title=typeof originalBook.name==="string"&&originalBook.name.trim()?originalBook.name:relative.replace(/\\/g,"/").split("/").at(-1)!.replace(/\.json$/i,"");names.set(source,title===bookName?`${title} · 独立书`:title);}
-   const name=names.get(source)??`${materials.card.name} · 补充设定`;if(["__proto__","constructor","prototype"].includes(name))throw new Error("世界书名称不允许原型字段");
-   const rows=originalBook?.entries;const original=Array.isArray(rows)?rows.find((row:any)=>(row.id??row.uid)===entry.uid):rows&&typeof rows==="object"?(rows as Record<string,any>)[entry.entryKey??String(entry.uid)]:undefined;
-   const fields=(original?.extensions??{}) as Record<string,unknown>;const rawPosition=original?.position??fields.position??0;const position=rawPosition==="before_char"?0:rawPosition==="after_char"?1:rawPosition;
-   readonlyBooks[name]??={entries:[]};readonlyBooks[name].entries.push({...original,...fields,uid:entry.uid,key:entry.keys,keys:entry.keys,keysecondary:entry.secondaryKeys,comment:entry.comment,content:entry.content,constant:entry.constant,selective:entry.selective,disable:!entry.enabled,enabled:entry.enabled,order:entry.order,position,depth:original?.depth??fields.depth??4});
-  }
-  readonlyBooks[bookName]??={entries:[]};
+  const { readonlyBooks, worldbookSelections } = nativeWorldbookContext(materials.worldbooks!);
+  const bookName = worldbookSelections.primary;
   const chat = branch.flatMap(entry => {
    if (!entry.id || entry.type !== "message" || !entry.message || !["user", "assistant"].includes(entry.message.role ?? "")) return [];
    const details = entry.message.details as Record<string, unknown> | undefined;
    const mes = entry.message.role === "assistant" && !details?.rpGreeting ? committedNarrativeText(entry) : extractEntryText(entry.message.content);
    if (!mes.trim()) return [];
-   return [{ mes, name: entry.message.role === "user" ? materials.config.userName : materials.card.name, is_user: entry.message.role === "user", is_system: false, swipe_id: 0, swipes: [mes], variables: [{}], extra: {}, __liyuanEntryId: entry.id,__liyuanUnfinished:entry.message.stopReason==="aborted", ...(typeof details?.rpAuthorDraft === "string" ? { __liyuanAuthorDelivery: details.rpAuthorDraft } : {}) }];
+   return [{ mes, name: entry.message.role === "user" ? materials.config.userName : materials.card.name, is_user: entry.message.role === "user", is_system: false, swipe_id: 0, swipes: [mes], variables: [{}], extra: {}, __liyuanEntryId: entry.id,__liyuanUnfinished:entry.message.stopReason==="aborted", ...(typeof details?.rpAuthorDraft === "string" ? { __liyuanAuthorDelivery: details.rpAuthorDraft, ...supplementaryMvuInput(branch as unknown as Record<string, unknown>[], entry.id, details.rpAuthorDraft, details.rpNarrative) } : {}) }];
   });
   const sourceEntryId = String(chat.at(-1)?.__liyuanEntryId ?? `session:${session.sessionId}`);
   const character = { name: materials.card.name, description: materials.card.description, personality: materials.card.personality, scenario: materials.card.scenario,
    first_mes: materials.card.firstMes, mes_example: materials.card.mesExample, avatar: (cardPath || "liyuan-current").replace(/\\/g,"/").split("/").at(-1)!.replace(/\.(json|png)$/i,"")+".png",
    data: { name: materials.card.name, description: materials.card.description, personality: materials.card.personality, scenario: materials.card.scenario, first_mes: materials.card.firstMes, mes_example: materials.card.mesExample,
     system_prompt: materials.card.systemPrompt, post_history_instructions: materials.card.postHistoryInstructions, creator_notes: typeof raw.creator_notes === "string" ? raw.creator_notes : "", alternate_greetings: raw.alternate_greetings ?? [],
-    extensions: { ...((raw.extensions && typeof raw.extensions === "object" ? raw.extensions : {}) as Record<string, unknown>), world: bookName }, character_book: raw.character_book ?? { entries: [] } } };
+    extensions: { ...((raw.extensions && typeof raw.extensions === "object" ? raw.extensions : {}) as Record<string, unknown>), world: bookName ?? "" }, character_book: raw.character_book ?? { entries: [] } } };
   return { sessionId: session.sessionId, card: cardPath || undefined, sourceEntryId, visibleEntryIds: [...branch.flatMap(e => e.id ? [e.id] : []), sourceEntryId], userName: materials.config.userName, userPersona: materials.config.userPersona,
-   chat, character, readonlyBooks, mvu,
+   chat, character, readonlyBooks, worldbookSelections, mvu,
    preset: { name: materials.presetDoc?.name ?? "梨园当前预设", prompts: materials.presetDoc?.entries.filter(e => e.enabled && !e.marker).map(e => ({ identifier: e.identifier, name: e.name, content: e.content, enabled: true, role: e.role })) ?? [], extensions: materials.presetDoc?.raw?.extensions ?? {} },
    model: { id: writerModel?.id ?? "", contextWindow: writerModel?.contextWindow } };
  },
@@ -2703,7 +2803,7 @@ const tavernPluginRuntime: TavernPluginRuntime = new TavernPluginRuntime(tavernP
 tavernPlugins.onMvuChanged=()=>tavernPluginRuntime.close();
 tavernPlugins.onChanged = () => tavernPluginRuntime.close();
 
-const npcParallel = new NpcParallelHttp(cwd, {
+const npcParallel = new NpcSidewriteHttp(cwd, {
  binding:()=>{
   const branch=session.sessionManager.getBranch() as BranchEntryLike[];
   const latest=[...branch].reverse().find(e=>(e.type==="message"&&e.message?.role==="assistant"&&typeof (e.message?.details as Record<string,unknown>|undefined)?.rpNarrative==="string")||e.customType==="rp-greeting");
@@ -2714,14 +2814,46 @@ const npcParallel = new NpcParallelHttp(cwd, {
  config:()=>{const config=loadStageConfig(cwd),ref=config.stepModels?.npcParallel,models=currentlyConfiguredModels();return{ecologyEnabled:config.literaryEcologyEnabled===true,model:ref&&models.some(m=>m.provider===ref.provider&&m.id===ref.id)?ref:undefined};},
  branch:()=>session.sessionManager.getBranch() as BranchEntryLike[],
  ecology:()=>literaryEcologyFromBranch(session.sessionManager.getBranch() as BranchEntryLike[]),
- materials:()=>loadStageMaterials(cwd),
+ materials:()=>loadCurrentMaterials(),
 });
-const veridisRewrite=new VeridisRewriteHttp(cwd,{binding:()=>npcParallel.host.binding(),isBusy:()=>npcParallel.host.isBusy()||npcParallel.runtime.busy(),branch:()=>npcParallel.host.branch(),model:()=>{const ref=loadStageConfig(cwd).stepModels?.veridisRewrite;return ref&&currentlyConfiguredModels().some(m=>m.provider===ref.provider&&m.id===ref.id)?ref:undefined;}});
+const veridisRewrite=new VeridisRewriteHttp(cwd,{binding:()=>npcParallel.host.binding(),isBusy:()=>npcParallel.host.isBusy()||npcParallel.busy(),branch:()=>npcParallel.host.branch(),model:()=>{const ref=loadStageConfig(cwd).stepModels?.veridisRewrite;return ref&&currentlyConfiguredModels().some(m=>m.provider===ref.provider&&m.id===ref.id)?ref:undefined;}});
+const fishTts = new FishTtsHttp(cwd, { binding: () => npcParallel.host.binding() });
+process.once("exit", () => fishTts.close());
 let npcUpdateTimer:ReturnType<typeof setInterval>|undefined;
 
+let workspaceOperations = 0;
+const mainWindowBusy = () => readStoryStreaming() || readStorySettling() || !!assistantHost?.isStreaming() ||
+ workspaceOperations > 0 || deliveryWaiters.size > 0 || pendingChoices.size > 0 ||
+ !!corpus.view().running?.length || tavernPluginRuntime.busy() || npcParallel.busy() || veridisRewrite.runtime.busy() || !!researchSearchScheduler?.status().running;
+const playSlots = new PlaySlots(cwd, {
+	cardFile: card => { const file = assertLibraryCard(cwd, loadConfig(cwd), card); return { file, name: loadCardFile(file).name }; },
+	snapshot: () => ({ config: loadConfig(cwd) as unknown as Record<string, unknown>, agent: loadAgentConfig(cwd).config as unknown as Record<string, unknown>, agentDirectory: getAgentDir() }),
+	authorized: req => requestAuthed(req) && localAccessAllowed(req),
+ mainBusy: mainWindowBusy,
+ persist: () => session.sessionManager.flush(),
+ mainChanged: () => { for(const ws of clients){clients.delete(ws);try{ws.send(JSON.stringify({type:"workspace_changed"}));ws.close(4410,"workspace changed");}catch{}} },
+ cards: () => {const config=loadConfig(cwd);return{current:config.card,cards:listCardLibrary(cwd,config)};},
+}, playSlotChild);
+process.once("exit", () => playSlots.close());
+
 const httpServer = createServer((req, res) => {
-	void (async () => {
-		const urlPath = (req.url ?? "/").split("?")[0];
+	let activeWorkspaceRequest=false;
+ void (async () => {
+		let urlPath: string;
+		try { urlPath = requestPathname(req.url ?? "/"); }
+		catch { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "无效的请求路径" })); return; }
+		res.setHeader("x-content-type-options", "nosniff");
+		res.setHeader("referrer-policy", "same-origin");
+		const sensitive = accessGuarded(urlPath) || urlPath.startsWith("/api/access/");
+		if (sensitive) res.setHeader("cache-control", "private, no-store");
+		if (sensitive && !localAccessAllowed(req)) {
+			res.writeHead(403, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: "未设访问密码的服务只接受本机及局域网IP；请从本机设置访问密码，或显式配置 LIYUAN_TRUSTED_HOSTS 后使用自定义域名。" })); return;
+		}
+		if ((sensitive || !["GET", "HEAD"].includes(req.method ?? "GET")) && !isSameOriginRequest(req)) {
+			res.writeHead(403, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: "不允许跨站访问管理接口" })); return;
+		}
 		if (urlPath.startsWith("/api/access/")) {
 			await handleAccessApi(req, res, urlPath);
 			return;
@@ -2733,31 +2865,44 @@ const httpServer = createServer((req, res) => {
 			res.end(JSON.stringify({ error: "需要登录" }));
 			return;
 		}
-		if (urlPath === "/api/database-plugin/rpc" && req.method === "POST") {
+		if (urlPath === "/workspace-scope.js" && req.method === "GET") {
+   res.writeHead(200,{"content-type":"text/javascript; charset=utf-8","cache-control":"no-store"});res.end(WORKSPACE_BOOTSTRAP);return;
+  }
+  if(!["GET","HEAD"].includes(req.method??"GET") && !urlPath.startsWith("/api/play-slots") && !urlPath.startsWith("/api/update/") && !databaseHostRequest && !tavernHostRequest){workspaceOperations++;activeWorkspaceRequest=true;}
+  if (await playSlots.mainRequest(req,res,databaseHostRequest || tavernHostRequest)) return;
+  // Only our own host HTML receives a transport adapter; author HTML and original
+  // plugin sources are never edited. Child proxy injects the parent's captured lease.
+  if (!playSlotChild && !databaseHostRequest && !tavernHostRequest && WORKSPACE_HOSTS.has(urlPath)) {
+   const originalEnd=res.end.bind(res);
+   res.end=((body:unknown,...args:unknown[])=>originalEnd((typeof body==="string"||Buffer.isBuffer(body))&&/^\s*<(?:!doctype|html|head)[\s>]/i.test(body.toString())?mainWorkspaceHtml(body.toString(),playSlots.context):body,...args as [])) as typeof res.end;
+  }
+  if (urlPath === "/api/database-plugin/rpc" && req.method === "POST") {
 			let raw=""; for await (const part of req) { raw+=part; if(raw.length>100000)throw new Error("插件管理请求过大"); }
 			try { const body=JSON.parse(raw);const value=await databasePluginRuntime.rpc(body.method,body.args??[]);res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify({value})); }
 			catch { res.writeHead(400,{"content-type":"application/json"});res.end(JSON.stringify({error:"数据库管理操作未完成"})); }return;
 		}
+		if (await playSlots.handle(req, res)) return;
+		if (await fishTts.handle(req,res)) return;
 		if (await veridisRewrite.handle(req,res)) return;
 		if (await npcParallel.handle(req,res)) return;
 		if (await tavernPlugins.handle(req,res)) return;
 		if (await databasePlugin.handle(req,res)) return;
 		if (await handleApiRequest(req, res, restHost)) return;
-		const url = (req.url ?? "/").split("?")[0];
+		const url = urlPath;
 		if (url === "/healthz") {
 			res.writeHead(200, { "content-type": "application/json" });
-			res.end(JSON.stringify({ ok: true, version: APP_VERSION, ...(process.env.LIYUAN_CODE_REVISION && /^[0-9a-f]{40}$/.test(process.env.LIYUAN_CODE_REVISION) ? { codeRevision: process.env.LIYUAN_CODE_REVISION } : {}), sessionId: session.sessionId, char: names.charName }));
+			res.end(JSON.stringify({ ok: true, version: APP_VERSION, ...(process.env.LIYUAN_CODE_REVISION && /^[0-9a-f]{40}$/.test(process.env.LIYUAN_CODE_REVISION) ? { codeRevision: process.env.LIYUAN_CODE_REVISION } : {}), ...(requestAuthed(req) && localAccessAllowed(req) && isSameOriginRequest(req) ? { sessionId: session.sessionId, char: names.charName, ...(playSlotChild ? { playSlotId: process.env.LIYUAN_PLAY_SLOT_ID } : {}) } : {}) }));
 			return;
 		}
 		// 图片通道媒体托管（show_image → .liyuan-media/）
 		if (url.startsWith("/media/")) {
 			const mediaDir = dir(cwd, "media");
-			const rel = normalize(url.slice("/media/".length)).replace(/^([/\\.])+/, "");
-			const file = join(mediaDir, rel);
-			if (file.startsWith(mediaDir) && existsSync(file)) {
+			const file = resolveStaticFile(mediaDir, url.slice("/media/".length));
+			if (file) {
 				res.writeHead(200, {
 					"content-type": MIME[extname(file).toLowerCase()] ?? "application/octet-stream",
-					"cache-control": "public, max-age=31536000, immutable", // 内容寻址文件名，可永久缓存
+					"cache-control": "private, no-store",
+					"content-security-policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'",
 				});
 				res.end(readFileSync(file));
 			} else {
@@ -2769,12 +2914,12 @@ const httpServer = createServer((req, res) => {
 		// 音频通道（show_audio / tts → .liyuan-audio/）
 		if (url.startsWith("/audio/")) {
 			const audioDir = dir(cwd, "audio");
-			const rel = normalize(url.slice("/audio/".length)).replace(/^([/\\.])+/, "");
-			const file = join(audioDir, rel);
-			if (file.startsWith(audioDir) && existsSync(file)) {
+			const file = resolveStaticFile(audioDir, url.slice("/audio/".length));
+			if (file) {
 				res.writeHead(200, {
 					"content-type": MIME[extname(file).toLowerCase()] ?? "application/octet-stream",
-					"cache-control": "public, max-age=31536000, immutable",
+					"cache-control": "private, no-store",
+					"content-security-policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'",
 				});
 				res.end(readFileSync(file));
 			} else {
@@ -2786,18 +2931,12 @@ const httpServer = createServer((req, res) => {
 		// 上传区托管（.liyuan-uploads/）
 		if (url.startsWith("/uploads/")) {
 			const upDir = dir(cwd, "uploads");
-			let rel = "";
-			try {
-				rel = normalize(decodeURIComponent(url.slice("/uploads/".length))).replace(/^([/\\.])+/, "");
-			} catch {
-				// 畸形百分号编码：按 404 处理
-			}
-			const file = rel ? join(upDir, rel) : "";
-			if (file.startsWith(upDir) && existsSync(file)) {
+			const file = resolveStaticFile(upDir, url.slice("/uploads/".length));
+			if (file) {
 				res.writeHead(200, {
 					"content-type": MIME[extname(file).toLowerCase()] ?? "application/octet-stream",
-					"cache-control": "public, max-age=86400",
-					"content-security-policy": "default-src 'none'",
+					"cache-control": "private, no-store",
+					"content-security-policy": "sandbox; default-src 'none'",
 					"x-content-type-options": "nosniff",
 				});
 				res.end(readFileSync(file));
@@ -2813,9 +2952,9 @@ const httpServer = createServer((req, res) => {
 			return;
 		}
 		// 静态文件（含 SPA 回退），normalize 防目录穿越
-		const rel = normalize(url === "/" ? "/index.html" : url).replace(/^([/\\])+/, "");
-		let file = join(distDir, rel);
-		if (!file.startsWith(distDir) || !existsSync(file)) file = join(distDir, "index.html");
+		const rel = url === "/" ? "index.html" : url.slice(1);
+		const file = resolveStaticFile(distDir, rel) ?? resolveStaticFile(distDir, "index.html");
+		if (!file) { res.writeHead(404); res.end(); return; }
 		try {
 			const body = readFileSync(file);
 			const ext = extname(file).toLowerCase();
@@ -2847,7 +2986,7 @@ const httpServer = createServer((req, res) => {
 				headers["cache-control"] = "no-cache";
 			}
 			res.writeHead(200, headers);
-			res.end(body);
+			res.end(ext === ".html" && file.endsWith("index.html") && !playSlotChild ? mainWorkspaceHtml(body.toString("utf8"),playSlots.context) : body);
 		} catch {
 			res.writeHead(404);
 			res.end();
@@ -2855,12 +2994,21 @@ const httpServer = createServer((req, res) => {
 	})().catch((err) => {
 		if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
 		res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
-	});
+	}).finally(()=>{if(activeWorkspaceRequest)workspaceOperations--;});
 });
 
 // ---------- WS 端点 ----------
 
-const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+const wss = new WebSocketServer({
+	noServer: true, maxPayload: 32 * 1024 * 1024,
+});
+
+httpServer.on("upgrade", (req, socket, head) => {
+	if (playSlots.handleUpgrade(req, socket, head)) return;
+	if ((req.url ?? "").split("?")[0] !== "/ws") { socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); return; }
+	if (!isSameOriginRequest(req) || !requestAuthed(req) || !localAccessAllowed(req)) { socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return; }
+	wss.handleUpgrade(req, socket, head, ws => wss.emit("connection", ws, req));
+});
 
 // 同一 WS 客户端请求会话列表的最短间隔。旧缓存前端曾形成 sessions 请求闭环；
 // 即使浏览器尚未刷新到修复版，也不能让它反复扫描会话文件、解析 7MB PNG 卡吃满单核。
@@ -2868,17 +3016,13 @@ const sessionsRequestAt = new WeakMap<WebSocket, number>();
 
 // ---------- 台上引擎（PLAN-RP-HARNESS R1：叙事回合走自建循环，pi 只留幕后） ----------
 
-const stage = new StageEngine({
+const stage: StageEngine = new StageEngine({
 	cwd,
+	plotOptions,
 	getSessionManager: () => session.sessionManager as never,
 	getModel: () => session.model as never,
 	findModel: (provider, id) => currentlyConfiguredModels().find((item) => item.provider === provider && item.id === id) as never,
-	findModelById: (id) => {
-		const available = currentlyConfiguredModels().filter((item) => item.id === id);
-		// 同 id 多渠道时优先当前剧情渠道；否则只有唯一候选才可自动迁移。
-		const currentProvider = session.model?.provider;
-		return (available.find((item) => item.provider === currentProvider) ?? (available.length === 1 ? available[0] : undefined)) as never;
-	},
+	findModelById: id => findAvailableModelById(currentlyConfiguredModels(), id, session.model?.provider) as never,
 	getAuth: async (m) => {
 		// 部分中转/网关会拦截 openai SDK 的默认 User-Agent（返回 403「request was blocked」），
 		// 导致旁路模型（生态/导演等）静默失败。默认补一个普通浏览器 UA，已显式配置的 UA 优先。
@@ -2901,8 +3045,8 @@ const stage = new StageEngine({
 	},
 	databasePluginMemory: {
 		enabled: () => databasePlugin.config().enabled,
-		before: async (userText, signal) => { const prepared = await databasePluginRuntime.before(userText, signal); return databasePlugin.prompt(prepared.userInput); },
-		after: async (sourceEntryId, signal) => { await databasePluginRuntime.after(sourceEntryId, signal); },
+		before: async (userText, signal, director, observation) => { const prepared = await databasePluginRuntime.before(userText, signal, director, observation); return { ...await databasePlugin.prompt(prepared.userInput), literaryDirectorHandled: prepared.literaryDirectorHandled, literaryDirection: prepared.literaryDirection }; },
+		after: async (sourceEntryId, signal, observation) => { await databasePluginRuntime.after(sourceEntryId, signal, observation); },
 		recentHistoryMessages: () => databasePlugin.config().recentHistoryMessages,
 	},
 	searchMemory: async (sessionId, query) => {
@@ -3041,7 +3185,7 @@ const stage = new StageEngine({
 	deleteMemory: async (sessionId, storeId, id) =>
 		await memoryDeleteChunk(cwd, { sessionId, card: cardPath || undefined }, storeId, id),
 	webResearch: async (queries, maxResults, signal) => {
-		const { card, config } = loadStageMaterials(cwd);
+		const { card, config } = loadCurrentMaterials();
 		return webResearchBatch(queries, maxResults, { card, userName: config.userName, publicTerms: config.webResearchPublicTerms, signal, env: researchNetworkEnvironment(cwd) });
 	},
 	webOpen: async (url, _focus, signal) => ({ url, documentText: await readPublicWebDocument(url, signal, sourceReaderTransport(researchNetworkEnvironment(cwd))) ?? undefined }),
@@ -3160,6 +3304,10 @@ const stage = new StageEngine({
 			resyncAll();
 			broadcast({ type: "agent", state: "settling" });
 		},
+		onSupplementaryReady: () => {
+			resyncAll();
+			if (stage.isSettling) broadcast({ type: "agent", state: "settling" });
+		},
 		onTurnEnd: (info) => {
 			settlementProgress = undefined;
 			broadcast({ type: "agent", state: "end" });
@@ -3172,7 +3320,9 @@ const stage = new StageEngine({
 				const sm = session.sessionManager;
 				if (sm.getLeafId() !== rerollFallbackLeaf) {
 					try {
+						const previousLeaf = sm.getLeafId();
 						sm.branch(rerollFallbackLeaf);
+						persistNavigation(sm, previousLeaf);
 					} catch {
 						// 回退失败不致命：保持当前状态
 					}
@@ -3237,6 +3387,7 @@ const stage = new StageEngine({
 
 /** 台上或旧循环任一在流式中（守卫共用） */
 const storyStreaming = (): boolean => session.isStreaming || stage.isStreaming;
+plotOptions.start();
 readStoryStreaming = storyStreaming;
 readStorySettling = () => stage.isSettling;
 
@@ -3644,6 +3795,9 @@ const deliveryWaiters = new Map<string, Set<WebSocket>>();
 const receivePrompt = async (ws: WebSocket, frame: Extract<ClientFrame, { type: "prompt" | "assistant_prompt" }>): Promise<void> => {
 	if (frame.type === "prompt" && frame.generationMode !== undefined && !isGenerationMode(frame.generationMode)) { sendFrame(ws, { type: "prompt_ack", messageId: String(frame.messageId ?? ""), sessionId: String(frame.sessionId ?? ""), status: "rejected", reason: "生成模式无效，草稿保留" }); return; }
 	const text = String(frame.text ?? "").trim();
+ if (frame.type === "prompt" && frame.plotChoice !== undefined && (!validPlotChoice(frame.plotChoice) || text.startsWith("/") || !frame.messageId || !frame.sessionId)) {
+  sendFrame(ws, { type: "prompt_ack", messageId: String(frame.messageId ?? ""), sessionId: String(frame.sessionId ?? ""), status: "rejected", reason: "剧情方向必须绑定合法的普通输入，草稿保留" }); return;
+ }
 	const identity = readSubmissionIdentity(frame);
 	if (identity === "legacy") { if (text) await (frame.type === "prompt" ? handlePrompt(text, { generationMode: isGenerationMode(frame.generationMode) ? frame.generationMode : effectiveGenerationMode(loadStageConfig(cwd).generationMode) }) : promptAssistant(text)); return; }
 	const reply = (status: "accepted" | "rejected", reason?: string) => sendFrame(ws, { type: "prompt_ack", sessionId: String(frame.sessionId ?? "").slice(0, 256), messageId: String(frame.messageId ?? "").slice(0, 128), status, ...(reason ? { reason } : {}) });
@@ -3656,9 +3810,9 @@ const receivePrompt = async (ws: WebSocket, frame: Extract<ClientFrame, { type: 
 	if (!assistant && command && (storyStreaming() || deliveryLedger.hasPendingSessionPrefix("assistant:")) && /^\/(?:new|back|rewind|drop|reroll|swipe|greeting|compact|editreply)(?:\s|$)/i.test(text)) { reply("rejected", "生成中不能执行此状态命令，输入保留，请停止或结束后重试"); return; }
 	if (!assistant && !command) {
 		const persisted = findPersistedSubmission(session.sessionManager.getEntries(), identity.messageId);
-		if (persisted) { reply(persisted.text === text ? "accepted" : "rejected", persisted.text === text ? undefined : "该消息 ID 已用于其他正文"); return; }
+		if (persisted) { const same = persisted.text === text && plotSubmissionKey("", persisted.plotChoice) === plotSubmissionKey("", frame.type === "prompt" ? frame.plotChoice : undefined); reply(same ? "accepted" : "rejected", same ? undefined : "该消息 ID 已用于其他正文或剧情方向"); return; }
 	}
-	const disposition = deliveryLedger.begin(channel, identity, text);
+	const disposition = deliveryLedger.begin(channel, identity, frame.type === "prompt" && !command ? plotSubmissionKey(text, frame.plotChoice) : text);
 	if (disposition === "conflict" || disposition === "full") { reply("rejected", disposition === "conflict" ? "该消息 ID 已用于其他正文" : "待确认消息过多，请稍后再试"); return; }
 	if (disposition === "accepted") { reply("accepted"); return; }
 	const key = deliveryLedger.key(channel, identity);
@@ -3666,9 +3820,10 @@ const receivePrompt = async (ws: WebSocket, frame: Extract<ClientFrame, { type: 
 	if (waiters.size < 16) waiters.add(ws);
 	deliveryWaiters.set(key, waiters);
 	if (disposition === "pending") return;
-	let accepted = false;
+	let accepted = false, settled = false;
 	const finish = (status: "accepted" | "rejected", reason?: string) => {
-		if (accepted) return;
+		if (settled) return;
+		settled = true;
 		if (status === "accepted") { accepted = true; deliveryLedger.accept(channel, identity); }
 		else deliveryLedger.reject(channel, identity);
 		for (const client of deliveryWaiters.get(key) ?? []) sendFrame(client, { type: "prompt_ack", ...identity, status, ...(reason ? { reason } : {}) });
@@ -3687,7 +3842,7 @@ const receivePrompt = async (ws: WebSocket, frame: Extract<ClientFrame, { type: 
 			await handlePrompt(text);
 			finish("accepted", "命令已处理；这是执行返回确认，不是持久用户消息 ACK");
 		} else {
-			await handlePrompt(text, { clientMessageId: identity.messageId, expectedSessionId: identity.sessionId, generationMode: isGenerationMode(frame.generationMode) ? frame.generationMode : effectiveGenerationMode(loadStageConfig(cwd).generationMode), onAccepted: () => finish("accepted") });
+			await handlePrompt(text, { ...(frame.type === "prompt" && frame.plotChoice ? { plotChoice: frame.plotChoice } : {}), clientMessageId: identity.messageId, expectedSessionId: identity.sessionId, generationMode: isGenerationMode(frame.generationMode) ? frame.generationMode : effectiveGenerationMode(loadStageConfig(cwd).generationMode), onAccepted: () => finish("accepted"), onRejected: reason => finish("rejected", reason) });
 			if (!accepted) finish("rejected", "输入尚未落树，草稿保留，请重试");
 		}
 	} catch (error) {
@@ -3721,11 +3876,16 @@ wss.on("connection", (ws, req) => {
 	for (const [id, p] of pendingChoices) sendFrame(ws, choiceFrame(id, p));
 
 	ws.on("message", (data) => {
-		if (!clients.allows(ws)) return;
+		if (!clients.allows(ws) || !playSlots.rootWritable(req)) return;
+  workspaceOperations++;
+  let commandId:string|undefined;
 		void (async () => {
 			let frame: ClientFrame;
 			try {
-				frame = JSON.parse(String(data)) as ClientFrame;
+				const parsed=JSON.parse(String(data));
+    if(playSlotChild && parsed?.type==="workspace_command" && typeof parsed.id==="string" && /^[0-9a-f-]{36}$/.test(parsed.id)){
+     commandId=parsed.id;frame=parsed.frame as ClientFrame;
+    }else frame=parsed as ClientFrame;
 			} catch {
 				return;
 			}
@@ -3923,7 +4083,7 @@ wss.on("connection", (ws, req) => {
 			} catch (err) {
 				broadcast({ type: "error", text: err instanceof Error ? err.message : String(err) });
 			}
-		})();
+		})().finally(() => {workspaceOperations--;if(commandId&&ws.readyState===ws.OPEN)ws.send(JSON.stringify({type:"workspace_command_done",id:commandId}));});
 	});
 
 	const forgetConnection = () => { clients.delete(ws); for (const waiters of deliveryWaiters.values()) waiters.delete(ws); };
@@ -3934,9 +4094,11 @@ wss.on("connection", (ws, req) => {
 // ---------- 启动 ----------
 
 httpServer.listen(PORT, HOST, () => {
-	npcUpdateTimer=setInterval(()=>{void npcParallel.sources.autoUpdateOnce(npcParallel.networkOptions());void veridisRewrite.sources.autoUpdateOnce(veridisRewrite.networkOptions());},6*60*60*1000);
-	npcUpdateTimer.unref();
-	tavernPlugins.sources.startAutoUpdate({ isIdle: () => !readStoryStreaming() && !(assistantHost?.isStreaming() ?? false) && !(corpus.view().running?.length) && !tavernPluginRuntime.busy(), validateCandidate: candidate => validateTavernPluginCandidate(cwd, candidate), onActivated: () => tavernPluginRuntime.close() });
+	if (!playSlotChild) {
+		npcUpdateTimer=setInterval(()=>{void veridisRewrite.sources.autoUpdateOnce(veridisRewrite.networkOptions());},6*60*60*1000);
+		npcUpdateTimer.unref();
+	}
+	if (!playSlotChild) tavernPlugins.sources.startAutoUpdate({ isIdle: () => !readStoryStreaming() && !(assistantHost?.isStreaming() ?? false) && !(corpus.view().running?.length) && !tavernPluginRuntime.busy(), validateCandidate: candidate => validateTavernPluginCandidate(cwd, candidate), onActivated: () => tavernPluginRuntime.close() });
 	const urls = [`http://localhost:${PORT}`];
 	if (HOST === "0.0.0.0") {
 		for (const list of Object.values(networkInterfaces())) {
@@ -3956,13 +4118,15 @@ httpServer.listen(PORT, HOST, () => {
 const shutdown = async () => {
 	try {
 		unsubscribe?.();
+		fishTts.close();
+		playSlots.close();
+		plotOptions?.close();
 		for (const ws of clients) ws.close();
 		wss.close();
 		httpServer.close();
 		tavernPlugins.sources.close();
 		await tavernPluginRuntime.close();
 		if(npcUpdateTimer)clearInterval(npcUpdateTimer);
-		await npcParallel.close();
 		await veridisRewrite.close();
 		await databasePluginRuntime.close();
 		await assistantHost?.dispose();

@@ -1,5 +1,6 @@
 export const SIDE_MODEL_STEPS = [
 	"writer",
+	"dailyPlot",
 	"mvuParse",
 	"npcParallel",
 	"veridisRewrite",
@@ -65,9 +66,13 @@ export function resolveStepModel<M>(
 	findById?: (id: string) => M | undefined,
 	fallbackChain?: SideModelStep[],
 ): { model?: M; requested?: ModelRef; fallback: boolean } {
-	if (step === "mvuParse" || step === "npcParallel" || step === "veridisRewrite") {
+	if (step === "dailyPlot" || step === "mvuParse" || step === "npcParallel" || step === "veridisRewrite") {
 		const requested = stepModels?.[step];
 		return { model: requested ? find(requested.provider, requested.id) : undefined, requested, fallback: false };
+	}
+	if (step === "worldProfile" && stepModels?.worldProfile) {
+		const requested = stepModels.worldProfile;
+		return { model: find(requested.provider, requested.id) ?? findById?.(requested.id), requested, fallback: false };
 	}
 	if (!primary) return { fallback: false };
 	let fallbackResolved: {
@@ -92,4 +97,10 @@ export function resolveStepModel<M>(
 	return selected
 		? { model: selected, requested, fallback: false }
 		: { model: primary, requested, fallback: true };
+}
+
+/** Same relocation policy for manual side requests and the turn engine. */
+export function findAvailableModelById<M extends { id: string; provider?: string }>(models: M[], id: string, preferredProvider?: string): M | undefined {
+	const candidates = models.filter(model => model.id === id);
+	return (preferredProvider ? candidates.find(model => model.provider === preferredProvider) : undefined) ?? (candidates.length === 1 ? candidates[0] : undefined);
 }

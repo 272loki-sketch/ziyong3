@@ -6,12 +6,13 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../web/public/database-plugin-host.js", import.meta.url), "utf8");
 
 /** Exercises the host lifecycle without importing upstream bytes, private data or a browser. */
-function hostFixture(view: string, options: { open?: () => Promise<boolean>; stateSave?: () => Promise<any>; contextError?: boolean; legacyOpen?: boolean; scriptLoadFailure?: boolean; standalone?: boolean; binding?: {scopeKey:string;sourceEntryId:string;sha256:string}; context?: Record<string, unknown>; contextResponse?: () => Record<string, unknown>; intercept?: (params: any) => any; suppressGeneration?: boolean; modelError?: string; generateHook?: (params:any, window:any, capture:(params:any)=>Promise<string>)=>Promise<unknown> } = {}) {
+function hostFixture(view: string, options: { chatReload?: () => Promise<void>; open?: () => Promise<boolean>; stateSave?: () => Promise<any>; contextError?: boolean; legacyOpen?: boolean; scriptLoadFailure?: boolean; standalone?: boolean; binding?: {scopeKey:string;sourceEntryId:string;sha256:string}; context?: Record<string, unknown>; contextResponse?: () => Record<string, unknown>; intercept?: (params: any) => any; suppressGeneration?: boolean; modelError?: string; modelReply?: string; modelStream?: boolean; generateHook?: (params:any, window:any, capture:(params:any)=>Promise<string>)=>Promise<unknown> } = {}) {
 	const messages: Array<{ type: string; message?: string }> = [];
 	const elements = new Map<string, any>();
 	const polls: Array<() => Promise<void>> = [];
 	const replacements: string[] = [];
 	const savedStates: any[] = [];
+ const modelRequests: any[] = [];
 	for (const id of ["host-home", "host-status", "host-open", "host-tables", "host-sync", "host-feedback", "host-retry", "send_but", "send_textarea"]) {
 		elements.set(id, { dataset: {}, hidden: false, disabled: id === "host-open", textContent: "", addEventListener(name: string, cb: () => void) { this[name] = cb; }, dispatchEvent(event: any) { this[event.type]?.(); return true; } });
 	}
@@ -22,6 +23,12 @@ function hostFixture(view: string, options: { open?: () => Promise<boolean>; sta
 		parent: { postMessage(message: any, origin: string) { assert.equal(origin, "https://synthetic.invalid"); messages.push(message); } },
 		fetch: async (path: string, init?: {body?:string}) => {
 			if (path.endsWith("/state")) { savedStates.push(JSON.parse(init?.body ?? "{}").state); return options.stateSave ? options.stateSave() : { ok: true, json: async () => ({globalRevision: 1}) }; }
+            if ((path.endsWith("/completion") || path.endsWith("/generate") || path.endsWith("/external")) && options.modelReply) {
+             modelRequests.push(JSON.parse(init?.body??'{}'));
+             if(path.endsWith('/generate'))return new Response(JSON.stringify({text:options.modelReply}),{status:200});
+             if(options.modelStream)return new Response([...options.modelReply].map(content=>'data: '+JSON.stringify({choices:[{delta:{content}}]})+'\n\n').join('')+'data: [DONE]\n\n',{status:200});
+             return new Response(JSON.stringify({choices:[{message:{content:options.modelReply}}]}),{status:200});
+            }
 			if ((path.endsWith("/completion") || path.endsWith("/generate")) && options.modelError) return new Response(JSON.stringify({error:options.modelError}),{status:400,headers:{"content-type":"application/json"}});
 			if (path.endsWith("/binding")) return { ok: true, json: async () => ({ ...(options.binding ?? { scopeKey: "fixture-scope", sourceEntryId: "a-1", sha256: "verified-fixture-source" }) }) };
 			if (options.contextError) throw new Error("合成登录已失效");
@@ -36,6 +43,7 @@ function hostFixture(view: string, options: { open?: () => Promise<boolean>; sta
 		head: { append(script: any) {
 			if (script.src.endsWith("source/index.js")) {
 				window.AutoCardUpdaterAPI = { triggerUpdate: async () => ({ success: true }), refreshDataAndWorldbook: async () => {}, openSettings: open };
+				window.SillyTavern.getContext().eventSource.on('CHAT_CHANGED',()=>window.setTimeout(async()=>{await options.chatReload?.();},1200));
 				window.AutoCardUpdaterV2API = options.legacyOpen ? {} : { open, openVisualizer: async () => { window.tableOpens = (window.tableOpens ?? 0) + 1; return true; }, refreshVisualizer: async () => { window.tableRefreshes = (window.tableRefreshes ?? 0) + 1; } };
 				const hostGenerate = window.TavernHelper.generate;
 				window.TavernHelper.generate = async (params: any) => { if(options.generateHook) return options.generateHook(params,window,hostGenerate); if (options.suppressGeneration) return; return hostGenerate(options.intercept?.(params) ?? params); };
@@ -43,8 +51,8 @@ function hostFixture(view: string, options: { open?: () => Promise<boolean>; sta
 			queueMicrotask(() => options.scriptLoadFailure ? script.onerror() : script.onload());
 		} },
 	};
-	vm.runInNewContext(`(async () => { ${source} })()`, { window, document, location: { search: view, origin: "https://synthetic.invalid", href: "https://synthetic.invalid/database-plugin-host.html" + view, reload() {}, replace(url: string) { replacements.push(url); } }, URL, URLSearchParams, Response, Error, Event, clearTimeout, setInterval: (cb: () => Promise<void>, delay: number) => { assert.equal(delay,2500); polls.push(cb); }, setTimeout: (fn: () => void, delay: number) => setTimeout(fn, delay === 45000 ? delay : 0) });
-	return { window, document, elements, messages, polls, replacements, savedStates, opens: () => opens };
+	vm.runInNewContext(`(async () => { ${source} })()`, { window, document, location: { search: view, origin: "https://synthetic.invalid", href: "https://synthetic.invalid/database-plugin-host.html" + view, reload() {}, replace(url: string) { replacements.push(url); } }, URL, URLSearchParams, Response, Headers, Error, Event, clearTimeout, setInterval: (cb: () => Promise<void>, delay: number) => { assert.equal(delay,2500); polls.push(cb); }, setTimeout: (fn: () => void, delay: number) => setTimeout(fn, delay === 45000 ? delay : 0) });
+	return { window, document, elements, messages, polls, replacements, savedStates, modelRequests, opens: () => opens };
 }
 async function settled(f: ReturnType<typeof hostFixture>) {
 	for (let i = 0; i < 100 && !f.messages.some(m => /liyuan-database-(ready|error)/.test(m.type)); i++) await new Promise(resolve => setTimeout(resolve, 5));
@@ -76,6 +84,19 @@ test("database host: manager readiness waits for actual upstream open, and close
 	release(true); await settled(manager);
 	manager.elements.get("host-open").click(); await new Promise(resolve => setTimeout(resolve, 5));
 	assert.equal(manager.opens(), 2);
+});
+
+test('database startup joins delayed native hydration rather than racing a fixed sleep and extra refresh',async()=>{
+ let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});
+ const f=hostFixture('',{chatReload:()=>gate});
+ await new Promise(r=>setTimeout(r,20));
+ assert.equal(f.window.LiyuanDatabasePluginHost.ready(),false);
+ let duplicateRefreshes=0;f.window.AutoCardUpdaterAPI.refreshDataAndWorldbook=async()=>{duplicateRefreshes++;};
+ release();await settled(f);
+ assert.equal(f.window.LiyuanDatabasePluginHost.ready(),true);assert.equal(duplicateRefreshes,0);
+ const failed=hostFixture('',{chatReload:async()=>{throw Error('synthetic hydration failed');}});await settled(failed);
+ assert.equal(failed.window.LiyuanDatabasePluginHost.ready(),false);
+ assert.match(failed.messages.at(-1)!.message!,/synthetic hydration failed/);
 });
 
 test("database host: failed upstream open reports error, never success, and exposes retry", async () => {
@@ -336,6 +357,26 @@ test("database host: repeated identical upstream saves share the durable revisio
  assert.equal(calls,1);ctx.chatMetadata.synthetic="changed";await ctx.saveChat();assert.equal(calls,2);
 });
 
+test('database after refreshes authoritative context once, without duplicate post-fill rebuilds',async()=>{
+ const f=hostFixture('');await settled(f);
+ const api=f.window.AutoCardUpdaterAPI,ctx=f.window.SillyTavern.getContext();let refreshes=0,syncs=0;
+ api.exportTableAsJson=()=>({sheet_fixture:{}});api.getRecentPerformanceSpans=()=>[];
+ api.refreshDataAndWorldbook=async()=>{refreshes++;};api.syncWorldbookEntries=async()=>{syncs++;};
+ ctx.eventSource.on('GENERATION_ENDED',()=>f.window.setTimeout(async()=>{await ctx.saveChat();},500));
+ await f.window.LiyuanDatabasePluginHost.after();
+ assert.equal(refreshes,1);assert.equal(syncs,0);assert.equal(f.savedStates.length,1);
+});
+
+test('database existing-frame recovery repairs worldbooks without repeating native filling',async()=>{
+ const f=hostFixture('',{context:{chat:[{__liyuanEntryId:'a-1',TavernDB_ACU_IsolatedData:{fixture:{storageFrame:{checkpoint:true}}}}]}});await settled(f);
+ const api=f.window.AutoCardUpdaterAPI,ctx=f.window.SillyTavern.getContext();let refreshes=0;
+ api.exportTableAsJson=()=>({sheet_fixture:{}});
+ api.refreshDataAndWorldbook=async()=>{refreshes++;await f.window.TavernHelper.replaceWorldbook('Fixture',[{uid:1,content:'synthetic repaired projection',order:4}]);};
+ ctx.eventSource.on('GENERATION_ENDED',()=>{throw Error('saved narrative must not be filled again');});
+ await f.window.LiyuanDatabasePluginHost.after();
+ assert.equal(refreshes,1);assert.equal(f.savedStates.at(-1).worldbooks.Fixture.entries[0].order,4);
+});
+
 test("database host: background execution boundaries propagate saves even when upstream catches persistence errors", async () => {
  for(const boundary of ["before","after-update","after-worldbook","rpc"]){
   const f=hostFixture("",{stateSave:async()=>({ok:false,json:async()=>({error:"合成后台持久化失败"})})});await settled(f);
@@ -353,7 +394,7 @@ test("database host: background execution boundaries propagate saves even when u
     api.getRecentPerformanceSpans=()=>[];
     ctx.eventSource.on('GENERATION_ENDED',()=>f.window.setTimeout(boundary==="after-update"?caughtSave:async()=>{},500));
     if(boundary==="after-update")api.triggerUpdate=()=>{throw new Error('legacy standard fill must not run');};
-   else api.syncWorldbookEntries=caughtSave;
+    else api.refreshDataAndWorldbook=caughtSave;
    await assert.rejects(f.window.LiyuanDatabasePluginHost.after(),/合成后台持久化失败/);
   }
  }
@@ -377,4 +418,61 @@ test("database host: after joins native grouped event and rejects failed groups 
  const after=f.window.LiyuanDatabasePluginHost.after();
  await new Promise(r=>setTimeout(r,10));assert.equal(done,false);
  release();await assert.rejects(after,/自动分组填表失败/);assert.equal(done,true);
+});
+
+
+for(const transport of ['raw','completion','stream','external'])test(`database merged director: ${transport} preserves native labels and captures one same-request candidate`,async()=>{
+ const director={systemPrompt:'SYNTHETIC_MERGED_DIRECTOR',userText:'{"latest_user_input":"synthetic user"}'};
+ const direction='{"scenePressure":"已知线索","candidateBeats":["合成候选"]}';
+ const reply='<recall>AM0001</recall><liyuan_literary_direction>'+direction+'</liyuan_literary_direction>';
+ const native='<input>synthetic user</input><recall>AM0001</recall>';
+ const f=hostFixture('',{modelReply:reply,modelStream:transport==='stream',generateHook:async(params,w,capture)=>{
+  if(transport==='raw')assert.equal(await w.TavernHelper.generateRaw({ordered_prompts:[{role:'user',content:'NATIVE_TASK'}]}),'<recall>AM0001</recall>');
+  else {const response=await w.fetch(transport==='external'?'https://synthetic-model.invalid/v1/chat/completions':'/api/backends/chat-completions/generate',{method:'POST',body:JSON.stringify({messages:[{role:'user',content:'NATIVE_TASK'}]})});const nativeReply=await response.text();assert.ok(!nativeReply.includes('liyuan_literary_direction'));if(transport!=='stream')assert.equal(JSON.parse(nativeReply).choices[0].message.content,'<recall>AM0001</recall>');}
+  return capture({...params,user_input:native,_qrf_processed_by_hook:true});
+ }});await settled(f);
+ const result=await f.window.LiyuanDatabasePluginHost.before('synthetic user',director);
+ assert.equal(result.userInput,native);assert.equal(result.literaryDirection,direction);assert.equal(result.literaryDirectorHandled,true);assert.equal(f.modelRequests.length,1);
+ const sent=f.modelRequests[0].prompts??f.modelRequests[0].payload.messages;
+ assert.equal(sent[0].content,'NATIVE_TASK');assert.ok(sent.some((p:any)=>p.content===director.systemPrompt));
+ await f.window.TavernHelper.generateRaw({ordered_prompts:[{role:'user',content:'FILL_ONLY'}]});
+ assert.deepEqual(f.modelRequests[1].prompts,[{role:'user',content:'FILL_ONLY'}]);
+ assert.ok(f.savedStates.every(state=>!JSON.stringify(state).includes('SYNTHETIC_MERGED_DIRECTOR')));
+});
+for(const mode of ['no-output','no-writeback','failed','keyword-only'])test(`database merged director does not claim ${mode} as handled, and clears transient context`,async()=>{
+ const reply=mode==='no-output'?'native only':'<liyuan_literary_direction>{"candidateBeats":[]}</liyuan_literary_direction>';
+ const f=hostFixture('',{modelReply:reply,generateHook:async(params,w,capture)=>{await w.TavernHelper.generateRaw({ordered_prompts:[{role:'user',content:'NATIVE'}]});if(mode==='failed')throw new Error('synthetic cancelled');return capture({...params,_qrf_processed_by_hook:!['no-writeback','keyword-only'].includes(mode)});}});await settled(f);
+ const action=f.window.LiyuanDatabasePluginHost.before('input',{systemPrompt:'TRANSIENT',userText:'data'});
+ if(mode==='failed')await assert.rejects(action,/synthetic cancelled/);else assert.equal((await action).literaryDirectorHandled,false);
+ await f.window.TavernHelper.generateRaw({ordered_prompts:[{role:'user',content:'LATER'}]});assert.equal(f.modelRequests[1].prompts.length,1);
+});
+
+
+for(const bounded of ['messages','characters'])test(`database merged director keeps near-limit native ${bounded} unchanged instead of failing recall`,async()=>{
+ const prompts=bounded==='messages'?Array.from({length:99},()=>({role:'user',content:'native'})):[{role:'user',content:'x'.repeat(239950)}];
+ const f=hostFixture('',{modelReply:'<recall>AM0001</recall>',generateHook:async(params,w,capture)=>{await w.TavernHelper.generateRaw({ordered_prompts:prompts});return capture({...params,_qrf_processed_by_hook:true});}});await settled(f);
+ const result=await f.window.LiyuanDatabasePluginHost.before('input',{systemPrompt:'merged',userText:'d'.repeat(100)});
+ assert.deepEqual(f.modelRequests[0].prompts,prompts);assert.equal(result.literaryDirectorHandled,false);
+});
+
+
+test('database merged director strips only the final owned envelope, retaining literal examples in native reasoning',async()=>{
+ const native='<thinking>原任务提到字面示例 <liyuan_literary_direction>{example}</liyuan_literary_direction>，仍按原协议选AM。</thinking><recall>AM0001</recall>';
+ const json='{"candidateBeats":["同请求候选"]}';
+ const f=hostFixture('',{modelReply:native+'<liyuan_literary_direction>'+json+'</liyuan_literary_direction>',generateHook:async(params,w,capture)=>{assert.equal(await w.TavernHelper.generateRaw({ordered_prompts:[{role:'user',content:'NATIVE'}]}),native);return capture({...params,_qrf_processed_by_hook:true});}});await settled(f);
+ const result=await f.window.LiyuanDatabasePluginHost.before('input',{systemPrompt:'merged',userText:'data'});assert.equal(result.literaryDirectorHandled,true);assert.equal(result.literaryDirection,json);
+});
+
+
+test('shared literaryDirector model rebinds native plot/keyword tasks while preserving fill and task prompts',async()=>{
+ const first=hostFixture('',{context:{managedModels:managedModelsFixture}});await settled(first);
+ const old=upstreamSettings(first),fill=managedModelsFixture.presets[0];
+ old.profile.tableApiPreset='MANUAL_FILL_UNCHANGED';old.profile.tableApiPresetOverridesByName={Synthetic:'MANUAL_FILL_UNCHANGED'};
+ old.profile.plotTaskApiPresetOverridesById={task:'OLD_RECALL'};old.profile.plotSettings={enabled:true,plotTasks:[{id:'task',enabled:true,taskApiPreset:'OLD_RECALL',promptGroup:[{role:'user',content:'PRIVATE_NATIVE_PROMPT'}]}]};
+ old.namespace[profileSettingsKey]=JSON.stringify(old.profile);
+ const recall={...managedModelsFixture.presets[1],provider:'synthetic-primary',model:'gemini-4-argon',name:'合成统一召回推进',url:'/api/database-plugin/connections/recall/synthetic-primary/v1'};
+ const managed={revision:'synthetic-shared-argon',presets:[fill,recall],recallModelSource:'literaryDirector'};
+ const f=hostFixture('',{context:{managedModels:managed,extensionSettings:old.extensionSettings}});await settled(f);const fresh=upstreamSettings(f);
+ assert.equal(fresh.profile.plotApiPreset,recall.name);assert.equal(fresh.globalMeta.vectorMemoryConfigGlobal.keywordApiPreset,recall.name);assert.equal(fresh.profile.plotTaskApiPresetOverridesById.task,recall.name);assert.equal(fresh.profile.plotSettings.plotTasks[0].taskApiPreset,recall.name);assert.equal(fresh.profile.plotSettings.plotTasks[0].promptGroup[0].content,'PRIVATE_NATIVE_PROMPT');
+ assert.equal(fresh.profile.tableApiPreset,'MANUAL_FILL_UNCHANGED');assert.deepEqual(fresh.profile.tableApiPresetOverridesByName,{Synthetic:'MANUAL_FILL_UNCHANGED'});assert.equal(fresh.profile.apiPresets.find(p=>p.name===recall.name).apiConfig.model,'gemini-4-argon');
 });
