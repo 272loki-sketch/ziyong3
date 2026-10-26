@@ -20,7 +20,7 @@ export class FishTtsStore {
 		try {
 			const stat = lstatSync(path);
 			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("配音私有目录不允许符号链接");
-			if (stat.mode & 0o077) chmodSync(path, 0o700);
+			if (process.platform !== "win32" && (stat.mode & 0o077)) chmodSync(path, 0o700);
 			return true;
 		} catch (error) { if (missing(error)) return false; throw error; }
 	}
@@ -31,7 +31,8 @@ export class FishTtsStore {
 		try {
 			const info = fstatSync(fd);
 			if (!info.isFile() || info.size > limit || info.nlink !== 1) throw new Error("配音私有文件类型或大小无效");
-			if (info.mode & 0o077) throw new Error("配音私有文件权限应为 0600；未读取不安全的文件");
+			// Windows reports 0666 for every writable file; POSIX modes are not an ACL there.
+			if (process.platform !== "win32" && (info.mode & 0o077)) throw new Error("配音私有文件权限应为 0600；未读取不安全的文件");
 			return readFileSync(fd);
 		} finally { closeSync(fd); }
 	}

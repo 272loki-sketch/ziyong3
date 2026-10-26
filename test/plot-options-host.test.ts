@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { memoryConfigPath } from "../src/memory/config.ts";
 import { join, resolve, dirname } from "node:path";
 import WebSocket from "ws";
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(import.meta.dirname, "..");
 async function listen(server: ReturnType<typeof createServer>): Promise<number> { await new Promise<void>(r => server.listen(0, "127.0.0.1", r)); return (server.address() as { port: number }).port; }
 async function until(fn: () => boolean | Promise<boolean>, label: string, timeoutMs = 10000): Promise<void> { const deadline = Date.now() + timeoutMs; while (Date.now() < deadline) { if (await fn()) return; await new Promise(r => setTimeout(r, 40)); } throw Error(`timeout: ${label}`); }
 test("real host: daily backend, editable bound submission/replay, source validation and slow planning never blocks direct RP (synthetic local models)", { timeout: 90000 }, async () => {

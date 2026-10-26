@@ -32,7 +32,7 @@ test("new defaults and legacy enabled configs are read-only and disabled until e
 	assert.equal(next.config.enabled, true); assert.equal(next.apiKey, "synthetic-legacy-key");
 	assert.deepEqual(next.raw.unknownPrivate, { preserve: true });
 	assert.equal(readFileSync(path, "utf8"), before);
-	assert.equal(statSync(join(cwd, ".liyuan/novelai-generation.json")).mode & 0o777, 0o600);
+	if (process.platform !== "win32") assert.equal(statSync(join(cwd, ".liyuan/novelai-generation.json")).mode & 0o777, 0o600);
 	assert.deepEqual(readdirSync(join(cwd, ".liyuan")).sort(), ["novelai-generation.json", "novelai.json"]);
 });
 
@@ -100,7 +100,7 @@ test("persistent scoped cache and duplicate subscribers generate only once; disk
 	assert.equal(findHistoricalImage(cwd, "tree"), null, "new writes do not repurpose the historical index");
 	const changed = updateNovelAiConfig(cwd, { revision: loadNovelAiConfig(cwd).revision, steps: 29 });
 	assert.equal(changed.config.steps, 29); assert.equal(getCachedNovelAiImage(cwd, "tree", opts), null);
-	assert.equal(statSync(join(cwd, ".liyuan/novelai-image-cache-v2.json")).mode & 0o777, 0o600);
+	if (process.platform !== "win32") assert.equal(statSync(join(cwd, ".liyuan/novelai-image-cache-v2.json")).mode & 0o777, 0o600);
 });
 
 test("disabled, incomplete and invalid requests never call a paid endpoint", async t => {

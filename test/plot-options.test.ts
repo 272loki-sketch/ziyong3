@@ -35,8 +35,10 @@ test("full-library retrieval finds relevant daily cards beyond the first 16; bro
   assert.equal(retrievePlotCards(plotCards(f.library), "", 100).length, 80);
   assert.equal(f.engine.library("", 60).cards.length, 20);
   await f.enable(); assert.equal(f.calls, 1); assert.equal(f.engine.view().options.length, 1); assert.equal(f.engine.view().libraryCount, 80);
-  assert.equal(statSync(join(f.cwd, ".liyuan/plot-options")).mode & 0o777, 0o700);
-  assert.equal(statSync(join(f.cwd, ".liyuan/plot-options/settings.json")).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+   assert.equal(statSync(join(f.cwd, ".liyuan/plot-options")).mode & 0o777, 0o700);
+   assert.equal(statSync(join(f.cwd, ".liyuan/plot-options/settings.json")).mode & 0o777, 0o600);
+  }
  } finally { f.cleanup(); }
 });
 test("draft resolution has no story side effects; only persisted selection guides later floors; cancel and restart", async () => {

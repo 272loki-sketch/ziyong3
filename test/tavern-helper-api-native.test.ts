@@ -5,7 +5,6 @@ import { mkdtemp, rm, readFile, mkdir, cp, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { build } from "../web/node_modules/esbuild/lib/main.js";
 import { chromium } from "playwright";
 import { TavernPluginHttp } from "../server/tavern-plugin-http.ts";
 import { TavernPluginSources } from "../server/tavern-plugin-source.ts";
@@ -48,7 +47,9 @@ test("original helper renderer APIs: composer bridge, real rejection, events/var
    eventOn('synthetic-ui-event',value=>{document.body.dataset.event=value;});
    document.getElementById('vars').onclick=async()=>{replaceVariables({syntheticCounter:42},{type:'chat'});await parent.LiyuanTavernPlugins.host.flush();statusNode.textContent='VARIABLES:'+getVariables({type:'chat'}).syntheticCounter;};
    </script></body></html>`;
-  const bundle = await build({ stdin: { resolveDir: join(root, "web"), loader: "tsx", contents: `import React from'react';import{createRoot}from'react-dom/client';import{TavernMessageFrame,TavernEntryContext}from'./src/components/TavernMessageFrame.tsx';import{registerTavernChatBridge}from'./src/tavernShim.ts';window.__submitted=[];window.__input='';window.__refuse=false;registerTavernChatBridge({getInput:()=>window.__input,setInput:value=>window.__input=value,sendPrompt:value=>{if(window.__refuse)return{accepted:false,reason:'Synthetic outbox refusal'};window.__submitted.push(value);return{accepted:true};}});createRoot(document.getElementById('root')).render(<TavernEntryContext.Provider value={{entryId:'reply',entryScope:${JSON.stringify(scope)}}}><TavernMessageFrame html={${JSON.stringify(html)}}><div>STATIC</div></TavernMessageFrame></TavernEntryContext.Provider>);` }, bundle: true, format: "esm", jsx: "automatic", write: false, loader: { ".css": "empty" }, logLevel: "silent" });
+     // Web dependencies are only required when explicit original fixtures enable this test.
+   const { build } = await import("../web/node_modules/esbuild/lib/main.js");
+   const bundle = await build({ stdin: { resolveDir: join(root, "web"), loader: "tsx", contents: `import React from'react';import{createRoot}from'react-dom/client';import{TavernMessageFrame,TavernEntryContext}from'./src/components/TavernMessageFrame.tsx';import{registerTavernChatBridge}from'./src/tavernShim.ts';window.__submitted=[];window.__input='';window.__refuse=false;registerTavernChatBridge({getInput:()=>window.__input,setInput:value=>window.__input=value,sendPrompt:value=>{if(window.__refuse)return{accepted:false,reason:'Synthetic outbox refusal'};window.__submitted.push(value);return{accepted:true};}});createRoot(document.getElementById('root')).render(<TavernEntryContext.Provider value={{entryId:'reply',entryScope:${JSON.stringify(scope)}}}><TavernMessageFrame html={${JSON.stringify(html)}}><div>STATIC</div></TavernMessageFrame></TavernEntryContext.Provider>);` }, bundle: true, format: "esm", jsx: "automatic", write: false, loader: { ".css": "empty" }, logLevel: "silent" });
   server = createServer((req, res) => { void (async () => {
    const path = new URL(req.url!, "http://localhost").pathname;
    if (path === "/") { res.writeHead(200, { "content-type": "text/html" }); return res.end('<!doctype html><div id="root"></div><script type="module" src="/fixture.js"></script>'); }

@@ -29,7 +29,7 @@ test("hybrid semantic recall includes a lexically unrelated mechanism outside ke
   const changed = { ...target, friction: "different opinions" }; f.cards[79] = changed;
   await f.service.retrieve(input(f)); assert.equal(f.calls.length, 5); assert.equal(f.calls[4].length, 1);
   const restart = new PlotSemanticSearch({ root: f.root, provider: f.provider }); await restart.retrieve(input(f)); assert.equal(f.calls.length, 5);
-  const files = readdirSync(f.root).filter(p => p.endsWith(".json")); assert.equal(files.length, 1); assert.equal(statSync(join(f.root, files[0])).mode & 0o777, 0o600);
+  const files = readdirSync(f.root).filter(p => p.endsWith(".json")); assert.equal(files.length, 1); if (process.platform !== "win32") assert.equal(statSync(join(f.root, files[0])).mode & 0o777, 0o600);
   const disk = readFileSync(join(f.root, files[0]), "utf8"); assert.ok(!disk.includes("ease tension")); assert.ok(!disk.includes("Repairing a bench"));
  } finally { f.cleanup(); }
 });

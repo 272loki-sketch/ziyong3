@@ -104,7 +104,7 @@ test('paused/legacy ownership metadata is read without rewriting; corrupted/miss
  try{
   mkdirSync(join(root,id),{recursive:true});writeFileSync(join(root,id,'meta.json'),JSON.stringify({version:1,id,name:'合成旧卡位',createdAt:new Date(0).toISOString()}));
   const file=join(root,'main-window.json');writeFileSync(file,JSON.stringify({version:1,id}),{mode:0o600});const hash=digest(file);
-  const slots=new PlaySlots(cwd,host);assert.equal(slots.mainWorkspace,id);assert.equal(slots.list()[0].state,'paused');assert.equal(slots.list()[0].owner,'main');assert.equal(digest(file),hash);assert.equal(statSync(file).mode&0o777,0o600);slots.close();
+  const slots=new PlaySlots(cwd,host);assert.equal(slots.mainWorkspace,id);assert.equal(slots.list()[0].state,'paused');assert.equal(slots.list()[0].owner,'main');assert.equal(digest(file),hash);if(process.platform!=='win32')assert.equal(statSync(file).mode&0o777,0o600);slots.close();
   for(const record of [{version:1,id:'../../outside'},{version:1,id:randomUUID()},{version:2,id},{version:1,id,lease:'<script>'}]){writeFileSync(file,JSON.stringify(record));assert.throws(()=>new PlaySlots(cwd,host));}
   writeFileSync(file,'{"broken":');assert.throws(()=>new PlaySlots(cwd,host));
   if(process.platform!=='win32'){const target=join(cwd,'pointer.json');writeFileSync(target,JSON.stringify({version:1,id:null}));rmSync(file);symlinkSync(target,file);assert.throws(()=>new PlaySlots(cwd,host));assert.equal(JSON.parse(readFileSync(target,'utf8')).id,null);}

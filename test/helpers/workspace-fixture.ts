@@ -4,6 +4,7 @@ import {createServer} from 'node:http';
 import {mkdtempSync,mkdirSync,writeFileSync,symlinkSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {setPassword,ACCESS_COOKIE} from '../../src/access.ts';
 const root=resolve(import.meta.dirname,'../..');
 export async function until(check:()=>boolean|Promise<boolean>,timeout=20_000){const end=Date.now()+timeout;while(Date.now()<end){if(await check())return;await new Promise(r=>setTimeout(r,30));}throw Error('synthetic workspace fixture timeout');}
@@ -39,7 +40,7 @@ export async function workspaceFixture(dist?:string, cards?: Record<string, unkn
  const stop=async()=>{if(!child)return;const proc=child;child=undefined;if(proc.exitCode===null&&proc.signalCode===null){const exited=new Promise<void>(ok=>proc.once('exit',()=>ok()));proc.kill();await exited;}};
  const start=async()=>{
   const probe=createServer();await new Promise<void>(ok=>probe.listen(0,'127.0.0.1',ok));port=(probe.address() as {port:number}).port;await new Promise<void>(ok=>probe.close(()=>ok()));
-  child=spawn(process.execPath,[join(root,'server/main.ts')],{cwd,env:{...process.env,NODE_OPTIONS:`--import=${guard}`,HOME:join(cwd,'home'),LIYUAN_CODING_AGENT_DIR:join(cwd,'agent'),PI_CODING_AGENT_DIR:join(cwd,'agent'),HOST:'127.0.0.1',PORT:String(port),LIYUAN_PLAY_SLOT_CHILD:'0',LIYUAN_WEB_DIST_DIR:dist??join(cwd,'web/dist')},stdio:['ignore','pipe','pipe']});
+  child=spawn(process.execPath,[join(root,'server/main.ts')],{cwd,env:{...process.env,NODE_OPTIONS:`--import=${JSON.stringify(pathToFileURL(guard).href)}`,HOME:join(cwd,'home'),LIYUAN_CODING_AGENT_DIR:join(cwd,'agent'),PI_CODING_AGENT_DIR:join(cwd,'agent'),HOST:'127.0.0.1',PORT:String(port),LIYUAN_PLAY_SLOT_CHILD:'0',LIYUAN_WEB_DIST_DIR:dist??join(cwd,'web/dist')},stdio:['ignore','pipe','pipe']});
   child.stdout!.on('data',bytes=>{log=(log+bytes.toString()).slice(-12_000);});child.stderr!.on('data',bytes=>{log=(log+bytes.toString()).slice(-12_000);});
   await until(async()=>{if(child!.exitCode!==null)throw Error('synthetic server exited: '+log);try{
    const base=`http://127.0.0.1:${port}`,html=await(await fetch(base+'/',{headers:{cookie}})).text();
